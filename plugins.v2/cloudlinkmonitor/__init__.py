@@ -63,7 +63,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.5.9"
+    plugin_version = "2.6.0"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -88,6 +88,7 @@ class CloudLinkMonitor(_PluginBase):
     _onlyonce = False
     _history = False
     _scrape = False
+    _type = False
     _category = False
     _refresh = False
     _softlink = False
@@ -132,6 +133,7 @@ class CloudLinkMonitor(_PluginBase):
             self._onlyonce = config.get("onlyonce")
             self._history = config.get("history")
             self._scrape = config.get("scrape")
+            self._type = config.get("type")
             self._category = config.get("category")
             self._refresh = config.get("refresh")
             self._mode = config.get("mode")
@@ -272,6 +274,7 @@ class CloudLinkMonitor(_PluginBase):
             "softlink": self._softlink,
             "strm": self._strm,
             "scrape": self._scrape,
+            "type": self._type,
             "category": self._category,
             "size": self._size,
             "refresh": self._refresh,
@@ -456,6 +459,7 @@ class CloudLinkMonitor(_PluginBase):
                     target_dir.notify = False
                     target_dir.overwrite_mode = self._overwrite_mode.get(mon_path) or 'never'
                     target_dir.library_storage = "local"
+                    target_dir.library_type_folder = self._type
                     target_dir.library_category_folder = self._category
                 else:
                     target_dir.transfer_type = transfer_type
@@ -835,6 +839,22 @@ class CloudLinkMonitor(_PluginBase):
                                             {
                                                 'component': 'VSwitch',
                                                 'props': {
+                                                    'model': 'type',
+                                                    'label': '是否按类型分类',
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VCol',
+                                        'props': {
+                                            'cols': 12,
+                                            'md': 4
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'VSwitch',
+                                                'props': {
                                                     'model': 'category',
                                                     'label': '是否二级分类',
                                                 }
@@ -1086,6 +1106,7 @@ class CloudLinkMonitor(_PluginBase):
             "onlyonce": False,
             "history": False,
             "scrape": False,
+            "type": True,
             "category": False,
             "refresh": True,
             "softlink": False,
