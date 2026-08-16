@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import threading
 import time
 import traceback
@@ -53,13 +54,13 @@ class CloudStrmCompanion(_PluginBase):
     # 插件名称
     plugin_name = "云盘Strm助手"
     # 插件描述
-    plugin_desc = "实时监控、定时全量增量生成strm文件。"
+    plugin_desc = "实时监控、定时全量增量生成strm文件，通知Emby前校验源文件可见性。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.4.0"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "thsrite,Anniversor"
     # 作者主页
     author_url = "https://github.com/thsrite"
     # 插件配置项ID前缀
@@ -92,6 +93,11 @@ class CloudStrmCompanion(_PluginBase):
     _other_mediaext = None
     _interval: int = 10
     _mediaservers = None
+    # 定时对账与挂载缓存刷新配置
+    _cron = None
+    _rc_socket = ""
+    _rc_fs = ""
+    _rc_mount_prefix = ""
     mediaserver_helper = None
     _emby_paths = {}
     _path_replacements = {}  # 新增：路径替换规则属性
@@ -120,6 +126,10 @@ class CloudStrmCompanion(_PluginBase):
             self._enabled = config.get("enabled")
             self._onlyonce = config.get("onlyonce")
             self._interval = config.get("interval") or 10
+            self._cron = config.get("cron")
+            self._rc_socket = config.get("rc_socket") or ""
+            self._rc_fs = config.get("rc_fs") or ""
+            self._rc_mount_prefix = (config.get("rc_mount_prefix") or "").rstrip("/")
             self._monitor = config.get("monitor")
             self._cover = config.get("cover")
             self._copy_files = config.get("copy_files")
@@ -335,7 +345,8 @@ class CloudStrmCompanion(_PluginBase):
                                                          uriencode=self._uriencode)
                     # 生成strm文件
                     self.__create_strm_file(strm_file=target_file,
-                                            strm_content=strm_content)
+                                            strm_content=strm_content,
+                                            source_file=event_path)
 
                     # nfo、jpg等同名文件
                     pattern = Path(event_path).stem.replace('[', '?').replace(']', '?')
@@ -374,6 +385,9 @@ class CloudStrmCompanion(_PluginBase):
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
             shutil.copy2(str(event_path), target_file)
             logger.info(f"复制字幕文件 {str(event_path)} 到 {target_file}")
+            # 通知Emby扫描新字幕（新字幕晚于视频入库时，Emby需要刷新才能挂载外挂字幕）
+            if self._refresh_emby and self._mediaservers:
+                self.__refresh_emby_file(target_file)
 
     def __sava_json(self):
         """
@@ -402,13 +416,13 @@ class CloudStrmCompanion(_PluginBase):
         else:
             return None
 
-    def __create_strm_file(self, strm_file: str, strm_content: str):
+    def __create_strm_file(self, strm_file: str, strm_content: str, source_file: str = None):
 
         """
         生成strm文件
-        :param library_dir:
-        :param dest_dir:
-        :param dest_file:
+        :param strm_file: strm文件路径
+        :param strm_content: strm文件内容
+        :param source_file: 云盘挂载源文件路径（通知Emby前校验可见性）
         """
         try:
             # 文件
@@ -421,7 +435,7 @@ class CloudStrmCompanion(_PluginBase):
 
             # 媒体文件
             if Path(strm_file).exists() and not self._cover:
-                logger.info(f"目标文件 {strm_file} 已存在")
+                logger.debug(f"目标文件 {strm_file} 已存在")
                 return
             # 新增：应用自定义路径替换规则
             for source, target in self._path_replacements.items():
@@ -476,14 +490,76 @@ class CloudStrmCompanion(_PluginBase):
                     }
                 self._medias[key] = media_list
 
-            # 通知emby刷新
+            # 通知emby刷新（先校验源文件在挂载上可见，避免Emby探测遇到缓存未刷新的空窗）
             if self._refresh_emby and self._mediaservers:
                 time.sleep(0.1)
+                if source_file:
+                    self.__ensure_source_visible(source_file)
                 self.__refresh_emby_file(strm_file)
             return True
         except Exception as e:
             logger.error(f"创建strm文件失败 {strm_file} -> {str(e)}")
         return False
+
+    def __ensure_source_visible(self, source_file: str) -> bool:
+        """
+        校验源文件在挂载上可见；不可见时强制刷新rclone目录缓存并重试。
+        最终仍不可见也不阻塞通知（由定时提取任务兜底），但会输出明显日志。
+        """
+        try:
+            for _ in range(3):
+                if Path(source_file).exists():
+                    return True
+                logger.warn(f"源文件暂不可见，尝试刷新挂载缓存：{source_file}")
+                self.__vfs_refresh(str(Path(source_file).parent))
+                time.sleep(2)
+            if Path(source_file).exists():
+                return True
+            logger.error(f"源文件多次刷新后仍不可见，Emby探测可能失败（等待定时提取兜底）：{source_file}")
+        except Exception as e:
+            logger.error(f"源文件可见性检查异常：{str(e)}")
+        return False
+
+    def __rc_call(self, endpoint: str, payload: dict, timeout: int = 120) -> bool:
+        """
+        通过 unix socket 调用 rclone rc 接口
+        """
+        if not self._rc_socket:
+            return False
+        try:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect(self._rc_socket)
+            req = (f"POST /{endpoint} HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\n"
+                   f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+            s.sendall(req)
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            ok = data.startswith(b"HTTP/1.1 200")
+            if not ok:
+                logger.warn(f"rclone rc {endpoint} 返回异常：{data[:200]}")
+            return ok
+        except Exception as e:
+            logger.warn(f"rclone rc {endpoint} 调用失败：{str(e)}")
+            return False
+
+    def __vfs_refresh(self, local_dir: str) -> bool:
+        """
+        强制刷新 rclone VFS 目录缓存
+        """
+        if not self._rc_fs or not self._rc_mount_prefix \
+                or not str(local_dir).startswith(self._rc_mount_prefix):
+            return False
+        rel = str(local_dir)[len(self._rc_mount_prefix):].strip("/")
+        if not rel:
+            return False
+        return self.__rc_call("vfs/refresh", {"fs": self._rc_fs, "dir": rel})
 
     def __refresh_emby_file(self, strm_file: str):
         """
@@ -820,6 +896,10 @@ class CloudStrmCompanion(_PluginBase):
             "notify": self._notify,
             "monitor": self._monitor,
             "interval": self._interval,
+            "cron": self._cron,
+            "rc_socket": self._rc_socket,
+            "rc_fs": self._rc_fs,
+            "rc_mount_prefix": self._rc_mount_prefix,
             "copy_files": self._copy_files,
             "copy_subtitles": self._copy_subtitles,
             "refresh_emby": self._refresh_emby,
@@ -874,6 +954,18 @@ class CloudStrmCompanion(_PluginBase):
             "kwargs": {} # 定时器参数
         }]
         """
+        if self._enabled and self._cron:
+            try:
+                from apscheduler.triggers.cron import CronTrigger
+                return [{
+                    "id": "CloudStrmCompanionScan",
+                    "name": "云盘Strm助手定时全量对账",
+                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "func": self.scan,
+                    "kwargs": {}
+                }]
+            except Exception as e:
+                logger.error(f"注册定时对账服务失败，请检查cron表达式：{str(e)}")
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -1083,6 +1175,79 @@ class CloudStrmCompanion(_PluginBase):
                                             'model': 'interval',
                                             'label': '消息延迟',
                                             'placeholder': '10'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cron',
+                                            'label': '定时全量对账(cron)',
+                                            'placeholder': '30 4 * * *'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'rc_socket',
+                                            'label': 'rclone rc socket',
+                                            'placeholder': '/var/run/rclone/rcd_1000.sock'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'rc_fs',
+                                            'label': 'rclone远端(fs)',
+                                            'placeholder': 'remote:path（通知Emby前校验源文件用）'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'rc_mount_prefix',
+                                            'label': '容器内挂载前缀',
+                                            'placeholder': '/115_rclone'
                                         }
                                     }
                                 ]
@@ -1309,6 +1474,10 @@ class CloudStrmCompanion(_PluginBase):
             "monitor_confs": "",
             "emby_path": "",
             "interval": 10,
+            "cron": "",
+            "rc_socket": "",
+            "rc_fs": "",
+            "rc_mount_prefix": "",
             "url": "",
             "other_mediaext": ".nfo, .jpg, .png, .json",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",

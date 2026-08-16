@@ -1,12 +1,15 @@
 import datetime
+import json
 import re
 import shutil
+import socket
 import threading
 import traceback
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
 import pytz
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from watchdog.events import FileSystemEventHandler
@@ -59,13 +62,13 @@ class CloudLinkMonitor(_PluginBase):
     # 插件名称
     plugin_name = "目录实时监控"
     # 插件描述
-    plugin_desc = "监控目录文件变化，自动转移媒体文件。"
+    plugin_desc = "监控目录文件变化，自动转移媒体与字幕文件，支持云端定时对账与挂载缓存强制刷新。"
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.6.0"
+    plugin_version = "2.7.0"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "thsrite,Anniversor"
     # 作者主页
     author_url = "https://github.com/thsrite"
     # 插件配置项ID前缀
@@ -104,6 +107,17 @@ class CloudLinkMonitor(_PluginBase):
     _monitor_dirs = ""
     _exclude_keywords = ""
     _interval: int = 10
+    # 对账/缓存刷新配置
+    _openlist_url = ""
+    _openlist_token = ""
+    _openlist_base = ""
+    _rc_socket = ""
+    _rc_fs = ""
+    _rc_mount_prefix = ""
+    _junk_clean = False
+    _junk_exts = ".url,.html,.htm,.txt"
+    # 失败重试计数(进程内)
+    _retry_counts = None
     # 存储源目录与目的目录关系
     _dirconf: Dict[str, Optional[Path]] = {}
     # 存储源目录转移方式
@@ -141,10 +155,21 @@ class CloudLinkMonitor(_PluginBase):
             self._monitor_dirs = config.get("monitor_dirs") or ""
             self._exclude_keywords = config.get("exclude_keywords") or ""
             self._interval = config.get("interval") or 10
-            # self._cron = config.get("cron")
+            self._cron = config.get("cron")
             self._size = config.get("size") or 0
             self._softlink = config.get("softlink")
             self._strm = config.get("strm")
+            self._openlist_url = (config.get("openlist_url") or "").rstrip("/")
+            self._openlist_token = config.get("openlist_token") or ""
+            self._openlist_base = (config.get("openlist_base") or "").rstrip("/")
+            self._rc_socket = config.get("rc_socket") or ""
+            self._rc_fs = config.get("rc_fs") or ""
+            self._rc_mount_prefix = (config.get("rc_mount_prefix") or "").rstrip("/")
+            self._junk_clean = config.get("junk_clean") or False
+            self._junk_exts = config.get("junk_exts") or ".url,.html,.htm,.txt"
+
+        # 重置失败重试计数
+        self._retry_counts = {}
 
         # 停止现有任务
         self.stop_service()
@@ -278,6 +303,15 @@ class CloudLinkMonitor(_PluginBase):
             "category": self._category,
             "size": self._size,
             "refresh": self._refresh,
+            "cron": self._cron,
+            "openlist_url": self._openlist_url,
+            "openlist_token": self._openlist_token,
+            "openlist_base": self._openlist_base,
+            "rc_socket": self._rc_socket,
+            "rc_fs": self._rc_fs,
+            "rc_mount_prefix": self._rc_mount_prefix,
+            "junk_clean": self._junk_clean,
+            "junk_exts": self._junk_exts,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -305,13 +339,189 @@ class CloudLinkMonitor(_PluginBase):
         # 遍历所有监控目录
         for mon_path in self._dirconf.keys():
             logger.info(f"开始处理监控目录 {mon_path} ...")
-            list_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
-            logger.info(f"监控目录 {mon_path} 共发现 {len(list_files)} 个文件")
-            # 遍历目录下所有文件
-            for file_path in list_files:
+            media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
+            sub_files = SystemUtils.list_files(Path(mon_path), settings.RMT_SUBEXT)
+            logger.info(f"监控目录 {mon_path} 共发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
+            # 遍历目录下所有文件（先媒体后字幕，保证字幕改名与视频一致时目标目录已就绪）
+            for file_path in media_files + sub_files:
                 logger.info(f"开始处理文件 {file_path} ...")
-                self.__handle_file(event_path=str(file_path), mon_path=mon_path)
+                self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
         logger.info("全量同步云盘实时监控目录完成！")
+
+    def sync_reconcile(self):
+        """
+        定时对账：强制刷新云端列表与挂载缓存后，扫描监控目录中未处理的媒体与字幕文件。
+        仅处理配置了目的目录的监控目录；失败记录会有限次重试。
+        """
+        logger.info("开始云盘目录定时对账 ...")
+        try:
+            self.__refresh_sources()
+        except Exception as e:
+            logger.error(f"对账刷新缓存失败：{str(e)}")
+        for mon_path in list(self._dirconf.keys()):
+            if self._dirconf.get(mon_path) is None:
+                continue
+            try:
+                media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
+                sub_files = SystemUtils.list_files(Path(mon_path), settings.RMT_SUBEXT)
+            except Exception as e:
+                logger.error(f"对账扫描 {mon_path} 失败：{str(e)}")
+                continue
+            if media_files or sub_files:
+                logger.info(f"对账：{mon_path} 发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
+            for file_path in media_files + sub_files:
+                self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
+        if self._junk_clean:
+            try:
+                self.__clean_junk_dirs()
+            except Exception as e:
+                logger.error(f"清理垃圾目录失败：{str(e)}")
+        logger.info("云盘目录定时对账完成")
+
+    def __refresh_sources(self):
+        """
+        对账前强制刷新：先让 OpenList 直连网盘拉取真实列表，再刷新 rclone VFS 目录缓存，
+        保证随后的挂载扫描看到云端真实状态。均为尽力而为，失败不阻塞扫描。
+        """
+        for mon_path in self._dirconf.keys():
+            if self._dirconf.get(mon_path) is None:
+                continue
+            if self._openlist_url and self._openlist_token:
+                ol_path = self.__map_openlist_path(mon_path)
+                if ol_path:
+                    logger.info(f"对账：强制刷新 OpenList 列表 {ol_path} ...")
+                    self.__openlist_refresh_walk(ol_path)
+            if self._rc_socket and self._rc_fs:
+                logger.info(f"对账：刷新 rclone 目录缓存 {mon_path} ...")
+                self.__vfs_refresh(mon_path)
+
+    def __map_openlist_path(self, local_path: str) -> Optional[str]:
+        """
+        将本地挂载路径映射为 OpenList 路径
+        """
+        if not self._rc_mount_prefix or not str(local_path).startswith(self._rc_mount_prefix):
+            return None
+        rel = str(local_path)[len(self._rc_mount_prefix):]
+        return (self._openlist_base + rel) or "/"
+
+    def __openlist_refresh_walk(self, ol_path: str, depth: int = 0, budget: list = None):
+        """
+        递归强制刷新 OpenList 目录列表（refresh=true 直连网盘），budget 限制总目录数防失控
+        """
+        if budget is None:
+            budget = [200]
+        if budget[0] <= 0 or depth > 6:
+            return
+        budget[0] -= 1
+        try:
+            resp = requests.post(f"{self._openlist_url}/api/fs/list",
+                                 headers={"Authorization": self._openlist_token,
+                                          "Content-Type": "application/json"},
+                                 json={"path": ol_path, "refresh": True, "page": 1, "per_page": 0},
+                                 timeout=60)
+            data = resp.json() if resp is not None else {}
+            if data.get("code") != 200:
+                logger.warn(f"OpenList 刷新 {ol_path} 失败：{data.get('message')}")
+                return
+            for item in (data.get("data") or {}).get("content") or []:
+                if item.get("is_dir"):
+                    self.__openlist_refresh_walk(f"{ol_path.rstrip('/')}/{item.get('name')}",
+                                                 depth + 1, budget)
+        except Exception as e:
+            logger.warn(f"OpenList 刷新 {ol_path} 异常：{str(e)}")
+
+    def __rc_call(self, endpoint: str, payload: dict, timeout: int = 300) -> bool:
+        """
+        通过 unix socket 调用 rclone rc 接口
+        """
+        if not self._rc_socket:
+            return False
+        try:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect(self._rc_socket)
+            req = (f"POST /{endpoint} HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\n"
+                   f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+            s.sendall(req)
+            data = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            ok = data.startswith(b"HTTP/1.1 200")
+            if not ok:
+                logger.warn(f"rclone rc {endpoint} 返回异常：{data[:200]}")
+            return ok
+        except Exception as e:
+            logger.warn(f"rclone rc {endpoint} 调用失败：{str(e)}")
+            return False
+
+    def __vfs_refresh(self, local_path: str) -> bool:
+        """
+        强制刷新 rclone VFS 目录缓存（递归）
+        """
+        if not self._rc_fs or not self._rc_mount_prefix \
+                or not str(local_path).startswith(self._rc_mount_prefix):
+            return False
+        rel = str(local_path)[len(self._rc_mount_prefix):].strip("/")
+        if not rel:
+            return False
+        return self.__rc_call("vfs/refresh", {"fs": self._rc_fs, "dir": rel, "recursive": "true"})
+
+    @staticmethod
+    def __match_any(keywords: List[str], text: str) -> bool:
+        """
+        判断文本是否命中任一正则关键字（无效正则忽略）
+        """
+        for keyword in keywords:
+            if not keyword:
+                continue
+            try:
+                if re.findall(keyword, text):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def __clean_junk_dirs(self):
+        """
+        清理监控目录下只剩垃圾文件（广告/推广/空目录）的一级子目录。
+        含任何未被排除的媒体/字幕/音轨文件或未知类型文件时保守不动。
+        """
+        junk_exts = [e.strip().lower() for e in (self._junk_exts or "").split(",") if e.strip()]
+        keep_exts = [str(e).lower() for e in
+                     (settings.RMT_MEDIAEXT + settings.RMT_SUBEXT + getattr(settings, "RMT_AUDIOEXT", []))]
+        keywords = [k for k in (self._exclude_keywords or "").split("\n") if k]
+        for mon_path in self._dirconf.keys():
+            if self._dirconf.get(mon_path) is None:
+                continue
+            root = Path(mon_path)
+            if not root.exists():
+                continue
+            for child in root.iterdir():
+                try:
+                    if not child.is_dir():
+                        continue
+                    all_files = [f for f in child.rglob("*") if f.is_file()]
+                    has_valuable = False
+                    for f in all_files:
+                        if f.suffix.lower() in keep_exts and not self.__match_any(keywords, str(f)):
+                            has_valuable = True
+                            break
+                    if has_valuable:
+                        continue
+                    if all_files and not all(
+                            f.suffix.lower() in junk_exts or self.__match_any(keywords, str(f))
+                            for f in all_files):
+                        # 含未知类型文件，保守起见不动
+                        continue
+                    logger.warn(f"对账清理：删除垃圾目录 {child}（含 {len(all_files)} 个垃圾文件）")
+                    shutil.rmtree(child, ignore_errors=True)
+                except Exception as e:
+                    logger.warn(f"对账清理 {child} 失败：{str(e)}")
 
     def event_handler(self, event, mon_path: str, text: str, event_path: str):
         """
@@ -326,11 +536,12 @@ class CloudLinkMonitor(_PluginBase):
             logger.debug("文件%s：%s" % (text, event_path))
             self.__handle_file(event_path=event_path, mon_path=mon_path)
 
-    def __handle_file(self, event_path: str, mon_path: str):
+    def __handle_file(self, event_path: str, mon_path: str, from_reconcile: bool = False):
         """
         同步一个文件
         :param event_path: 事件文件路径
         :param mon_path: 监控目录
+        :param from_reconcile: 是否来自定时对账（失败记录允许有限次重试）
         """
         file_path = Path(event_path)
         try:
@@ -340,8 +551,17 @@ class CloudLinkMonitor(_PluginBase):
             with lock:
                 transfer_history = self.transferhis.get_by_src(event_path)
                 if transfer_history:
-                    logger.info("文件已处理过：%s" % event_path)
-                    return
+                    # 成功记录直接跳过；失败记录仅在对账时有限次重试
+                    if transfer_history.status or not from_reconcile:
+                        logger.debug("文件已处理过：%s" % event_path)
+                        return
+                    retried = self._retry_counts.get(event_path, 0) if self._retry_counts is not None else 0
+                    if retried >= 3:
+                        logger.debug(f"{event_path} 整理失败已重试 {retried} 次，不再重试")
+                        return
+                    if self._retry_counts is not None:
+                        self._retry_counts[event_path] = retried + 1
+                    logger.info(f"{event_path} 上次整理失败，对账重试第 {retried + 1} 次")
 
                 # 回收站及隐藏的文件不处理
                 if event_path.find('/@Recycle/') != -1 \
@@ -368,9 +588,10 @@ class CloudLinkMonitor(_PluginBase):
                             logger.info(f"{event_path} 命中整理屏蔽词 {keyword}，不处理")
                             return
 
-                # 不是媒体文件不处理
-                if file_path.suffix not in settings.RMT_MEDIAEXT:
-                    logger.debug(f"{event_path} 不是媒体文件")
+                # 只处理媒体文件与字幕文件
+                is_subtitle = file_path.suffix.lower() in [str(ext).lower() for ext in settings.RMT_SUBEXT]
+                if file_path.suffix not in settings.RMT_MEDIAEXT and not is_subtitle:
+                    logger.debug(f"{event_path} 不是媒体或字幕文件")
                     return
 
                 # 判断是不是蓝光目录
@@ -390,8 +611,9 @@ class CloudLinkMonitor(_PluginBase):
                     logger.error(f"{file_path.name} 无法识别有效信息")
                     return
 
-                # 判断文件大小
-                if self._size and float(self._size) > 0 and file_path.stat().st_size < float(self._size) * 1024 ** 3:
+                # 判断文件大小（字幕文件不受大小限制）
+                if not is_subtitle and self._size and float(self._size) > 0 \
+                        and file_path.stat().st_size < float(self._size) * 1024 ** 3:
                     logger.info(f"{file_path} 文件大小小于监控文件大小，不处理")
                     return
 
@@ -512,8 +734,8 @@ class CloudLinkMonitor(_PluginBase):
                         transferinfo=transferinfo
                     )
 
-                # 刮削
-                if self._scrape:
+                # 刮削（字幕文件无需刮削）
+                if self._scrape and not is_subtitle:
                     self.mediaChain.scrape_metadata(fileitem=transferinfo.target_diritem,
                                                     meta=file_meta,
                                                     mediainfo=mediainfo)
@@ -532,7 +754,7 @@ class CloudLinkMonitor(_PluginBase):
                     }
                 }
                 """
-                if self._notify:
+                if self._notify and not is_subtitle:
                     # 发送消息汇总
                     media_list = self._medias.get(mediainfo.title_year + " " + file_meta.season) or {}
                     if media_list:
@@ -577,7 +799,7 @@ class CloudLinkMonitor(_PluginBase):
                         }
                     self._medias[mediainfo.title_year + " " + file_meta.season] = media_list
 
-                if self._refresh:
+                if self._refresh and not is_subtitle:
                     # 广播事件
                     self.eventmanager.send_event(EventType.TransferComplete, {
                         'meta': file_meta,
@@ -585,7 +807,7 @@ class CloudLinkMonitor(_PluginBase):
                         'transferinfo': transferinfo
                     })
 
-                if self._softlink:
+                if self._softlink and not is_subtitle:
                     # 通知实时软连接生成
                     self.eventmanager.send_event(EventType.PluginAction, {
                         'file_path': str(transferinfo.target_item.path),
@@ -593,19 +815,22 @@ class CloudLinkMonitor(_PluginBase):
                     })
 
                 if self._strm:
-                    # 通知Strm助手生成
+                    # 通知Strm助手生成（媒体文件生成strm，字幕文件由助手复制到strm目录）
                     self.eventmanager.send_event(EventType.PluginAction, {
                         'file_path': str(transferinfo.target_item.path),
                         'action': 'cloudstrm_file'
                     })
 
-                # 移动模式删除空目录
+                # 移动模式删除空目录（必须确认媒体/字幕/音轨文件都已清空，防止误删未整理的字幕）
                 if transfer_type == "move":
                     for file_dir in file_path.parents:
                         if len(str(file_dir)) <= len(str(Path(mon_path))):
                             # 重要，删除到监控目录为止
                             break
-                        files = SystemUtils.list_files(file_dir, settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT)
+                        files = SystemUtils.list_files(
+                            file_dir,
+                            settings.RMT_MEDIAEXT + settings.RMT_SUBEXT
+                            + getattr(settings, "RMT_AUDIOEXT", []) + settings.DOWNLOAD_TMPEXT)
                         if not files:
                             logger.warn(f"移动模式，删除空目录：{file_dir}")
                             shutil.rmtree(file_dir, ignore_errors=True)
@@ -717,13 +942,16 @@ class CloudLinkMonitor(_PluginBase):
         }]
         """
         if self._enabled and self._cron:
-            return [{
-                "id": "CloudLinkMonitor",
-                "name": "云盘实时监控全量同步服务",
-                "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.sync_all,
-                "kwargs": {}
-            }]
+            try:
+                return [{
+                    "id": "CloudLinkMonitor",
+                    "name": "云盘目录定时对账服务",
+                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "func": self.sync_reconcile,
+                    "kwargs": {}
+                }]
+            except Exception as e:
+                logger.error(f"注册定时对账服务失败，请检查cron表达式：{str(e)}")
         return []
 
     def sync(self) -> schemas.Response:
@@ -1042,6 +1270,196 @@ class CloudLinkMonitor(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cron',
+                                            'label': '对账周期(cron)',
+                                            'placeholder': '*/10 * * * *'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'junk_clean',
+                                            'label': '对账时清理垃圾目录',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'junk_exts',
+                                            'label': '垃圾文件扩展名',
+                                            'placeholder': '.url,.html,.htm,.txt'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openlist_url',
+                                            'label': 'OpenList地址',
+                                            'placeholder': 'http://127.0.0.1:5244'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 8
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openlist_token',
+                                            'label': 'OpenList令牌',
+                                            'placeholder': '用于对账前强制刷新网盘列表'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openlist_base',
+                                            'label': 'OpenList根路径',
+                                            'placeholder': '/115'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'rc_mount_prefix',
+                                            'label': '容器内挂载前缀',
+                                            'placeholder': '/115_rclone'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'rc_fs',
+                                            'label': 'rclone远端(fs)',
+                                            'placeholder': 'remote:path'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'rc_socket',
+                                            'label': 'rclone rc socket',
+                                            'placeholder': '/var/run/rclone/rcd_1000.sock'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '定时对账：先通过OpenList API强制刷新网盘真实列表，再刷新rclone挂载缓存，'
+                                                    '然后扫描监控目录处理遗漏的媒体/字幕文件（含失败重试，最多3次）。'
+                                                    '网盘挂载目录的文件事件经常因缓存不可见而丢失，强烈建议开启。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
                                 },
                                 'content': [
                                     {
@@ -1117,7 +1535,15 @@ class CloudLinkMonitor(_PluginBase):
             "exclude_keywords": "",
             "interval": 10,
             "cron": "",
-            "size": 0
+            "size": 0,
+            "openlist_url": "",
+            "openlist_token": "",
+            "openlist_base": "",
+            "rc_socket": "",
+            "rc_fs": "",
+            "rc_mount_prefix": "",
+            "junk_clean": False,
+            "junk_exts": ".url,.html,.htm,.txt"
         }
 
     def get_page(self) -> List[dict]:
