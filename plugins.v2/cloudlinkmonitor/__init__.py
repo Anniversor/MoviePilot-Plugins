@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.8.0"
+    plugin_version = "2.8.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -118,6 +118,8 @@ class CloudLinkMonitor(_PluginBase):
     _junk_exts = ".url,.html,.htm,.txt"
     # 快速探测间隔(秒)，0为关闭
     _fast_interval = 0
+    # 内置垃圾/广告文件名模式（与排除关键词合并生效，防止配置被误清后失去防线）
+    _builtin_junk_patterns = ["【更多", "更多.*(下载|访问)", "TVBOXNOW", r"\.url$"]
     # 失败重试计数(进程内)
     _retry_counts = None
     # 快速探测指纹(进程内)
@@ -554,6 +556,15 @@ class CloudLinkMonitor(_PluginBase):
             return False
         return self.__rc_call("vfs/refresh", {"fs": self._rc_fs, "dir": rel, "recursive": "true"})
 
+    def __exclude_patterns(self) -> List[str]:
+        """
+        内置垃圾模式与用户配置的排除关键词合并
+        """
+        patterns = list(self._builtin_junk_patterns)
+        if self._exclude_keywords:
+            patterns.extend(k for k in self._exclude_keywords.split("\n") if k)
+        return patterns
+
     @staticmethod
     def __match_any(keywords: List[str], text: str) -> bool:
         """
@@ -577,7 +588,7 @@ class CloudLinkMonitor(_PluginBase):
         junk_exts = [e.strip().lower() for e in (self._junk_exts or "").split(",") if e.strip()]
         keep_exts = [str(e).lower() for e in
                      (settings.RMT_MEDIAEXT + settings.RMT_SUBEXT + getattr(settings, "RMT_AUDIOEXT", []))]
-        keywords = [k for k in (self._exclude_keywords or "").split("\n") if k]
+        keywords = self.__exclude_patterns()
         for mon_path in self._dirconf.keys():
             if self._dirconf.get(mon_path) is None:
                 continue
@@ -654,12 +665,14 @@ class CloudLinkMonitor(_PluginBase):
                     logger.debug(f"{event_path} 是回收站或隐藏的文件")
                     return
 
-                # 命中过滤关键字不处理
-                if self._exclude_keywords:
-                    for keyword in self._exclude_keywords.split("\n"):
+                # 命中过滤关键字不处理（内置垃圾模式 + 用户配置合并生效）
+                for keyword in self.__exclude_patterns():
+                    try:
                         if keyword and re.findall(keyword, event_path):
                             logger.info(f"{event_path} 命中过滤关键字 {keyword}，不处理")
                             return
+                    except Exception:
+                        continue
 
                 # 整理屏蔽词不处理
                 transfer_exclude_words = self.systemconfig.get(SystemConfigKey.TransferExcludeWords)
