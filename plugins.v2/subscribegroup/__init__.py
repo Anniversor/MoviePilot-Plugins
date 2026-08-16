@@ -20,7 +20,7 @@ class SubscribeGroup(_PluginBase):
     # 插件图标
     plugin_icon = "teamwork.png"
     # 插件版本
-    plugin_version = "2.8.6"
+    plugin_version = "2.8.7"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -184,7 +184,7 @@ class SubscribeGroup(_PluginBase):
             # 二级分类自定义配置
             category_conf = self._subscribe_confs.get(category)
 
-            logger.error(
+            logger.info(
                 f"订阅记录:{subscribe.name} 二级分类:{category} 自定义配置:{category_conf}")
 
             update_dict = {}
@@ -329,7 +329,7 @@ class SubscribeGroup(_PluginBase):
                         update_dict['include'] = resource_team
                 # 站点
                 if "站点" in self._update_details and (
-                        not subscribe.sites or (subscribe.sites and len(json.loads(subscribe.sites)) == 0)):
+                        not subscribe.sites or (subscribe.sites and len(subscribe.sites) == 0)):
                     # 站点 判断是否在订阅站点范围内
                     rss_sites = self.systemconfig.get(SystemConfigKey.RssSites) or []
                     if _torrent and _torrent.site and int(_torrent.site) in rss_sites:

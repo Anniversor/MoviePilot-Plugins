@@ -16,7 +16,8 @@ from requests import RequestException
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
-from app.helper.sites import SitesHelper, SiteSpider
+from app.helper.sites import SitesHelper
+from app.modules.indexer.spider import SiteSpider
 
 from app.chain.tmdb import TmdbChain
 from app.core.config import settings
@@ -62,7 +63,7 @@ class ShortPlayMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Amule_B.png"
     # 插件版本
-    plugin_version = "4.0.1"
+    plugin_version = "4.0.4"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -517,7 +518,7 @@ class ShortPlayMonitor(_PluginBase):
             if transfer_type == 'link':
                 # 硬链接
                 retcode, retmsg = SystemUtils.link(file_item, target_file)
-            elif transfer_type == 'filesoftlink':
+            elif transfer_type == 'softlink':
                 # 软链接
                 retcode, retmsg = SystemUtils.softlink(file_item, target_file)
             elif transfer_type == 'move':

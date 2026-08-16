@@ -29,7 +29,7 @@ class MediaSyncDel(_PluginBase):
     # 插件图标
     plugin_icon = "mediasyncdel.png"
     # 插件版本
-    plugin_version = "1.9.1"
+    plugin_version = "1.9.2"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -583,7 +583,7 @@ class MediaSyncDel(_PluginBase):
         if not self._enabled or str(self._sync_type) != "webhook":
             return
 
-        event_data = event.event_data
+        event_data: schemas.WebhookEventInfo = event.event_data
         event_type = event_data.event
 
         # Emby Webhook event_type = library.deleted
@@ -596,12 +596,16 @@ class MediaSyncDel(_PluginBase):
         media_name = event_data.item_name
         # 媒体路径
         media_path = event_data.item_path
+        # 兼容windows路径 如 C:\test.mp4 转换为 C:/test.mp4
+        media_path = media_path.replace('\\', '/')
         # tmdb_id
         tmdb_id = event_data.tmdb_id
         # 季数
         season_num = event_data.season_id
         # 集数
         episode_num = event_data.episode_id
+        # 操作时间戳
+        delete_time = self.format_timestamp(event_data.json_object)
 
         """
         执行删除逻辑
@@ -633,10 +637,11 @@ class MediaSyncDel(_PluginBase):
                         media_path=media_path,
                         tmdb_id=tmdb_id,
                         season_num=season_num,
-                        episode_num=episode_num)
+                        episode_num=episode_num,
+                        delete_time=delete_time)
 
     @eventmanager.register(EventType.WebhookMessage)
-    def sync_del_by_plugin(self, event):
+    def sync_del_by_plugin(self, event: Event):
         """
         emby删除媒体库同步删除历史记录
         Scripter X插件
@@ -644,7 +649,7 @@ class MediaSyncDel(_PluginBase):
         if not self._enabled or str(self._sync_type) != "plugin":
             return
 
-        event_data = event.event_data
+        event_data: schemas.WebhookEventInfo = event.event_data
         event_type = event_data.event
 
         # Scripter X插件 event_type = media_del
@@ -675,6 +680,8 @@ class MediaSyncDel(_PluginBase):
         media_name = event_data.item_name
         # 媒体路径
         media_path = event_data.item_path
+        # 兼容windows路径 如 C:\test.mp4 转换为 C:/test.mp4
+        media_path = media_path.replace('\\', '/')
         # tmdb_id
         tmdb_id = event_data.tmdb_id
         # 季数
@@ -746,8 +753,16 @@ class MediaSyncDel(_PluginBase):
                         season_num=season_num,
                         episode_num=episode_num)
 
-    def __sync_del(self, media_type: str, media_name: str, media_path: str,
-                   tmdb_id: int, season_num: str, episode_num: str):
+    def __sync_del(
+        self,
+        media_type: str,
+        media_name: str,
+        media_path: str,
+        tmdb_id: int,
+        season_num: str,
+        episode_num: str,
+        delete_time: Optional[str] = None,
+    ):
         if not media_type:
             logger.error(f"{media_name} 同步删除失败，未获取到媒体类型，请检查媒体是否刮削")
             return
@@ -774,14 +789,18 @@ class MediaSyncDel(_PluginBase):
                                                         season_num=season_num,
                                                         episode_num=episode_num)
 
-        logger.info(f"正在同步删除{msg}")
-
         if not transfer_history:
             logger.warn(
                 f"{media_type} {media_name} 未获取到可删除数据，请检查路径映射是否配置错误，请检查tmdbid获取是否正确")
             return
 
-        logger.info(f"获取到 {len(transfer_history)} 条转移记录，开始同步删除")
+        if delete_time:
+            latest_his = max(transfer_history, key=lambda x: x.date)
+            if delete_time < latest_his.date:
+                logger.warn(f"忽略删除 {msg}, 整理时间: {latest_his.date}, 发生在删除事件: {delete_time} 之后")
+                return
+
+        logger.info(f"开始同步删除 {msg}, 获取到 {len(transfer_history)} 条转移记录")
         # 开始删除
         year = None
         del_torrent_hashs = []
@@ -1223,3 +1242,14 @@ class MediaSyncDel(_PluginBase):
             return ""
         tmdb_image_url = f"https://{settings.TMDB_IMAGE_DOMAIN}"
         return tmdb_image_url + f"/t/p/{prefix}{path}"
+
+    @staticmethod
+    def format_timestamp(json_data: dict) -> str:
+        from app.utils.string import StringUtils
+
+        return StringUtils.format_timestamp(
+            StringUtils.str_to_timestamp(
+                json_data.get("UtcTimestamp")  # jellyfin
+                or json_data.get("Date")  # emby
+            )
+        )

@@ -126,7 +126,6 @@
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/pluginupdate.png",
     "author": "thsrite",
     "level": 1,
-    "v2": true,
     "history": {
       "v2.0.1": "仅可选择已安装插件",
       "v2.0": "修复插件显示版本问题",
@@ -168,12 +167,13 @@
     "name": "群辉Webhook通知",
     "description": "接收群辉webhook通知并推送。",
     "labels": "消息通知",
-    "version": "1.2",
+    "version": "1.3",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/synology.png",
     "author": "thsrite",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.3": "新增参数title、content、url",
       "v1.2": "修改配置描述",
       "v1.1": "修复bug",
       "v1.0": "接收群辉webhook通知并推送"
@@ -277,11 +277,12 @@
     "name": "短剧刮削",
     "description": "监控视频短剧创建，刮削。",
     "labels": "刮削",
-    "version": "3.2",
+    "version": "3.2.1",
     "icon": "Amule_B.png",
     "author": "thsrite",
     "level": 1,
     "history": {
+      "v3.2.1": "引入watchdog依赖",
       "v3.2": "支持消息发送",
       "v3.1": "支持自定义转移方式",
       "v3.0": "默认从tmdb刮削，刮削失败则从pt站刮削"
@@ -291,11 +292,12 @@
     "name": "云盘实时监控",
     "description": "监控云盘目录文件变化，自动转移链接。",
     "labels": "云盘",
-    "version": "2.4.6",
+    "version": "2.4.7",
     "icon": "Linkease_A.png",
     "author": "thsrite",
     "level": 1,
     "history": {
+      "v2.4.7": "引入watchdog依赖",
       "v2.4.6": "修复bug",
       "v2.4.5": "联动实时软连接插件（近媒体文件）",
       "v2.4.4": "修复刷新媒体库",
@@ -434,11 +436,12 @@
     "name": "实时软连接",
     "description": "监控目录文件变化，媒体文件软连接，其他文件可选复制。",
     "labels": "文件管理",
-    "version": "2.0.2",
+    "version": "2.0.3",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/softlink.png",
     "author": "thsrite",
     "level": 1,
     "history": {
+      "v2.0.3": "引入watchdog依赖",
       "v2.0.2": "增加同步间隔",
       "v2.0.1": "不重要的更新",
       "v2.0": "修复交互命令",
@@ -488,11 +491,12 @@
     "name": "Emby元数据刷新",
     "description": "定时刷新Emby媒体库元数据，演职人员中文。",
     "labels": "Emby",
-    "version": "1.7.4",
+    "version": "1.7.5",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/emby-icon.png",
     "author": "thsrite",
     "level": 1,
     "history": {
+      "v1.7.5": "同时适配 zhconv 和 zhconv-rs",
       "v1.7.4": "获取tmdb图片使用PROXY_HOST代理",
       "v1.7.3": "优化剧集演员刮削",
       "v1.7.2": "优化剧集演员刮削",
@@ -525,12 +529,14 @@
     "name": "热门媒体订阅",
     "description": "自动添加热门电影、电视剧、动漫到订阅。",
     "labels": "订阅",
-    "version": "1.7",
+    "version": "2.1",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/popular.png",
     "author": "thsrite",
     "level": 1,
     "v2": true,
     "history": {
+      "v2.1": "修复 MoviePilot v2.14 定时任务未传递热门订阅参数的问题",
+      "v2.0": "适配 MoviePilot v2.14 订阅统计接口",
       "v1.7": "调整订阅用户名，默认：热门订阅",
       "v1.6": "调整历史unique唯一索引（可删除本次更新后的历史）",
       "v1.5": "修复电视剧订阅、订阅历史展示",
@@ -559,11 +565,12 @@
     "name": "目录监控",
     "description": "监控目录文件发生变化时实时整理到媒体库。(统一入库消息增强版)（测试中-.-）",
     "labels": "文件整理",
-    "version": "1.0",
+    "version": "1.0.1",
     "icon": "directory.png",
     "author": "thsrite",
     "level": 1,
     "history": {
+      "v1.0.1": "引入watchdog依赖",
       "v1.0": "同步merge主仓库[目录监控]插件，增加统一发送消息逻辑（Testing…）"
     }
   },
@@ -600,11 +607,12 @@
     "name": "CloudDrive2助手",
     "description": "监控上传任务，检测是否有异常，发送通知。",
     "labels": "云盘",
-    "version": "1.8.4",
+    "version": "1.8.6",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/clouddrive.png",
     "author": "thsrite",
     "level": 2,
     "history": {
+      "v1.8.6": "解决依赖安装问题",
       "v1.8.4": "添加115 429消息通知",
       "v1.8.3": "添加异常处理，解决cd2上本地目录获取存储空间失败的问题",
       "v1.8.2": "插件页面密码类型设置为pasword",
@@ -787,6 +795,60 @@
       "v1.0.2": "修复问题",
       "v1.0.1": "支持Lucky最新版本获取ipv4。",
       "v1.0.0": "Lucky HomePage自定义API。"
+    }
+  },
+  "InvitesSignin": {
+    "name": "药丸签到",
+    "description": "药丸论坛签到。",
+    "labels": "站点",
+    "version": "1.5.1",
+    "icon": "invites.png",
+    "author": "thsrite",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.5.1": "增加保活（重新获取ck）",
+      "v1.5": "尝试修复签到",
+      "v1.4.1": "更新签到域名前缀",
+      "v1.4": "自定义保留消息天数"
+    }
+  },
+  "CloudflareSpeedTest": {
+    "name": "Cloudflare IP优选",
+    "description": "🌩 测试 Cloudflare CDN 延迟和速度，自动优选IP。",
+    "labels": "网络,站点",
+    "version": "1.5",
+    "icon": "cloudflare.jpg",
+    "author": "thsrite",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v1.5": "修改依赖包名",
+      "v1.4": "修复立即运行一次",
+      "v1.3": "调整插件开启状态判断条件",
+      "v1.2": "增强API安全性"
+    }
+  },
+  "WeatherWidget": {
+    "name": "天气",
+    "description": "定时推送天气，并在仪表盘中显示实时天气。",
+    "labels": "工具,仪表板",
+    "version": "1.8.1",
+    "icon": "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/weatherwidget.png",
+    "author": "InfinityPacer",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v1.8.1": "修复消息推送（I神摆烂了）",
+      "v1.8": "增加自动高度及组件规格，部分显示效果需要主程序升级1.9.3+版本及后续优化",
+      "v1.7": "天气时间以及空气质量调整为原生渲染，优化显示效果",
+      "v1.6": "增加天气定时推送以及对应的Bot指令",
+      "v1.5": "优化了天气显示效果，可以根据日出和日落时间自动切换不同的主题背景，并可根据设备选择不同的适配模式",
+      "v1.4": "优化不同天气下的背景显示效果",
+      "v1.3": "优化无边框显示效果，支持切换显示边框，进一步优化性能",
+      "v1.2": "精准匹配城市，并支持无边框显示，需要主程序升级v1.8.8+版本",
+      "v1.1": "性能优化以及天气图片显示优化",
+      "v1.0": "增加天气插件，支持在仪表盘中显示实时天气小部件"
     }
   }
 }
