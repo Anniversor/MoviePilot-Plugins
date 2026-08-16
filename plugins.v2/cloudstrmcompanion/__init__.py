@@ -58,7 +58,7 @@ class CloudStrmCompanion(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -377,17 +377,46 @@ class CloudStrmCompanion(_PluginBase):
                                                                                              self._other_mediaext.split(
                                                                                                  ",")]:
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
-            shutil.copy2(str(event_path), target_file)
-            logger.info(f"复制非媒体文件 {str(event_path)} 到 {target_file}")
+            if self.__copy_with_verify(str(event_path), target_file):
+                logger.info(f"复制非媒体文件 {str(event_path)} 到 {target_file}")
 
         # 复制字幕文件（独立于copy_files检查）
         if self._copy_subtitles and Path(event_path).suffix.lower() in ['.srt', '.ass', '.ssa', '.sub']:
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
-            shutil.copy2(str(event_path), target_file)
-            logger.info(f"复制字幕文件 {str(event_path)} 到 {target_file}")
-            # 通知Emby扫描新字幕（新字幕晚于视频入库时，Emby需要刷新才能挂载外挂字幕）
-            if self._refresh_emby and self._mediaservers:
-                self.__refresh_emby_file(target_file)
+            if self.__copy_with_verify(str(event_path), target_file):
+                logger.info(f"复制字幕文件 {str(event_path)} 到 {target_file}")
+                # 通知Emby扫描新字幕（新字幕晚于视频入库时，Emby需要刷新才能挂载外挂字幕）
+                if self._refresh_emby and self._mediaservers:
+                    self.__refresh_emby_file(target_file)
+
+    def __copy_with_verify(self, src: str, dst: str, retries: int = 3) -> bool:
+        """
+        带校验的复制：云盘挂载在文件刚被移动后短时间内可能读到0字节且不报错，
+        复制后核对源/目标大小，不一致则刷新挂载缓存并重试；最终失败时清掉空文件。
+        """
+        for i in range(retries):
+            try:
+                src_size = Path(src).stat().st_size
+                if src_size > 0:
+                    shutil.copy2(src, dst)
+                    if Path(dst).stat().st_size == src_size:
+                        return True
+                    logger.warn(f"复制校验失败(第{i + 1}次)：{dst} "
+                                f"目标大小={Path(dst).stat().st_size} 期望={src_size}")
+                else:
+                    logger.warn(f"复制校验失败(第{i + 1}次)：源文件大小为0 {src}")
+            except Exception as e:
+                logger.warn(f"复制失败(第{i + 1}次)：{src} -> {dst} {str(e)}")
+            self.__vfs_refresh(str(Path(src).parent))
+            time.sleep(3)
+        try:
+            if Path(dst).exists() and Path(dst).stat().st_size == 0:
+                Path(dst).unlink()
+                logger.warn(f"已清理复制失败残留的空文件：{dst}")
+        except Exception:
+            pass
+        logger.error(f"复制最终失败（将由定时全量对账重试）：{src} -> {dst}")
+        return False
 
     def __sava_json(self):
         """
