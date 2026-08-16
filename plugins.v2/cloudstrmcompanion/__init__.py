@@ -9,6 +9,7 @@ import traceback
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, List, Dict, Tuple, Optional
 
 import pytz
@@ -58,7 +59,7 @@ class CloudStrmCompanion(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -98,6 +99,11 @@ class CloudStrmCompanion(_PluginBase):
     _rc_socket = ""
     _rc_fs = ""
     _rc_mount_prefix = ""
+    # Emby通知队列（就绪门控+串行错峰）
+    _notify_gap = 5
+    _notify_queue = None
+    _notify_thread = None
+    _notify_stop = None
     mediaserver_helper = None
     _emby_paths = {}
     _path_replacements = {}  # 新增：路径替换规则属性
@@ -130,6 +136,10 @@ class CloudStrmCompanion(_PluginBase):
             self._rc_socket = config.get("rc_socket") or ""
             self._rc_fs = config.get("rc_fs") or ""
             self._rc_mount_prefix = (config.get("rc_mount_prefix") or "").rstrip("/")
+            try:
+                self._notify_gap = int(config.get("notify_gap") if config.get("notify_gap") is not None else 5)
+            except (TypeError, ValueError):
+                self._notify_gap = 5
             self._monitor = config.get("monitor")
             self._cover = config.get("cover")
             self._copy_files = config.get("copy_files")
@@ -155,6 +165,13 @@ class CloudStrmCompanion(_PluginBase):
 
         # 停止现有任务
         self.stop_service()
+
+        if self._enabled:
+            # 启动Emby通知队列worker（就绪门控+串行错峰）
+            self._notify_stop = threading.Event()
+            self._notify_queue = Queue()
+            self._notify_thread = threading.Thread(target=self.__notify_worker, daemon=True)
+            self._notify_thread.start()
 
         if self._enabled or self._onlyonce:
             # 定时服务
@@ -385,9 +402,9 @@ class CloudStrmCompanion(_PluginBase):
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
             if self.__copy_with_verify(str(event_path), target_file):
                 logger.info(f"复制字幕文件 {str(event_path)} 到 {target_file}")
-                # 通知Emby扫描新字幕（新字幕晚于视频入库时，Emby需要刷新才能挂载外挂字幕）
+                # 通知Emby扫描新字幕（走串行队列；本地副本即时可读）
                 if self._refresh_emby and self._mediaservers:
-                    self.__refresh_emby_file(target_file)
+                    self.__enqueue_notify(strm_file=target_file, source_file=target_file)
 
     def __copy_with_verify(self, src: str, dst: str, retries: int = 3) -> bool:
         """
@@ -519,34 +536,83 @@ class CloudStrmCompanion(_PluginBase):
                     }
                 self._medias[key] = media_list
 
-            # 通知emby刷新（先校验源文件在挂载上可见，避免Emby探测遇到缓存未刷新的空窗）
+            # 通知emby刷新（进入就绪门控串行队列：验证源可读并预热直链后逐个通知，错峰探测）
             if self._refresh_emby and self._mediaservers:
-                time.sleep(0.1)
-                if source_file:
-                    self.__ensure_source_visible(source_file)
-                self.__refresh_emby_file(strm_file)
+                self.__enqueue_notify(strm_file=strm_file, source_file=source_file)
             return True
         except Exception as e:
             logger.error(f"创建strm文件失败 {strm_file} -> {str(e)}")
         return False
 
-    def __ensure_source_visible(self, source_file: str) -> bool:
+    def __enqueue_notify(self, strm_file: str, source_file: str = None):
         """
-        校验源文件在挂载上可见；不可见时强制刷新rclone目录缓存并重试。
-        最终仍不可见也不阻塞通知（由定时提取任务兜底），但会输出明显日志。
+        通知入队；队列未启动时退化为直接通知
+        """
+        if self._notify_queue is None:
+            self.__refresh_emby_file(strm_file)
+            return
+        self._notify_queue.put({"strm": strm_file, "source": source_file,
+                                "attempts": 0, "not_before": 0})
+
+    def __notify_worker(self):
+        """
+        Emby通知队列worker：
+        1. 逐个校验源文件真实可读（读头64KB，顺带预热OpenList直链缓存，
+           让随后的Emby探测命中缓存，不再挤占网盘API限速）；
+        2. 未就绪的通知退避重排（30/60/90/120/150秒，共5次），Emby不会去探测
+           一个没准备好的文件，一次性提取队列不再被无效消耗；
+        3. 通知之间强制间隔，错峰Emby扫描与探测。
+        """
+        stop_event = self._notify_stop
+        pending = []
+        logger.info("Emby通知队列已启动（就绪门控+串行错峰）")
+        while stop_event is not None and not stop_event.is_set():
+            try:
+                pending.append(self._notify_queue.get(timeout=1))
+            except Empty:
+                pass
+            if not pending:
+                continue
+            now = time.time()
+            item = next((x for x in pending if x.get("not_before", 0) <= now), None)
+            if item is None:
+                continue
+            pending.remove(item)
+            src = item.get("source")
+            if src and not self.__source_readable(src):
+                item["attempts"] += 1
+                if item["attempts"] <= 5:
+                    delay = 30 * item["attempts"]
+                    item["not_before"] = time.time() + delay
+                    pending.append(item)
+                    logger.warn(f"源文件未就绪，{delay}秒后重试通知（第{item['attempts']}次）：{src}")
+                    continue
+                logger.error(f"源文件多次未就绪，仍通知Emby（由定时提取任务兜底）：{src}")
+            self.__refresh_emby_file(item.get("strm"))
+            # 串行间隔，错峰Emby扫描/探测
+            stop_event.wait(max(0, int(self._notify_gap or 0)))
+        left = len(pending) + (self._notify_queue.qsize() if self._notify_queue else 0)
+        if left:
+            logger.warn(f"通知队列停止，剩余 {left} 条未通知（由每日全量对账与定时提取兜底）")
+
+    def __source_readable(self, source_file: str) -> bool:
+        """
+        源文件就绪校验：存在且能实际读到数据。读取本身会让OpenList完成直链
+        获取并缓存，等效为Emby探测预热。
         """
         try:
-            for _ in range(3):
-                if Path(source_file).exists():
-                    return True
-                logger.warn(f"源文件暂不可见，尝试刷新挂载缓存：{source_file}")
-                self.__vfs_refresh(str(Path(source_file).parent))
-                time.sleep(2)
-            if Path(source_file).exists():
+            p = Path(source_file)
+            if not p.exists():
+                self.__vfs_refresh(str(p.parent))
+                if not p.exists():
+                    return False
+            with open(source_file, "rb") as f:
+                data = f.read(65536)
+            if len(data) > 0:
                 return True
-            logger.error(f"源文件多次刷新后仍不可见，Emby探测可能失败（等待定时提取兜底）：{source_file}")
+            logger.warn(f"源文件读到0字节：{source_file}")
         except Exception as e:
-            logger.error(f"源文件可见性检查异常：{str(e)}")
+            logger.warn(f"源文件读取失败：{source_file} - {str(e)}")
         return False
 
     def __rc_call(self, endpoint: str, payload: dict, timeout: int = 120) -> bool:
@@ -929,6 +995,7 @@ class CloudStrmCompanion(_PluginBase):
             "rc_socket": self._rc_socket,
             "rc_fs": self._rc_fs,
             "rc_mount_prefix": self._rc_mount_prefix,
+            "notify_gap": self._notify_gap,
             "copy_files": self._copy_files,
             "copy_subtitles": self._copy_subtitles,
             "refresh_emby": self._refresh_emby,
@@ -1251,7 +1318,7 @@ class CloudStrmCompanion(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -1268,7 +1335,7 @@ class CloudStrmCompanion(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -1277,6 +1344,23 @@ class CloudStrmCompanion(_PluginBase):
                                             'model': 'rc_mount_prefix',
                                             'label': '容器内挂载前缀',
                                             'placeholder': '/115_rclone'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'notify_gap',
+                                            'label': 'Emby通知间隔(秒)',
+                                            'placeholder': '5'
                                         }
                                     }
                                 ]
@@ -1507,6 +1591,7 @@ class CloudStrmCompanion(_PluginBase):
             "rc_socket": "",
             "rc_fs": "",
             "rc_mount_prefix": "",
+            "notify_gap": 5,
             "url": "",
             "other_mediaext": ".nfo, .jpg, .png, .json",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
@@ -1520,6 +1605,11 @@ class CloudStrmCompanion(_PluginBase):
         """
         退出插件
         """
+        if self._notify_stop:
+            self._notify_stop.set()
+        if self._notify_thread and self._notify_thread.is_alive():
+            self._notify_thread.join(timeout=5)
+        self._notify_thread = None
         if self._observer:
             for observer in self._observer:
                 try:

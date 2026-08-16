@@ -454,11 +454,12 @@
     "name": "云盘Strm助手",
     "description": "实时监控、定时全量增量生成strm文件，通知Emby前校验源文件可见性。",
     "labels": "云盘",
-    "version": "1.4.1",
+    "version": "1.5.0",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png",
     "author": "thsrite,Anniversor",
     "level": 1,
     "history": {
+      "v1.5.0": "Emby通知改为就绪门控串行队列：先读源文件64KB验证并预热直链缓存，未就绪退避重试，通知间隔错峰，根治入库探测风暴",
       "v1.4.1": "复制字幕/非媒体文件后校验大小并重试，修复挂载读空窗导致的0字节文件；失败时清理残留空文件",
       "v1.4.0": "通知Emby前校验源文件可见性(不可见时vfs/refresh重试)；字幕复制后通知Emby刷新；新增定时全量对账",
       "v1.3.2": "插件联动生成Strm文件同时处理非媒体文件",
