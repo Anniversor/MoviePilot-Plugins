@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.7.0"
+    plugin_version = "2.7.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -637,6 +637,16 @@ class CloudLinkMonitor(_PluginBase):
                 if not file_item:
                     logger.warn(f"{event_path.name} 未找到对应的文件")
                     return
+
+                # 字幕语言标记归一化：MP核心的字幕语言正则不识别 zh-Hans/zh-Hant，
+                # 会导致简繁字幕改名后同名互相覆盖。归一化为 chs/cht 让核心正确追加
+                # .chi.zh-cn / .zh-tw 后缀。
+                if is_subtitle and file_item.name:
+                    normalized_name = re.sub(r"zh[-_]?hant", "cht", file_item.name, flags=re.I)
+                    normalized_name = re.sub(r"zh[-_]?hans", "chs", normalized_name, flags=re.I)
+                    if normalized_name != file_item.name:
+                        logger.info(f"字幕语言标记归一化：{file_item.name} -> {normalized_name}")
+                        file_item.name = normalized_name
                 # 识别媒体信息
                 mediainfo: MediaInfo = self.chain.recognize_media(meta=file_meta)
                 if not mediainfo:
