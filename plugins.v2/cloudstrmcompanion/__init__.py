@@ -59,7 +59,7 @@ class CloudStrmCompanion(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -388,23 +388,30 @@ class CloudStrmCompanion(_PluginBase):
         处理非媒体文件
         :param event_path: 事件文件路径
         """
-        # 复制非媒体文件
+        # 复制非媒体文件（进就绪门控队列：源文件刚被移动后存在读空窗，直接读会拿到0字节）
         if self._copy_files and self._other_mediaext and Path(event_path).suffix.lower() in [ext.strip() for
                                                                                              ext in
                                                                                              self._other_mediaext.split(
                                                                                                  ",")]:
-            os.makedirs(os.path.dirname(target_file), exist_ok=True)
-            if self.__copy_with_verify(str(event_path), target_file):
-                logger.info(f"复制非媒体文件 {str(event_path)} 到 {target_file}")
+            self.__enqueue_copy(src=str(event_path), dst=target_file, notify=False)
 
-        # 复制字幕文件（独立于copy_files检查）
+        # 复制字幕文件（独立于copy_files检查，复制成功后通知Emby挂载外挂字幕）
         if self._copy_subtitles and Path(event_path).suffix.lower() in ['.srt', '.ass', '.ssa', '.sub']:
-            os.makedirs(os.path.dirname(target_file), exist_ok=True)
-            if self.__copy_with_verify(str(event_path), target_file):
-                logger.info(f"复制字幕文件 {str(event_path)} 到 {target_file}")
-                # 通知Emby扫描新字幕（走串行队列；本地副本即时可读）
-                if self._refresh_emby and self._mediaservers:
-                    self.__enqueue_notify(strm_file=target_file, source_file=target_file)
+            self.__enqueue_copy(src=str(event_path), dst=target_file, notify=True)
+
+    def __enqueue_copy(self, src: str, dst: str, notify: bool = False):
+        """
+        复制任务入队；队列未启动时退化为直接复制
+        """
+        if self._notify_queue is None:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if self.__copy_with_verify(src, dst):
+                logger.info(f"复制文件 {src} 到 {dst}")
+                if notify and self._refresh_emby and self._mediaservers:
+                    self.__refresh_emby_file(dst)
+            return
+        self._notify_queue.put({"kind": "copy", "src": src, "dst": dst, "notify": notify,
+                                "attempts": 0, "not_before": 0})
 
     def __copy_with_verify(self, src: str, dst: str, retries: int = 3) -> bool:
         """
@@ -578,6 +585,32 @@ class CloudStrmCompanion(_PluginBase):
             if item is None:
                 continue
             pending.remove(item)
+            if item.get("kind") == "copy":
+                # 复制任务：源就绪后带校验复制，成功且需要时通知Emby
+                src = item.get("src")
+                dst = item.get("dst")
+                if not self.__source_readable(src):
+                    item["attempts"] += 1
+                    if item["attempts"] <= 5:
+                        delay = 30 * item["attempts"]
+                        item["not_before"] = time.time() + delay
+                        pending.append(item)
+                        logger.warn(f"源文件未就绪，{delay}秒后重试复制（第{item['attempts']}次）：{src}")
+                        continue
+                    logger.error(f"源文件多次未就绪，放弃复制（由每日全量对账兜底）：{src}")
+                    continue
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                except Exception as e:
+                    logger.error(f"创建目录失败：{os.path.dirname(dst)} - {str(e)}")
+                if self.__copy_with_verify(src, dst):
+                    logger.info(f"复制文件 {src} 到 {dst}")
+                    if item.get("notify") and self._refresh_emby and self._mediaservers:
+                        self.__refresh_emby_file(dst)
+                        # 串行间隔，错峰Emby扫描/探测
+                        stop_event.wait(max(0, int(self._notify_gap or 0)))
+                continue
+            # 通知任务
             src = item.get("source")
             if src and not self.__source_readable(src):
                 item["attempts"] += 1
