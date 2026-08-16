@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.8.2"
+    plugin_version = "2.9.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -743,8 +743,9 @@ class CloudLinkMonitor(_PluginBase):
                     if normalized_name != file_item.name:
                         logger.info(f"字幕语言标记归一化：{file_item.name} -> {normalized_name}")
                         file_item.name = normalized_name
-                # 识别媒体信息
-                mediainfo: MediaInfo = self.chain.recognize_media(meta=file_meta)
+                # 识别媒体信息（走chain层完整识别链：原生识别失败时自动回退AI辅助识别，
+                # 辅助识别以原始文件名请求LLM并回填季集信息，解决复杂命名解析失败问题）
+                mediainfo: MediaInfo = self.mediaChain.recognize_by_meta(file_meta)
                 if not mediainfo:
                     logger.warn(f'未识别到媒体信息，标题：{file_meta.name}')
                     # 新增转移成功历史记录
