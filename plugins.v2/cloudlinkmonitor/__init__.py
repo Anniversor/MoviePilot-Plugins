@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.7.1"
+    plugin_version = "2.8.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -116,8 +116,14 @@ class CloudLinkMonitor(_PluginBase):
     _rc_mount_prefix = ""
     _junk_clean = False
     _junk_exts = ".url,.html,.htm,.txt"
+    # 快速探测间隔(秒)，0为关闭
+    _fast_interval = 0
     # 失败重试计数(进程内)
     _retry_counts = None
+    # 快速探测指纹(进程内)
+    _fast_fp = None
+    # 对账互斥锁
+    _busy = None
     # 存储源目录与目的目录关系
     _dirconf: Dict[str, Optional[Path]] = {}
     # 存储源目录转移方式
@@ -167,9 +173,15 @@ class CloudLinkMonitor(_PluginBase):
             self._rc_mount_prefix = (config.get("rc_mount_prefix") or "").rstrip("/")
             self._junk_clean = config.get("junk_clean") or False
             self._junk_exts = config.get("junk_exts") or ".url,.html,.htm,.txt"
+            try:
+                self._fast_interval = int(config.get("fast_interval") or 0)
+            except (TypeError, ValueError):
+                self._fast_interval = 0
 
-        # 重置失败重试计数
+        # 重置失败重试计数与快速探测指纹
         self._retry_counts = {}
+        self._fast_fp = None
+        self._busy = threading.Lock()
 
         # 停止现有任务
         self.stop_service()
@@ -312,6 +324,7 @@ class CloudLinkMonitor(_PluginBase):
             "rc_mount_prefix": self._rc_mount_prefix,
             "junk_clean": self._junk_clean,
             "junk_exts": self._junk_exts,
+            "fast_interval": self._fast_interval,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -353,30 +366,108 @@ class CloudLinkMonitor(_PluginBase):
         定时对账：强制刷新云端列表与挂载缓存后，扫描监控目录中未处理的媒体与字幕文件。
         仅处理配置了目的目录的监控目录；失败记录会有限次重试。
         """
-        logger.info("开始云盘目录定时对账 ...")
+        if self._busy and not self._busy.acquire(blocking=False):
+            logger.info("上一轮对账仍在进行，跳过本轮")
+            return
         try:
-            self.__refresh_sources()
-        except Exception as e:
-            logger.error(f"对账刷新缓存失败：{str(e)}")
-        for mon_path in list(self._dirconf.keys()):
+            logger.info("开始云盘目录定时对账 ...")
+            try:
+                self.__refresh_sources()
+            except Exception as e:
+                logger.error(f"对账刷新缓存失败：{str(e)}")
+            for mon_path in list(self._dirconf.keys()):
+                if self._dirconf.get(mon_path) is None:
+                    continue
+                try:
+                    media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
+                    sub_files = SystemUtils.list_files(Path(mon_path), settings.RMT_SUBEXT)
+                except Exception as e:
+                    logger.error(f"对账扫描 {mon_path} 失败：{str(e)}")
+                    continue
+                if media_files or sub_files:
+                    logger.info(f"对账：{mon_path} 发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
+                for file_path in media_files + sub_files:
+                    self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
+            if self._junk_clean:
+                try:
+                    self.__clean_junk_dirs()
+                except Exception as e:
+                    logger.error(f"清理垃圾目录失败：{str(e)}")
+            logger.info("云盘目录定时对账完成")
+        finally:
+            if self._busy:
+                self._busy.release()
+
+    def fast_probe(self):
+        """
+        快速探测：低成本强刷监控目录浅层列表（顶层+一级子目录），
+        指纹变化时立即触发对账。监控目录平时为空，稳态开销约为每轮1次API调用。
+        """
+        if not self._enabled:
+            return
+        if self._busy and self._busy.locked():
+            return
+        fp = self.__collect_fingerprint()
+        if fp is None:
+            return
+        if self._fast_fp is None:
+            self._fast_fp = fp
+            logger.debug("快速探测：完成基线采集")
+            return
+        if fp != self._fast_fp:
+            logger.info("快速探测：发现云端变化，立即触发对账 ...")
+            self._fast_fp = fp
+            self.sync_reconcile()
+            # 对账消化文件后重新基线，避免下一轮因文件被搬走再次触发
+            new_fp = self.__collect_fingerprint()
+            if new_fp is not None:
+                self._fast_fp = new_fp
+
+    def __collect_fingerprint(self) -> Optional[dict]:
+        """
+        采集监控目录云端浅层指纹（顶层+至多10个一级子目录），每目录一次强制刷新列表
+        """
+        if not self._openlist_url or not self._openlist_token:
+            return None
+        fp = {}
+        for mon_path in self._dirconf.keys():
             if self._dirconf.get(mon_path) is None:
                 continue
-            try:
-                media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
-                sub_files = SystemUtils.list_files(Path(mon_path), settings.RMT_SUBEXT)
-            except Exception as e:
-                logger.error(f"对账扫描 {mon_path} 失败：{str(e)}")
+            ol_path = self.__map_openlist_path(mon_path)
+            if not ol_path:
                 continue
-            if media_files or sub_files:
-                logger.info(f"对账：{mon_path} 发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
-            for file_path in media_files + sub_files:
-                self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
-        if self._junk_clean:
-            try:
-                self.__clean_junk_dirs()
-            except Exception as e:
-                logger.error(f"清理垃圾目录失败：{str(e)}")
-        logger.info("云盘目录定时对账完成")
+            top = self.__openlist_list(ol_path)
+            if top is None:
+                # API异常时放弃本轮，避免误判触发
+                return None
+            fp[ol_path] = tuple(sorted(
+                (i.get("name"), i.get("is_dir"), i.get("size"), i.get("modified")) for i in top))
+            for name in [i.get("name") for i in top if i.get("is_dir")][:10]:
+                sub_path = f"{ol_path.rstrip('/')}/{name}"
+                sub = self.__openlist_list(sub_path)
+                if sub is not None:
+                    fp[sub_path] = tuple(sorted(
+                        (i.get("name"), i.get("is_dir"), i.get("size"), i.get("modified")) for i in sub))
+        return fp
+
+    def __openlist_list(self, ol_path: str) -> Optional[list]:
+        """
+        OpenList 强制刷新列出目录（refresh=true 直连网盘），失败返回 None
+        """
+        try:
+            resp = requests.post(f"{self._openlist_url}/api/fs/list",
+                                 headers={"Authorization": self._openlist_token,
+                                          "Content-Type": "application/json"},
+                                 json={"path": ol_path, "refresh": True, "page": 1, "per_page": 0},
+                                 timeout=30)
+            data = resp.json() if resp is not None else {}
+            if data.get("code") != 200:
+                logger.debug(f"OpenList 列目录 {ol_path} 失败：{data.get('message')}")
+                return None
+            return (data.get("data") or {}).get("content") or []
+        except Exception as e:
+            logger.debug(f"OpenList 列目录 {ol_path} 异常：{str(e)}")
+            return None
 
     def __refresh_sources(self):
         """
@@ -413,22 +504,14 @@ class CloudLinkMonitor(_PluginBase):
         if budget[0] <= 0 or depth > 6:
             return
         budget[0] -= 1
-        try:
-            resp = requests.post(f"{self._openlist_url}/api/fs/list",
-                                 headers={"Authorization": self._openlist_token,
-                                          "Content-Type": "application/json"},
-                                 json={"path": ol_path, "refresh": True, "page": 1, "per_page": 0},
-                                 timeout=60)
-            data = resp.json() if resp is not None else {}
-            if data.get("code") != 200:
-                logger.warn(f"OpenList 刷新 {ol_path} 失败：{data.get('message')}")
-                return
-            for item in (data.get("data") or {}).get("content") or []:
-                if item.get("is_dir"):
-                    self.__openlist_refresh_walk(f"{ol_path.rstrip('/')}/{item.get('name')}",
-                                                 depth + 1, budget)
-        except Exception as e:
-            logger.warn(f"OpenList 刷新 {ol_path} 异常：{str(e)}")
+        items = self.__openlist_list(ol_path)
+        if items is None:
+            logger.warn(f"OpenList 刷新 {ol_path} 失败")
+            return
+        for item in items:
+            if item.get("is_dir"):
+                self.__openlist_refresh_walk(f"{ol_path.rstrip('/')}/{item.get('name')}",
+                                             depth + 1, budget)
 
     def __rc_call(self, endpoint: str, payload: dict, timeout: int = 300) -> bool:
         """
@@ -951,18 +1034,28 @@ class CloudLinkMonitor(_PluginBase):
             "kwargs": {} # 定时器参数
         }]
         """
+        services = []
         if self._enabled and self._cron:
             try:
-                return [{
+                services.append({
                     "id": "CloudLinkMonitor",
                     "name": "云盘目录定时对账服务",
                     "trigger": CronTrigger.from_crontab(self._cron),
                     "func": self.sync_reconcile,
                     "kwargs": {}
-                }]
+                })
             except Exception as e:
                 logger.error(f"注册定时对账服务失败，请检查cron表达式：{str(e)}")
-        return []
+        if self._enabled and self._fast_interval and int(self._fast_interval) > 0 \
+                and self._openlist_url and self._openlist_token:
+            services.append({
+                "id": "CloudLinkMonitorFastProbe",
+                "name": "云盘目录快速探测",
+                "trigger": "interval",
+                "func": self.fast_probe,
+                "kwargs": {"seconds": int(self._fast_interval)}
+            })
+        return services
 
     def sync(self) -> schemas.Response:
         """
@@ -1280,7 +1373,7 @@ class CloudLinkMonitor(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -1297,7 +1390,24 @@ class CloudLinkMonitor(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'fast_interval',
+                                            'label': '快速探测间隔(秒,0关闭)',
+                                            'placeholder': '60'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -1313,7 +1423,7 @@ class CloudLinkMonitor(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -1456,7 +1566,8 @@ class CloudLinkMonitor(_PluginBase):
                                             'variant': 'tonal',
                                             'text': '定时对账：先通过OpenList API强制刷新网盘真实列表，再刷新rclone挂载缓存，'
                                                     '然后扫描监控目录处理遗漏的媒体/字幕文件（含失败重试，最多3次）。'
-                                                    '网盘挂载目录的文件事件经常因缓存不可见而丢失，强烈建议开启。'
+                                                    '快速探测：每隔N秒强刷监控目录浅层列表（顶层+一级子目录，成本约1次API调用），'
+                                                    '发现变化立即触发对账，把检测延迟从对账周期压缩到探测间隔。'
                                         }
                                     }
                                 ]
@@ -1553,7 +1664,8 @@ class CloudLinkMonitor(_PluginBase):
             "rc_fs": "",
             "rc_mount_prefix": "",
             "junk_clean": False,
-            "junk_exts": ".url,.html,.htm,.txt"
+            "junk_exts": ".url,.html,.htm,.txt",
+            "fast_interval": 0
         }
 
     def get_page(self) -> List[dict]:
