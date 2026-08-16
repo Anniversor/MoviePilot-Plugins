@@ -23,8 +23,14 @@ from app.core.config import settings
 from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import TorrentInfo
 from app.schemas.types import MediaType
+
+# 搜索链路使用 app.core.context.TorrentInfo(dataclass,带 to_dict);
+# 部分版本迁移到 app.schemas(pydantic),做兼容导入
+try:
+    from app.core.context import TorrentInfo
+except ImportError:
+    from app.schemas import TorrentInfo
 
 
 class SeedHubIndexer(_PluginBase):
@@ -92,8 +98,14 @@ class SeedHubIndexer(_PluginBase):
         # 磁力缓存(seed_id -> magnet,磁力不变可长期复用)
         self._magnet_cache = self.get_data("magnet_map") or {}
 
+        # 停掉旧的注册确认定时器(重载场景)
+        self.__cancel_ensure_timer()
+
         if self._enabled:
-            self.__register_indexer()
+            # 站点索引池在系统启动时晚于插件初始化完成加载,
+            # 立即注册通常无效,需延迟注册并确认在列
+            self._ensure_attempts = 0
+            self.__schedule_ensure(delay=15)
 
     @staticmethod
     def __to_int(value, default, lo, hi):
@@ -121,12 +133,116 @@ class SeedHubIndexer(_PluginBase):
             "ua": self.UA,
         }
 
-    def __register_indexer(self):
+    def __domain_key(self) -> str:
+        return re.sub(r"^https?://", "", self._domain).strip("/").lower()
+
+    def __cancel_ensure_timer(self):
+        timer = getattr(self, "_ensure_timer", None)
+        if timer:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+            self._ensure_timer = None
+
+    def __schedule_ensure(self, delay: int):
+        self.__cancel_ensure_timer()
+        timer = threading.Timer(delay, self.__ensure_registered)
+        timer.daemon = True
+        self._ensure_timer = timer
+        timer.start()
+
+    def __pool_entry(self, helper) -> Optional[dict]:
+        """
+        在索引池中查找本站点(按域名匹配,合并后的 id 为站点表自增 id)。
+        """
+        key = self.__domain_key()
+        for indexer in (helper.get_indexers() or []):
+            dom = str(indexer.get("domain") or indexer.get("url") or "").lower()
+            if key and key in dom:
+                return indexer
+        return None
+
+    def __ensure_site_row(self, domain_key: str) -> bool:
+        """
+        确保站点管理表存在本站记录(get_indexers 只返回站点表内的站点)。
+        """
         try:
-            domain_key = re.sub(r"^https?://", "", self._domain).strip("/")
-            ret = SitesHelper().add_indexer(domain_key, self.__build_indexer())
-            self._registered = bool(ret)
-            logger.info(f"SeedHub 索引站点注册{'成功' if ret else '失败'}:{domain_key} (id={self.SITE_ID})")
+            from app.db.site_oper import SiteOper
+            oper = SiteOper()
+            if oper.exists(domain_key):
+                return True
+            ok, msg = oper.add(
+                name=self.SITE_NAME,
+                url=f"{self._domain}/",
+                domain=domain_key,
+                ua=self.UA,
+                pri=21,
+                rss="",
+                cookie="",
+                public=1,
+                proxy=1 if self._proxy else 0,
+                render=0,
+                timeout=self._timeout,
+            )
+            logger.info(f"SeedHub 站点管理记录创建:{ok} {msg}")
+            return ok or "已存在" in (msg or "")
+        except Exception as e:
+            logger.error(f"SeedHub 站点管理记录创建出错:{str(e)}")
+            return False
+
+    def __ensure_registered(self):
+        """
+        确认本站点已进搜索索引池。索引池 = 索引定义 ∩ 站点管理表,
+        且认证加载晚于插件初始化,故:池未就绪则重试;就绪后先补
+        站点表记录、再注册索引定义,回读确认。
+        """
+        try:
+            helper = SitesHelper()
+            pool = helper.get_indexers() or []
+            if not pool:
+                logger.info("SeedHub 索引池尚未就绪(认证加载未完成),稍后重试注册...")
+                self.__retry_ensure()
+                return
+            entry = self.__pool_entry(helper)
+            if entry:
+                self._registered = True
+                logger.info(f"SeedHub 已在搜索索引池:id={entry.get('id')} "
+                            f"name={entry.get('name')} domain={entry.get('domain')}")
+                return
+            domain_key = self.__domain_key()
+            self.__ensure_site_row(domain_key)
+            ret = helper.add_indexer(domain_key, self.__build_indexer())
+            entry = self.__pool_entry(helper)
+            self._registered = entry is not None
+            logger.info(f"SeedHub 注册:add_indexer={ret},回读在列={self._registered}"
+                        f"{',id=' + str(entry.get('id')) if entry else ''}(池 {len(helper.get_indexers() or [])} 个)")
+            if not self._registered:
+                self.__retry_ensure()
+        except Exception as e:
+            logger.error(f"SeedHub 注册确认出错:{str(e)}")
+            self.__retry_ensure()
+
+    def __retry_ensure(self):
+        self._ensure_attempts = getattr(self, "_ensure_attempts", 0) + 1
+        if self._ensure_attempts < 20:
+            self.__schedule_ensure(delay=30)
+        else:
+            logger.error("SeedHub 多次注册后仍未进入索引池,放弃。"
+                         "可能当前 MoviePilot 版本限制自定义索引站点。")
+
+    def __register_indexer(self):
+        """
+        域名切换后重注册入口(池已就绪场景)。
+        """
+        try:
+            helper = SitesHelper()
+            domain_key = self.__domain_key()
+            self.__ensure_site_row(domain_key)
+            ret = helper.add_indexer(domain_key, self.__build_indexer())
+            entry = self.__pool_entry(helper)
+            self._registered = entry is not None
+            logger.info(f"SeedHub 索引站点注册:{domain_key} add_indexer={ret} 在列={self._registered}")
         except Exception as e:
             self._registered = False
             logger.error(f"SeedHub 索引站点注册出错:{str(e)}")
@@ -152,11 +268,12 @@ class SeedHubIndexer(_PluginBase):
         """
         if not self.get_state():
             return None
-        if not site or site.get("id") != self.SITE_ID:
+        if not site:
             return None
-        # 域名巡检切换后,旧注册项残留在索引池中,按域名过滤避免重复搜索
-        if (site.get("domain") or "").rstrip("/") != self._domain:
-            return []
+        # 按域名识别本站点(索引池合并后 id 为站点表自增 id,不可预知)
+        site_domain = str(site.get("domain") or site.get("url") or "").lower()
+        if self.__domain_key() not in site_domain:
+            return None
         if page:
             return []
         # 关键词可能为列表(批量),取前两个依次尝试
@@ -166,7 +283,7 @@ class SeedHubIndexer(_PluginBase):
             return []
         try:
             for kw in keywords[:2]:
-                results = self.__do_search(str(kw), mtype)
+                results = self.__do_search(site, str(kw), mtype)
                 if results:
                     return results
             return []
@@ -187,7 +304,7 @@ class SeedHubIndexer(_PluginBase):
             proxies=settings.PROXY if self._proxy else None
         ).get_res(url, allow_redirects=True)
 
-    def __do_search(self, keyword: str, mtype: MediaType = None) -> List[TorrentInfo]:
+    def __do_search(self, site: dict, keyword: str, mtype: MediaType = None) -> List[TorrentInfo]:
         # 1. 搜索页:取作品条目
         search_url = f"{self._domain}/s/{quote(keyword, safe='')}/"
         res = self.__request(search_url)
@@ -214,15 +331,15 @@ class SeedHubIndexer(_PluginBase):
         # 3. 解析磁力(带持久缓存与单次预算)
         resolved, cache_hits, fetched, skipped = self.__resolve_rows(rows)
 
-        # 4. 构造 TorrentInfo
+        # 4. 构造 TorrentInfo(站点身份字段取自索引池合并后的 site 字典)
         torrents = []
         for row in resolved:
             torrents.append(TorrentInfo(
-                site=self.SITE_ID,
-                site_name=self.SITE_NAME,
+                site=site.get("id"),
+                site_name=site.get("name") or self.SITE_NAME,
                 site_ua=self.UA,
                 site_proxy=self._proxy,
-                site_order=0,
+                site_order=site.get("pri") or 0,
                 title=row["title"],
                 description=row["description"],
                 enclosure=row["magnet"],
@@ -576,6 +693,6 @@ class SeedHubIndexer(_PluginBase):
         return []
 
     def stop_service(self):
-        pass
+        self.__cancel_ensure_timer()
 
     # endregion
