@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.9.0"
+    plugin_version = "2.9.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -565,6 +565,30 @@ class CloudLinkMonitor(_PluginBase):
             patterns.extend(k for k in self._exclude_keywords.split("\n") if k)
         return patterns
 
+    def __source_readable(self, path_str: str) -> bool:
+        """
+        源文件真实可读校验：stat大小>0且能读到数据。失败时强制刷新OpenList与
+        rclone两层缓存后重试一次。0字节或仍不可读返回False。
+        """
+        try:
+            p = Path(path_str)
+            for attempt in range(2):
+                try:
+                    if p.exists() and p.stat().st_size > 0:
+                        with open(path_str, "rb") as f:
+                            if len(f.read(4096)) > 0:
+                                return True
+                except Exception as e:
+                    logger.debug(f"源可读性检查异常：{path_str} - {str(e)}")
+                if attempt == 0:
+                    ol_parent = self.__map_openlist_path(str(p.parent))
+                    if ol_parent and self._openlist_url and self._openlist_token:
+                        self.__openlist_list(ol_parent)
+                    self.__vfs_refresh(str(p.parent))
+        except Exception as e:
+            logger.debug(f"源可读性检查失败：{path_str} - {str(e)}")
+        return False
+
     @staticmethod
     def __match_any(keywords: List[str], text: str) -> bool:
         """
@@ -732,6 +756,13 @@ class CloudLinkMonitor(_PluginBase):
                 file_item = self.storagechain.get_file_item(storage="local", path=file_path)
                 if not file_item:
                     logger.warn(f"{event_path.name} 未找到对应的文件")
+                    return
+
+                # 转移前校验源文件真实可读：挂载读空窗期(缓存陈旧)执行move，rename失败
+                # 会退化为copy+delete，copy读到0字节即造成数据损坏(0字节上传+原文件删除)。
+                # 不可读则本轮跳过(不记历史)，由后续对账自然重试。
+                if not self.__source_readable(str(file_path)):
+                    logger.warn(f"{event_path} 源文件暂不可读（读空窗），本轮跳过，待后续对账重试")
                     return
 
                 # 字幕语言标记归一化：MP核心的字幕语言正则不识别 zh-Hans/zh-Hant，
