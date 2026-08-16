@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.9.1"
+    plugin_version = "2.9.2"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -807,6 +807,24 @@ class CloudLinkMonitor(_PluginBase):
                                                                  season=1 if file_meta.begin_season is None else file_meta.begin_season)
                 else:
                     episodes_info = None
+
+                # TMDB集数校验：LLM辅助识别只看文件名，无法得知该季真实集数，
+                # [25][SP]这类会被判为正篇第25集。集数超出该季范围且文件名带特典
+                # 标记时划入特典季(Season 0)；超范围但无标记(可能为绝对集数命名)
+                # 时保持原判并告警。
+                if mediainfo.type == MediaType.TV and file_meta.begin_episode and episodes_info:
+                    valid_episodes = {getattr(e, "episode_number", None) for e in episodes_info}
+                    valid_episodes.discard(None)
+                    if valid_episodes and file_meta.begin_episode not in valid_episodes:
+                        if re.search(r"(?:^|[\[\s._-])(SP|OVA|OAD|SPECIALS?|特典|特別篇|特别篇|番外)(?:[\]\s._-]|$)",
+                                     file_path.name, re.IGNORECASE):
+                            logger.info(f"{file_path.name} 集数 {file_meta.begin_episode} 超出该季TMDB范围"
+                                        f"且含特典标记，划入特典季 Season 0")
+                            file_meta.begin_season = 0
+                            episodes_info = self.tmdbchain.tmdb_episodes(tmdbid=mediainfo.tmdb_id, season=0)
+                        else:
+                            logger.warn(f"{file_path.name} 集数 {file_meta.begin_episode} 超出TMDB该季集数范围"
+                                        f"（可能为绝对集数命名），按原识别结果整理")
 
                 # 查询转移目的目录
                 target_dir = DirectoryHelper().get_dir(mediainfo, src_path=Path(mon_path))
