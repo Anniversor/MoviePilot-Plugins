@@ -1,14 +1,27 @@
 {
+  "U115OfflineDownloader": {
+    "name": "115离线下载器",
+    "description": "将磁力下载路由到 OpenList 的 115 离线下载,进度显示与完成通知,配合目录监控实现全自动云端入库。",
+    "labels": "下载器,云盘",
+    "version": "1.0.0",
+    "icon": "115.png",
+    "author": "Anniversor",
+    "level": 1,
+    "history": {
+      "v1.0.0": "首个版本:download/list_torrents 插件模块;OpenList add_offline_download 提交 115 云端离线;btih 任务跟踪+轮询进度+完成/失败通知;自动绑定站点下载器字段"
+    }
+  },
   "SeedHubIndexer": {
     "name": "SeedHub索引",
     "description": "将 SeedHub 接入内建搜索,公开磁力资源进入统一搜索结果,支持镜像域名自动切换。",
     "labels": "搜索,站点",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://sidhub.cc/favicon.ico",
     "author": "Anniversor",
     "level": 1,
     "history": {
-      "v1.0.0": "首个版本:add_indexer 注册进搜索站点池 + search_torrents 插件模块;两级页面解析,magnet base64 解析并持久缓存;/worker-json-hosts/ 镜像域名每日巡检自动切换"
+      "v1.0.0": "首个版本:add_indexer 注册进搜索站点池 + search_torrents 插件模块;两级页面解析,magnet base64 解析并持久缓存;/worker-json-hosts/ 镜像域名每日巡检自动切换",
+      "v1.0.1": "TorrentInfo 透传 site_downloader,支持站点级下载器定向路由(配合 115离线下载器)"
     }
   },
   "AutoSignIn": {

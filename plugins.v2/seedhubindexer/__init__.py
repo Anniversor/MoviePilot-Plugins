@@ -41,7 +41,7 @@ class SeedHubIndexer(_PluginBase):
     # 插件图标
     plugin_icon = "https://sidhub.cc/favicon.ico"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -340,6 +340,8 @@ class SeedHubIndexer(_PluginBase):
                 site_ua=self.UA,
                 site_proxy=self._proxy,
                 site_order=site.get("pri") or 0,
+                # 透传站点配置的下载器,支持定向路由(如 115离线下载器)
+                site_downloader=site.get("downloader"),
                 title=row["title"],
                 description=row["description"],
                 enclosure=row["magnet"],
