@@ -66,7 +66,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.9.2"
+    plugin_version = "2.10.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -470,6 +470,34 @@ class CloudLinkMonitor(_PluginBase):
         except Exception as e:
             logger.debug(f"OpenList 列目录 {ol_path} 异常：{str(e)}")
             return None
+
+    def __refresh_target_dir(self, local_dir: str):
+        """
+        转移落地后对目标目录做 OpenList->rclone 双层强刷,消除挂载读空窗,
+        让 strm 助手的就绪门控首查即过。
+        风控考量:按目录60秒去重(一季N集共享一个目录只刷1次);
+        rclone 刷新读取的是 OpenList 刚刷新的缓存,不再穿透到115。
+        """
+        try:
+            cache = getattr(self, "_target_refreshed", None)
+            if cache is None:
+                cache = {}
+                self._target_refreshed = cache
+            now = datetime.datetime.now().timestamp()
+            if now - (cache.get(local_dir) or 0) < 60:
+                return
+            cache[local_dir] = now
+            if len(cache) > 200:
+                cutoff = now - 300
+                self._target_refreshed = {k: v for k, v in cache.items() if v > cutoff}
+            # 保序:先 OpenList 强刷(绕过115列表缓存),后 rclone vfs 刷新(拉取新列表)
+            ol_path = self.__map_openlist_path(local_dir)
+            if ol_path:
+                self.__openlist_list(ol_path)
+            self.__vfs_refresh(local_dir)
+            logger.info(f"目标目录已双层强刷：{local_dir}")
+        except Exception as e:
+            logger.warn(f"目标目录强刷失败：{local_dir} - {str(e)}")
 
     def __refresh_sources(self):
         """
@@ -971,6 +999,9 @@ class CloudLinkMonitor(_PluginBase):
                     })
 
                 if self._strm:
+                    # 通知前强刷目标目录(OpenList->rclone 双层,按目录60秒去重),
+                    # 消除读空窗,strm助手的就绪门控可首查即过
+                    self.__refresh_target_dir(str(Path(transferinfo.target_item.path).parent))
                     # 通知Strm助手生成（媒体文件生成strm，字幕文件由助手复制到strm目录）
                     self.eventmanager.send_event(EventType.PluginAction, {
                         'file_path': str(transferinfo.target_item.path),

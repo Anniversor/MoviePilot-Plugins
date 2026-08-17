@@ -470,7 +470,7 @@
     "name": "目录实时监控",
     "description": "监控云盘目录文件变化，自动转移媒体与字幕文件，支持云端定时对账、快速探测与挂载缓存强制刷新。",
     "labels": "云盘,工具",
-    "version": "2.9.1",
+    "version": "2.10.0",
     "icon": "Linkease_A.png",
     "author": "thsrite,Anniversor",
     "level": 1,
@@ -513,14 +513,15 @@
       "v1.3": "修复bug",
       "v1.2": "修复订阅重复处理的bug",
       "v1.1": "自动转移链接（不刮削）",
-      "v1.0": "监控云盘目录文件变化，按原文件名软连接"
+      "v1.0": "监控云盘目录文件变化，按原文件名软连接",
+      "v2.10.0": "转移落地后主动双层强刷目标目录(OpenList refresh -> rclone vfs/refresh,按目录60秒去重),消除挂载读空窗,strm助手就绪门控可首查即过"
     }
   },
   "CloudStrmCompanion": {
     "name": "云盘Strm助手",
     "description": "实时监控、定时全量增量生成strm文件，通知Emby前校验源文件可读并预热直链。",
     "labels": "云盘",
-    "version": "1.5.2",
+    "version": "1.6.0",
     "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png",
     "author": "thsrite,Anniversor",
     "level": 1,
@@ -557,7 +558,8 @@
       "v1.0.4": "修复实时监控，只处理指定类型的文件",
       "v1.0.3": "修复重建索引缓存",
       "v1.0.2": "增加可玩性交互命令",
-      "v1.0": "实时监控、定时全量增量生成strm文件"
+      "v1.0": "实时监控、定时全量增量生成strm文件",
+      "v1.6.0": "就绪门控读失败时先做OpenList->rclone双层强刷(按目录60秒去重,风控友好)再立即重读,通知Emby延迟从分钟级降到秒级;新增openlist_url/token/base配置;退避队列保留兜底"
     }
   },
   "StrmRedirect": {

@@ -59,7 +59,7 @@ class CloudStrmCompanion(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.5.2"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -99,6 +99,9 @@ class CloudStrmCompanion(_PluginBase):
     _rc_socket = ""
     _rc_fs = ""
     _rc_mount_prefix = ""
+    _openlist_url = ""
+    _openlist_token = ""
+    _openlist_base = ""
     # Emby通知队列（就绪门控+串行错峰）
     _notify_gap = 5
     _notify_queue = None
@@ -136,6 +139,12 @@ class CloudStrmCompanion(_PluginBase):
             self._rc_socket = config.get("rc_socket") or ""
             self._rc_fs = config.get("rc_fs") or ""
             self._rc_mount_prefix = (config.get("rc_mount_prefix") or "").rstrip("/")
+            self._openlist_url = (config.get("openlist_url") or "").rstrip("/")
+            self._openlist_token = config.get("openlist_token") or ""
+            self._openlist_base = (config.get("openlist_base") or "").rstrip("/")
+        # 就绪门控强刷的按目录去重缓存(60秒TTL,风控友好)
+        self._dir_refreshed = {}
+        if config:
             try:
                 self._notify_gap = int(config.get("notify_gap") if config.get("notify_gap") is not None else 5)
             except (TypeError, ValueError):
@@ -632,13 +641,25 @@ class CloudStrmCompanion(_PluginBase):
         """
         源文件就绪校验：存在且能实际读到数据。读取本身会让OpenList完成直链
         获取并缓存，等效为Emby探测预热。
+        读失败时做 OpenList->rclone 双层强刷（按目录60秒去重）后立即重读，
+        消除挂载读空窗的分钟级干等；仍失败才交还退避队列兜底。
+        """
+        if self.__try_read_head(source_file):
+            return True
+        if self.__dual_refresh(str(Path(source_file).parent)):
+            if self.__try_read_head(source_file):
+                logger.info(f"双层强刷后源文件已就绪：{source_file}")
+                return True
+        return False
+
+    @staticmethod
+    def __try_read_head(source_file: str) -> bool:
+        """
+        读源文件头64KB验证真实可读。
         """
         try:
-            p = Path(source_file)
-            if not p.exists():
-                self.__vfs_refresh(str(p.parent))
-                if not p.exists():
-                    return False
+            if not Path(source_file).exists():
+                return False
             with open(source_file, "rb") as f:
                 data = f.read(65536)
             if len(data) > 0:
@@ -647,6 +668,65 @@ class CloudStrmCompanion(_PluginBase):
         except Exception as e:
             logger.warn(f"源文件读取失败：{source_file} - {str(e)}")
         return False
+
+    def __map_openlist_path(self, local_path: str) -> Optional[str]:
+        """
+        容器本地挂载路径映射为 OpenList 侧路径（/115_rclone/X -> /115/X）。
+        """
+        if not self._openlist_base or not self._rc_mount_prefix \
+                or not str(local_path).startswith(self._rc_mount_prefix):
+            return None
+        rel = str(local_path)[len(self._rc_mount_prefix):]
+        return f"{self._openlist_base}{rel}" if rel else self._openlist_base
+
+    def __openlist_refresh(self, local_dir: str) -> bool:
+        """
+        OpenList 目录强制刷新（fs/list refresh=true），绕过其对115的列表缓存。
+        每次调用消耗1次115 API配额，调用方需按目录去重。
+        """
+        if not self._openlist_url or not self._openlist_token:
+            return False
+        ol_path = self.__map_openlist_path(local_dir)
+        if not ol_path:
+            return False
+        try:
+            res = requests.post(f"{self._openlist_url}/api/fs/list",
+                                headers={"Authorization": self._openlist_token,
+                                         "Content-Type": "application/json"},
+                                json={"path": ol_path, "refresh": True,
+                                      "page": 1, "per_page": 0},
+                                timeout=30)
+            return bool(res.status_code == 200 and (res.json() or {}).get("code") == 200)
+        except Exception as e:
+            logger.warn(f"OpenList 刷新失败：{ol_path} - {str(e)}")
+            return False
+
+    def __dual_refresh(self, local_dir: str) -> bool:
+        """
+        先 OpenList 后 rclone 的保序双层强刷。按目录60秒去重：一季N集共享
+        同一目录只刷一次，控制115 API消耗；rclone 刷新读取的是 OpenList
+        刚刷新的缓存，不再穿透到115。返回是否真正执行了刷新。
+        """
+        try:
+            cache = getattr(self, "_dir_refreshed", None)
+            if cache is None:
+                cache = {}
+                self._dir_refreshed = cache
+            now = time.time()
+            if now - (cache.get(local_dir) or 0) < 60:
+                return False
+            cache[local_dir] = now
+            if len(cache) > 200:
+                cutoff = now - 300
+                self._dir_refreshed = {k: v for k, v in cache.items() if v > cutoff}
+            ok_ol = self.__openlist_refresh(local_dir)
+            ok_rc = self.__vfs_refresh(local_dir)
+            logger.info(f"就绪门控双层强刷(OpenList={'OK' if ok_ol else 'SKIP'}, "
+                        f"rclone={'OK' if ok_rc else 'SKIP'})：{local_dir}")
+            return ok_ol or ok_rc
+        except Exception as e:
+            logger.warn(f"双层强刷出错：{local_dir} - {str(e)}")
+            return False
 
     def __rc_call(self, endpoint: str, payload: dict, timeout: int = 120) -> bool:
         """
@@ -1030,6 +1110,9 @@ class CloudStrmCompanion(_PluginBase):
             "rc_socket": self._rc_socket,
             "rc_fs": self._rc_fs,
             "rc_mount_prefix": self._rc_mount_prefix,
+            "openlist_url": self._openlist_url,
+            "openlist_token": self._openlist_token,
+            "openlist_base": self._openlist_base,
             "notify_gap": self._notify_gap,
             "copy_files": self._copy_files,
             "copy_subtitles": self._copy_subtitles,
@@ -1359,6 +1442,62 @@ class CloudStrmCompanion(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
+                                            'model': 'openlist_url',
+                                            'label': 'OpenList 地址',
+                                            'placeholder': 'http://127.0.0.1:5244（就绪门控强刷用）'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openlist_token',
+                                            'label': 'OpenList Token',
+                                            'type': 'password'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'openlist_base',
+                                            'label': 'OpenList 基础路径',
+                                            'placeholder': '/115（对应挂载前缀的网盘侧路径）'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
                                             'model': 'rc_fs',
                                             'label': 'rclone远端(fs)',
                                             'placeholder': 'remote:path（通知Emby前校验源文件用）'
@@ -1627,6 +1766,9 @@ class CloudStrmCompanion(_PluginBase):
             "rc_fs": "",
             "rc_mount_prefix": "",
             "notify_gap": 5,
+            "openlist_url": "",
+            "openlist_token": "",
+            "openlist_base": "",
             "url": "",
             "other_mediaext": ".nfo, .jpg, .png, .json",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
