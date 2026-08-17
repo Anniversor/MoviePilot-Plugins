@@ -43,7 +43,10 @@ class U115OfflineDownloader(_PluginBase):
     # 插件图标
     plugin_icon = "115.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
+
+    # 下载器列表注册用的自定义类型(qb/tr 模块按 type 匹配配置,不会认领此类型)
+    DOWNLOADER_TYPE = "u115offline"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -93,7 +96,10 @@ class U115OfflineDownloader(_PluginBase):
         self.__stop_poller()
         if self._enabled:
             self.__bind_site_downloader()
+            self.__ensure_downloader_entry()
             self.__start_poller()
+        else:
+            self.__remove_downloader_entry()
 
     @staticmethod
     def __to_int(value, default, lo, hi):
@@ -124,6 +130,57 @@ class U115OfflineDownloader(_PluginBase):
                     logger.info(f"115离线:站点 {domain} 下载器已绑定为 {self._downloader_name}")
         except Exception as e:
             logger.error(f"115离线:绑定站点下载器出错:{str(e)}")
+
+    # region 下载器列表注册
+
+    def __get_downloaders_config(self):
+        from app.db.systemconfig_oper import SystemConfigOper
+        from app.schemas.types import SystemConfigKey
+        oper = SystemConfigOper()
+        return oper, SystemConfigKey.Downloaders, (oper.get(SystemConfigKey.Downloaders) or [])
+
+    def __ensure_downloader_entry(self):
+        """
+        把本下载器注册进系统下载器列表(自定义 type,qb/tr 模块按 type
+        匹配配置不会认领),使其出现在下载弹窗/站点编辑的下载器下拉中。
+        不设为默认,不改动用户对 enabled/default 的调整。
+        """
+        try:
+            oper, key, downloaders = self.__get_downloaders_config()
+            entry = next((d for d in downloaders
+                          if d.get("name") == self._downloader_name), None)
+            if entry:
+                if entry.get("type") != self.DOWNLOADER_TYPE:
+                    entry["type"] = self.DOWNLOADER_TYPE
+                    oper.set(key, downloaders)
+                return
+            downloaders.append({
+                "name": self._downloader_name,
+                "type": self.DOWNLOADER_TYPE,
+                "default": False,
+                "enabled": True,
+                "config": {},
+                "path_mapping": [],
+            })
+            oper.set(key, downloaders)
+            logger.info(f"115离线:已注册到下载器列表:{self._downloader_name}")
+        except Exception as e:
+            logger.error(f"115离线:注册下载器列表出错:{str(e)}")
+
+    def __remove_downloader_entry(self):
+        """
+        插件停用时从下载器列表移除本条目,保持下拉选项真实。
+        """
+        try:
+            oper, key, downloaders = self.__get_downloaders_config()
+            remain = [d for d in downloaders
+                      if not (d.get("name") == self._downloader_name
+                              and d.get("type") == self.DOWNLOADER_TYPE)]
+            if len(remain) != len(downloaders):
+                oper.set(key, remain)
+                logger.info(f"115离线:已从下载器列表移除:{self._downloader_name}")
+        except Exception as e:
+            logger.error(f"115离线:移除下载器列表条目出错:{str(e)}")
 
     # endregion
 
@@ -173,7 +230,22 @@ class U115OfflineDownloader(_PluginBase):
         return {
             "download": self.download,
             "list_torrents": self.list_torrents,
+            "downloader_info": self.downloader_info,
         }
+
+    def downloader_info(self, downloader: Optional[str] = None, **kwargs) -> Optional[list]:
+        """
+        下载器信息模块:供设置页卡片与仪表板聚合(云端离线无本地速度,报零)。
+        """
+        if not self.get_state():
+            return None
+        if downloader and downloader != self._downloader_name:
+            return None
+        try:
+            from app.schemas import DownloaderInfo
+        except ImportError:
+            from app.schemas.dashboard import DownloaderInfo
+        return [DownloaderInfo()]
 
     def download(self, content: Union[str, bytes] = None, download_dir=None, cookie: str = None,
                  episodes=None, category: Optional[str] = None, label: Optional[str] = None,
@@ -377,9 +449,10 @@ class U115OfflineDownloader(_PluginBase):
                     has_tasks = bool(self._tasks)
                 if has_tasks:
                     self.__poll_once()
-                # 定期重新绑定站点下载器(防 UI 编辑站点时被覆盖)
+                # 定期自愈:站点下载器绑定 + 下载器列表条目(防 UI 保存时被覆盖)
                 if tick % 20 == 0:
                     self.__bind_site_downloader()
+                    self.__ensure_downloader_entry()
             except Exception as e:
                 logger.error(f"115离线:轮询出错:{str(e)}")
 
