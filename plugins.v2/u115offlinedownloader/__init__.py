@@ -181,8 +181,6 @@ class U115OfflineDownloader(_PluginBase):
         """
         if not self.get_state():
             return None
-        if not downloader or downloader != self._downloader_name:
-            return None
 
         # 仅支持磁力链接(115 离线的能力边界)
         magnet = None
@@ -190,8 +188,17 @@ class U115OfflineDownloader(_PluginBase):
             magnet = content
         elif isinstance(content, bytes) and content.startswith(b"magnet:"):
             magnet = content.decode("utf-8", "ignore")
-        if not magnet:
-            return None, None, None, "115离线下载器仅支持磁力链接"
+
+        if downloader and downloader != self._downloader_name:
+            return None
+        if downloader == self._downloader_name:
+            if not magnet:
+                return None, None, None, "115离线下载器仅支持磁力链接"
+        else:
+            # 未指定下载器(如搜索页手动下载会抹掉站点路由):
+            # 磁力出自绑定站点索引缓存(SeedHub)时兜底认领,否则放行
+            if not magnet or not self.__is_bound_magnet(magnet):
+                return None
 
         btih = self.__parse_btih(magnet)
         title = self.__parse_dn(magnet) or btih
@@ -252,6 +259,27 @@ class U115OfflineDownloader(_PluginBase):
             ))
         return result
 
+    def __is_bound_magnet(self, magnet: str) -> bool:
+        """
+        判断磁力是否出自 SeedHub 索引(其 seed_id->magnet 持久缓存)。
+        """
+        try:
+            btih = None
+            m = re.search(r"urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", magnet)
+            if m:
+                btih = m.group(1).lower()
+            if not btih:
+                return False
+            from app.db.plugindata_oper import PluginDataOper
+            magnet_map = PluginDataOper().get_data("SeedHubIndexer", "magnet_map") or {}
+            for cached in magnet_map.values():
+                if btih in str(cached).lower():
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"115离线:磁力来源判断出错:{str(e)}")
+            return False
+
     @staticmethod
     def __parse_btih(magnet: str) -> str:
         m = re.search(r"urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", magnet)
@@ -311,7 +339,36 @@ class U115OfflineDownloader(_PluginBase):
             except Exception as e:
                 logger.error(f"115离线:轮询出错:{str(e)}")
 
+    def __enrich_titles(self):
+        """
+        磁力无 dn 时提交时刻拿不到标题(下载历史在模块返回后才落库),
+        轮询时从下载历史按 Hash 反查补齐。
+        """
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+            oper = DownloadHistoryOper()
+            with self._tasks_lock:
+                pending = {h: v for h, v in self._tasks.items()
+                           if (v.get("title") or "") == h}
+            for btih, info in pending.items():
+                his = None
+                try:
+                    his = oper.get_by_hash(btih)
+                except AttributeError:
+                    result = oper.get_by_hashes([btih]) or {}
+                    his = result.get(btih) if isinstance(result, dict) else (result[0] if result else None)
+                if not his:
+                    continue
+                name = getattr(his, "torrent_name", None) or getattr(his, "title", None)
+                if name:
+                    with self._tasks_lock:
+                        if btih in self._tasks:
+                            self._tasks[btih]["title"] = str(name)
+        except Exception as e:
+            logger.debug(f"115离线:标题补齐出错:{str(e)}")
+
     def __poll_once(self):
+        self.__enrich_titles()
         undone = self.__fetch_tasks("undone")
         done = self.__fetch_tasks("done")
         changed = False
