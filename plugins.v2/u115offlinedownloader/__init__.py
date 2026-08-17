@@ -19,7 +19,9 @@ import json
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import quote
 
 import requests
 
@@ -41,7 +43,7 @@ class U115OfflineDownloader(_PluginBase):
     # 插件图标
     plugin_icon = "115.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -63,6 +65,7 @@ class U115OfflineDownloader(_PluginBase):
     _poll_interval = 30
     _notify = True
     _bind_domains = "sidhub.cc"
+    _claim_public = True
 
     def __init__(self):
         super().__init__()
@@ -82,6 +85,7 @@ class U115OfflineDownloader(_PluginBase):
             self._poll_interval = self.__to_int(config.get("poll_interval"), 30, 10, 600)
             self._notify = bool(config.get("notify", True))
             self._bind_domains = (config.get("bind_domains") or "").strip()
+            self._claim_public = bool(config.get("claim_public", True))
 
         # 跟踪中的离线任务(btih -> info),持久化防重启丢失
         self._tasks = self.get_data("offline_tasks") or {}
@@ -182,26 +186,43 @@ class U115OfflineDownloader(_PluginBase):
         if not self.get_state():
             return None
 
-        # 仅支持磁力链接(115 离线的能力边界)
+        explicit = downloader == self._downloader_name
+        if downloader and not explicit:
+            # 显式指定了其他下载器(如 qbtorrent),尊重选择
+            return None
+
         magnet = None
+        title_hint = None
         if isinstance(content, str) and content.startswith("magnet:"):
             magnet = content
         elif isinstance(content, bytes) and content.startswith(b"magnet:"):
             magnet = content.decode("utf-8", "ignore")
 
-        if downloader and downloader != self._downloader_name:
-            return None
-        if downloader == self._downloader_name:
-            if not magnet:
-                return None, None, None, "115离线下载器仅支持磁力链接"
-        else:
-            # 未指定下载器(如搜索页手动下载会抹掉站点路由):
-            # 磁力出自绑定站点索引缓存(SeedHub)时兜底认领,否则放行
-            if not magnet or not self.__is_bound_magnet(magnet):
+        if magnet:
+            # 磁力:显式路由必接;自动模式按开关认领(SeedHub 缓存命中兜底)
+            if not explicit and not self._claim_public and not self.__is_bound_magnet(magnet):
                 return None
+        else:
+            # 种子内容(公开 BT 站如 Nyaa/ACG.RIP 的 enclosure 是 .torrent,
+            # 链路已下载为字节):解析 infohash 转磁力;private=1 为 PT 种子,
+            # 自动模式放行 qb(转磁力会丢 passkey,115 也拉不动,不该接)
+            if not explicit and not self._claim_public:
+                return None
+            torrent, err = self.__parse_torrent(content)
+            if torrent is None:
+                if explicit:
+                    return None, None, None, f"115离线下载器:{err}"
+                return None
+            if getattr(torrent, "private", False) and not explicit:
+                return None
+            magnet = f"magnet:?xt=urn:btih:{str(torrent.info_hash).lower()}"
+            name = getattr(torrent, "name", None)
+            if name:
+                title_hint = str(name)
+                magnet += f"&dn={quote(title_hint)}"
 
         btih = self.__parse_btih(magnet)
-        title = self.__parse_dn(magnet) or btih
+        title = title_hint or self.__parse_dn(magnet) or btih
 
         # 已在跟踪中的任务不重复提交
         with self._tasks_lock:
@@ -258,6 +279,29 @@ class U115OfflineDownloader(_PluginBase):
                 tags=self._downloader_name,
             ))
         return result
+
+    @staticmethod
+    def __parse_torrent(content) -> Tuple[Optional[Any], Optional[str]]:
+        """
+        种子内容(bytes/Path)解析为 torrentool Torrent 对象。
+        """
+        data = None
+        if isinstance(content, (bytes, bytearray)):
+            data = bytes(content)
+        elif isinstance(content, (str, Path)):
+            try:
+                p = Path(content)
+                if p.exists():
+                    data = p.read_bytes()
+            except Exception:
+                data = None
+        if not data:
+            return None, "无法读取种子内容"
+        try:
+            from torrentool.api import Torrent
+            return Torrent.from_string(data), None
+        except Exception as e:
+            return None, f"种子解析失败:{str(e)}"
 
     def __is_bound_magnet(self, magnet: str) -> bool:
         """
@@ -469,6 +513,15 @@ class U115OfflineDownloader(_PluginBase):
                                 'component': 'VCol',
                                 'props': {'cols': 12, 'md': 3},
                                 'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'claim_public',
+                                              'label': '自动认领公开资源'}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'downloader_name', 'label': '下载器名称',
                                               'placeholder': '115离线'}
@@ -551,10 +604,11 @@ class U115OfflineDownloader(_PluginBase):
                                     'props': {
                                         'type': 'info',
                                         'variant': 'tonal',
-                                        'text': '绑定站点的磁力资源将自动经 OpenList 提交 115 云端离线下载;'
-                                                '目标目录指向目录监控范围即可全自动整理入库。'
-                                                '进行中任务显示在下载管理页(进度来自 OpenList);'
-                                                '云端任务不参与 MoviePilot 本地整理。'
+                                        'text': '自动认领公开资源:下载器为"默认"时,磁力与公开种子'
+                                                '(private≠1,如 Nyaa/动漫花园/ACG.RIP)自动转 115 云端离线,'
+                                                'PT 种子(private=1)仍走 qBittorrent;显式选择下载器时尊重选择。'
+                                                '目标目录指向目录监控范围即可全自动整理入库;'
+                                                '进行中任务显示在下载管理页,云端任务不参与本地整理。'
                                     }
                                 }]
                             },
@@ -565,6 +619,7 @@ class U115OfflineDownloader(_PluginBase):
         ], {
             "enabled": False,
             "notify": True,
+            "claim_public": True,
             "downloader_name": "115离线",
             "poll_interval": 30,
             "openlist_url": "http://127.0.0.1:5244",

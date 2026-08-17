@@ -3,12 +3,13 @@
     "name": "115离线下载器",
     "description": "将磁力下载路由到 OpenList 的 115 离线下载,进度显示与完成通知,配合目录监控实现全自动云端入库。",
     "labels": "下载器,云盘",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "115.png",
     "author": "Anniversor",
     "level": 1,
     "history": {
-      "v1.0.0": "首个版本:download/list_torrents 插件模块;OpenList add_offline_download 提交 115 云端离线;btih 任务跟踪+轮询进度+完成/失败通知;自动绑定站点下载器字段"
+      "v1.0.0": "首个版本:download/list_torrents 插件模块;OpenList add_offline_download 提交 115 云端离线;btih 任务跟踪+轮询进度+完成/失败通知;自动绑定站点下载器字段",
+      "v1.1.0": "自动认领公开资源:下载器为默认时,磁力与公开种子(private≠1,Nyaa/动漫花园/ACG.RIP 等)自动转 115 离线(torrentool 解 infohash 转磁力),PT 种子(private=1)仍走 qb;显式选择下载器时尊重选择"
     }
   },
   "SeedHubIndexer": {
