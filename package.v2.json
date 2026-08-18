@@ -33,13 +33,14 @@
     "name": "SeedHub索引",
     "description": "将 SeedHub 接入内建搜索,公开磁力资源进入统一搜索结果,支持镜像域名自动切换。",
     "labels": "搜索,站点",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "icon": "https://sidhub.cc/favicon.ico",
     "author": "Anniversor",
     "level": 1,
     "history": {
       "v1.0.0": "首个版本:add_indexer 注册进搜索站点池 + search_torrents 插件模块;两级页面解析,magnet base64 解析并持久缓存;/worker-json-hosts/ 镜像域名每日巡检自动切换",
-      "v1.0.1": "TorrentInfo 透传 site_downloader,支持站点级下载器定向路由(配合 115离线下载器)"
+      "v1.0.1": "TorrentInfo 透传 site_downloader,支持站点级下载器定向路由(配合 115离线下载器)",
+      "v1.1.0": "请求瞬时失败(超时/连接异常/非200)自动重试一次:请求失败不再被当作站点无结果,避免中文关键词一次抖动导致整轮搜索空手(英文/繁体兜底词对本站无效)"
     }
   },
   "AutoSignIn": {

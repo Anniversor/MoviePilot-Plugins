@@ -13,6 +13,7 @@ SeedHub索引:将 SeedHub(sidhub.cc)接入 MoviePilot 内建搜索。
 import base64
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -41,7 +42,7 @@ class SeedHubIndexer(_PluginBase):
     # 插件图标
     plugin_icon = "https://sidhub.cc/favicon.ico"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -295,14 +296,26 @@ class SeedHubIndexer(_PluginBase):
 
     # region 站点抓取
 
-    def __request(self, url: str):
+    def __request(self, url: str, retries: int = 1):
+        """
+        瞬时失败(超时/连接异常/非200)自动重试:请求失败不等于站点无结果,
+        中文关键词是 SeedHub 唯一有效索引,一次抖动不该让整轮搜索空手而归。
+        """
         from app.utils.http import RequestUtils
-        return RequestUtils(
-            ua=self.UA,
-            timeout=self._timeout,
-            referer=f"{self._domain}/",
-            proxies=settings.PROXY if self._proxy else None
-        ).get_res(url, allow_redirects=True)
+        res = None
+        for attempt in range(retries + 1):
+            res = RequestUtils(
+                ua=self.UA,
+                timeout=self._timeout,
+                referer=f"{self._domain}/",
+                proxies=settings.PROXY if self._proxy else None
+            ).get_res(url, allow_redirects=True)
+            if res is not None and res.status_code == 200:
+                return res
+            if attempt < retries:
+                logger.warn(f"SeedHub 请求失败(第{attempt + 1}次),2秒后重试:{url}")
+                time.sleep(2)
+        return res
 
     def __do_search(self, site: dict, keyword: str, mtype: MediaType = None) -> List[TorrentInfo]:
         # 1. 搜索页:取作品条目
