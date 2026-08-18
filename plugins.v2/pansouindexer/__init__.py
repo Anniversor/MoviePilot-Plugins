@@ -12,6 +12,7 @@ PanSou索引:将本地 pansou 聚合搜索的 BT(磁力)结果接入 MoviePilot 
 """
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -66,7 +67,7 @@ class PanSouIndexer(_PluginBase):
     _max_results = 50
     _timeout = 30
     _probe_size = True
-    _probe_limit = 15
+    _probe_limit = 25
     _registered = False
 
     def init_plugin(self, config: dict = None):
@@ -77,7 +78,7 @@ class PanSouIndexer(_PluginBase):
             self._max_results = self.__to_int(config.get("max_results"), 50, 5, 200)
             self._timeout = self.__to_int(config.get("timeout"), 30, 5, 120)
             self._probe_size = bool(config.get("probe_size", True))
-            self._probe_limit = self.__to_int(config.get("probe_limit"), 15, 0, 50)
+            self._probe_limit = self.__to_int(config.get("probe_limit"), 25, 0, 50)
 
         # 磁力元数据缓存(btih -> {size,name,count},磁力不可变可永久复用)
         self._meta_cache: Dict[str, dict] = self.get_data("meta_cache") or {}
@@ -227,7 +228,15 @@ class PanSouIndexer(_PluginBase):
             # 关键词的结果都有名额——中文官方译名常命中垃圾条目,若按
             # 顺序拼接再截断,英文原名的真资源会被整体挤掉
             seen = set()
-            per_kw = [self.__do_search(site, str(kw), seen) for kw in keywords[:3]]
+            use_keywords = keywords[:3]
+            per_kw = [self.__do_search(site, str(kw), seen) for kw in use_keywords]
+            # pansou 异步模型:冷查询只返回响应窗口内抓到的,后台继续填缓存。
+            # 0 结果的关键词等 4 秒后重查一次,吃到补完的缓存(免得手动搜两次)
+            empty_idx = [i for i, r in enumerate(per_kw) if not r]
+            if empty_idx:
+                time.sleep(4)
+                for i in empty_idx:
+                    per_kw[i] = self.__do_search(site, str(use_keywords[i]), seen)
             merged: List[TorrentInfo] = []
             idx = 0
             while len(merged) < self._max_results:
@@ -287,7 +296,7 @@ class PanSouIndexer(_PluginBase):
         为无大小的结果补磁力元数据:缓存优先,未命中的并发探测(限量)。
         """
         try:
-            pending = []
+            candidates = []
             for t in torrents:
                 btih = self.__btih_of(t.enclosure)
                 if not btih:
@@ -295,9 +304,12 @@ class PanSouIndexer(_PluginBase):
                 hit = self._meta_cache.get(btih)
                 if hit:
                     self.__apply_meta(t, hit)
-                elif (t.size or 0) <= 0 and len(pending) < self._probe_limit \
-                        and btih not in self._probe_failed:
-                    pending.append((t, btih))
+                elif (t.size or 0) <= 0 and btih not in self._probe_failed:
+                    candidates.append((t, btih))
+            # 标题带年份的优先探测:MP 电影匹配要求年份,只有这类条目
+            # 会出现在最终结果里,它们的大小最该被补齐
+            candidates.sort(key=lambda x: 0 if re.search(r"\b(19|20)\d{2}\b", x[0].title or "") else 1)
+            pending = candidates[:self._probe_limit]
             if not pending:
                 return
             ok = 0
@@ -551,7 +563,7 @@ class PanSouIndexer(_PluginBase):
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'probe_limit',
-                                              'label': '单次探测上限', 'placeholder': '15'}
+                                              'label': '单次探测上限', 'placeholder': '25'}
                                 }]
                             },
                             {
@@ -579,7 +591,7 @@ class PanSouIndexer(_PluginBase):
             "max_results": 50,
             "timeout": 30,
             "probe_size": True,
-            "probe_limit": 15,
+            "probe_limit": 25,
         }
 
     def get_page(self) -> List[dict]:
