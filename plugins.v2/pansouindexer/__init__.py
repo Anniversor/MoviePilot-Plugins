@@ -40,7 +40,7 @@ class PanSouIndexer(_PluginBase):
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -84,6 +84,9 @@ class PanSouIndexer(_PluginBase):
         self._meta_cache: Dict[str, dict] = self.get_data("meta_cache") or {}
         self._meta_lock = threading.Lock()
         self._probe_failed = set()
+        self._probe_cooldown = 0.0
+        # 已知空关键词(keyword -> 失效时间),避免重复梯度重查
+        self._empty_kw: Dict[str, float] = {}
 
         self.__cancel_ensure_timer()
         if self._enabled:
@@ -221,39 +224,23 @@ class PanSouIndexer(_PluginBase):
         # 链路按关键词轮询且一有结果就停,英文原名往往轮不到;而聚合源对
         # 中文官方译名常返回裸标题垃圾,真资源多为英文 scene 命名。
         # 媒体搜索场景(mtype 已知)下反查识别缓存补充英文原名一起搜。
+        media_year = None
         if mtype:
-            keywords = self.__enrich_keywords(keywords)
+            keywords, media_year = self.__enrich_keywords(keywords)
         try:
-            # 所有关键词都搜(跨关键词按 btih 去重),轮转合并保证每个
-            # 关键词的结果都有名额——中文官方译名常命中垃圾条目,若按
-            # 顺序拼接再截断,英文原名的真资源会被整体挤掉
-            seen = set()
-            use_keywords = keywords[:3]
-            per_kw = [self.__do_search(site, str(kw), seen) for kw in use_keywords]
-            # pansou 异步模型:冷查询只返回响应窗口内抓到的,后台继续填缓存。
-            # 0 结果的关键词等 4 秒后重查一次,吃到补完的缓存(免得手动搜两次)
-            empty_idx = [i for i, r in enumerate(per_kw) if not r]
-            if empty_idx:
-                time.sleep(4)
-                for i in empty_idx:
-                    per_kw[i] = self.__do_search(site, str(use_keywords[i]), seen)
-            merged: List[TorrentInfo] = []
-            idx = 0
-            while len(merged) < self._max_results:
-                found = False
-                for lst in per_kw:
-                    if idx < len(lst):
-                        merged.append(lst[idx])
-                        found = True
-                        if len(merged) >= self._max_results:
-                            break
-                if not found:
-                    break
-                idx += 1
-            # 磁力元数据探测:补大小 + 用真实种子名替换聚合标题
-            # (真名是规范 scene 命名,MP 标题匹配成活率大幅提高)
+            # 所有关键词并行搜(串行冷查每个都顶满 pansou 10 秒异步窗口,
+            # 并行后墙钟时间 = 单查耗时);0 结果的关键词在各自线程内等
+            # 4 秒重查一次(pansou 异步后台已填缓存),不拖累其他关键词
+            use_keywords = [str(k) for k in keywords[:3]]
+            with ThreadPoolExecutor(max_workers=len(use_keywords)) as executor:
+                per_kw = list(executor.map(
+                    lambda kw: self.__search_with_retry(site, kw), use_keywords))
+            merged = self.__merge_round_robin(per_kw)
+            # 磁力元数据探测:补大小 + 真实种子名替换聚合标题;
+            # 单轮、带硬时限,电影场景只探标题带年份的可匹配条目
             if self._probe_size and self._probe_limit:
-                self.__enrich_metadata(merged)
+                movie_year = media_year if mtype == MediaType.MOVIE else None
+                self.__enrich_metadata(merged, movie_year=movie_year)
             return merged
         except Exception as e:
             logger.error(f"PanSou 搜索出错:{str(e)}")
@@ -264,24 +251,25 @@ class PanSouIndexer(_PluginBase):
         m = re.search(r"urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", magnet or "")
         return m.group(1).lower() if m else None
 
-    def __probe_magnet(self, btih: str) -> Optional[dict]:
+    def __probe_magnet(self, btih: str) -> Tuple[Optional[dict], bool]:
         """
         经 whatslink.info 探测磁力元数据(大小/真实名/文件数)。
+        返回 (元数据, 是否临时失败)——限流/超时是临时失败,不应拉黑。
         """
         try:
             r = requests.get("https://whatslink.info/api/v1/link",
                              params={"url": f"magnet:?xt=urn:btih:{btih}"},
-                             headers={"User-Agent": self.UA}, timeout=8)
+                             headers={"User-Agent": self.UA}, timeout=6)
             if r.status_code != 200:
-                return None
+                return None, True
             d = r.json() or {}
             if d.get("error") or not d.get("size"):
-                return None
+                return None, False
             return {"size": d.get("size") or 0,
                     "name": (d.get("name") or "").strip(),
-                    "count": d.get("count") or 0}
+                    "count": d.get("count") or 0}, False
         except Exception:
-            return None
+            return None, True
 
     def __apply_meta(self, torrent: TorrentInfo, info: dict):
         torrent.size = float(info.get("size") or 0)
@@ -291,9 +279,11 @@ class PanSouIndexer(_PluginBase):
             torrent.description = f"{torrent.title} | {torrent.description or ''}".strip(" |")
             torrent.title = name
 
-    def __enrich_metadata(self, torrents: List[TorrentInfo]):
+    def __enrich_metadata(self, torrents: List[TorrentInfo], movie_year=None):
         """
-        为无大小的结果补磁力元数据:缓存优先,未命中的并发探测(限量)。
+        为无大小的结果补磁力元数据:缓存优先,未命中的并发探测。
+        单轮执行 + 10 秒硬时限;电影场景只探标题带年份±1 的条目
+        (其余过不了 MP 电影匹配的年份规则,探了也不会展示)。
         """
         try:
             candidates = []
@@ -306,30 +296,55 @@ class PanSouIndexer(_PluginBase):
                     self.__apply_meta(t, hit)
                 elif (t.size or 0) <= 0 and btih not in self._probe_failed:
                     candidates.append((t, btih))
-            # 标题带年份的优先探测:MP 电影匹配要求年份,只有这类条目
-            # 会出现在最终结果里,它们的大小最该被补齐
-            candidates.sort(key=lambda x: 0 if re.search(r"\b(19|20)\d{2}\b", x[0].title or "") else 1)
+            # 探测服务限流冷却期:只吃缓存,不发新探测
+            if time.monotonic() < getattr(self, "_probe_cooldown", 0):
+                return
+            if movie_year:
+                try:
+                    y = int(movie_year)
+                    years = {str(y - 1), str(y), str(y + 1)}
+                    candidates = [c for c in candidates
+                                  if any(yy in (c[0].title or "") for yy in years)]
+                except (TypeError, ValueError):
+                    pass
+            else:
+                # 标题带年份的优先(更可能是可匹配的真资源)
+                candidates.sort(key=lambda x: 0 if re.search(r"\b(19|20)\d{2}\b", x[0].title or "") else 1)
             pending = candidates[:self._probe_limit]
             if not pending:
                 return
             ok = 0
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {executor.submit(self.__probe_magnet, btih): (t, btih)
-                           for t, btih in pending}
-                for future in as_completed(futures):
+            temp_fails = 0
+            executor = ThreadPoolExecutor(max_workers=6)
+            futures = {executor.submit(self.__probe_magnet, btih): (t, btih)
+                       for t, btih in pending}
+            try:
+                for future in as_completed(futures, timeout=10):
                     t, btih = futures[future]
-                    info = None
+                    info, temporary = None, False
                     try:
-                        info = future.result()
+                        info, temporary = future.result()
                     except Exception:
-                        pass
+                        temporary = True
                     if info:
                         ok += 1
                         with self._meta_lock:
                             self._meta_cache[btih] = info
                         self.__apply_meta(t, info)
+                    elif temporary:
+                        # 限流/超时:不拉黑,下次搜索再探
+                        temp_fails += 1
                     else:
                         self._probe_failed.add(btih)
+            except Exception:
+                # 到达硬时限:未完成的探测放弃(不计失败,下次搜索续探)
+                pass
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            if temp_fails >= 3 and ok == 0:
+                # 探测服务疑似限流,冷却 10 分钟避免空耗搜索时长
+                self._probe_cooldown = time.monotonic() + 600
+                logger.warn("PanSou 元数据探测服务疑似限流,冷却 10 分钟")
             with self._meta_lock:
                 if len(self._meta_cache) > 8000:
                     # 粗略瘦身,防止无限膨胀
@@ -342,16 +357,18 @@ class PanSouIndexer(_PluginBase):
             logger.warn(f"PanSou 元数据探测出错:{str(e)}")
 
     @staticmethod
-    def __enrich_keywords(keywords: List[str]) -> List[str]:
+    def __enrich_keywords(keywords: List[str]) -> Tuple[List[str], Optional[str]]:
         """
         反查识别缓存,为中文关键词补充英文原名(精确搜索场景识别刚发生过,
-        TMDB 缓存必命中,不会触发网络/AI 识别)。
+        TMDB 缓存必命中,不会触发网络/AI 识别)。返回 (关键词列表, 媒体年份)。
         """
+        media_year = None
         try:
             from app.chain.media import MediaChain
             from app.core.metainfo import MetaInfo as _MetaInfo
             media = MediaChain().recognize_by_meta(_MetaInfo(keywords[0]))
             if media:
+                media_year = getattr(media, "year", None)
                 # 英文原名(BT 真资源多为英文 scene 命名)
                 extras = [getattr(media, "original_title", None),
                           getattr(media, "en_title", None)]
@@ -366,15 +383,62 @@ class PanSouIndexer(_PluginBase):
                         keywords.append(extra)
         except Exception as e:
             logger.debug(f"PanSou 关键词补充失败:{str(e)}")
-        return keywords
+        return keywords, media_year
 
-    def __do_search(self, site: dict, keyword: str, seen: set) -> List[TorrentInfo]:
+    def __search_with_retry(self, site: dict, keyword: str) -> List[TorrentInfo]:
+        results = self.__do_search(site, keyword)
+        if results:
+            self._empty_kw.pop(keyword, None)
+            return results
+        # 已知空关键词(10分钟内验证过)不再重查,免得每次搜索空耗等待
+        if time.monotonic() < self._empty_kw.get(keyword, 0):
+            return results
+        # pansou 异步模型:全新关键词秒回空结果,后台聚合需 10-30 秒;
+        # 梯度重查直到出结果或预算耗尽,保证一次搜索拿到完整结果
+        for delay in (4, 6, 8):
+            time.sleep(delay)
+            results = self.__do_search(site, keyword)
+            if results:
+                return results
+        self._empty_kw[keyword] = time.monotonic() + 600
+        return results
+
+    def __merge_round_robin(self, per_kw: List[List[TorrentInfo]]) -> List[TorrentInfo]:
+        """
+        轮转合并各关键词结果并按 btih 跨关键词去重,截断到结果上限。
+        """
+        merged: List[TorrentInfo] = []
+        seen = set()
+        idx = 0
+        while len(merged) < self._max_results:
+            found = False
+            for lst in per_kw:
+                if idx < len(lst):
+                    found = True
+                    t = lst[idx]
+                    key = self.__btih_of(t.enclosure) or t.enclosure
+                    if key not in seen:
+                        seen.add(key)
+                        merged.append(t)
+                        if len(merged) >= self._max_results:
+                            break
+            if not found:
+                break
+            idx += 1
+        return merged
+
+    def __do_search(self, site: dict, keyword: str, seen: set = None) -> List[TorrentInfo]:
+        if seen is None:
+            seen = set()
         try:
+            # 超时压到 15 秒:pansou 对全新关键词的冷查询(TG 同步抓取)可能
+            # 拖 20-30 秒,但其后台会继续抓取并写缓存,超时放弃后重查即可
+            # 低成本拿到结果,不值得全程陪跑
             res = requests.get(
                 f"{self._pansou_url}/api/search",
                 params={"kw": keyword, "res": "merge", "src": self._src},
                 headers={"User-Agent": self.UA},
-                timeout=self._timeout,
+                timeout=min(self._timeout, 15),
             )
         except Exception as e:
             logger.warn(f"PanSou 请求失败:{str(e)}")
