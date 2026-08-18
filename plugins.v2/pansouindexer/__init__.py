@@ -12,6 +12,7 @@ PanSou索引:将本地 pansou 聚合搜索的 BT(磁力)结果接入 MoviePilot 
 """
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -38,7 +39,7 @@ class PanSouIndexer(_PluginBase):
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -64,6 +65,8 @@ class PanSouIndexer(_PluginBase):
     _src = "all"
     _max_results = 50
     _timeout = 30
+    _probe_size = True
+    _probe_limit = 15
     _registered = False
 
     def init_plugin(self, config: dict = None):
@@ -73,6 +76,13 @@ class PanSouIndexer(_PluginBase):
             self._src = (config.get("src") or "all").strip() or "all"
             self._max_results = self.__to_int(config.get("max_results"), 50, 5, 200)
             self._timeout = self.__to_int(config.get("timeout"), 30, 5, 120)
+            self._probe_size = bool(config.get("probe_size", True))
+            self._probe_limit = self.__to_int(config.get("probe_limit"), 15, 0, 50)
+
+        # 磁力元数据缓存(btih -> {size,name,count},磁力不可变可永久复用)
+        self._meta_cache: Dict[str, dict] = self.get_data("meta_cache") or {}
+        self._meta_lock = threading.Lock()
+        self._probe_failed = set()
 
         self.__cancel_ensure_timer()
         if self._enabled:
@@ -231,10 +241,93 @@ class PanSouIndexer(_PluginBase):
                 if not found:
                     break
                 idx += 1
+            # 磁力元数据探测:补大小 + 用真实种子名替换聚合标题
+            # (真名是规范 scene 命名,MP 标题匹配成活率大幅提高)
+            if self._probe_size and self._probe_limit:
+                self.__enrich_metadata(merged)
             return merged
         except Exception as e:
             logger.error(f"PanSou 搜索出错:{str(e)}")
             return []
+
+    @staticmethod
+    def __btih_of(magnet: str) -> Optional[str]:
+        m = re.search(r"urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", magnet or "")
+        return m.group(1).lower() if m else None
+
+    def __probe_magnet(self, btih: str) -> Optional[dict]:
+        """
+        经 whatslink.info 探测磁力元数据(大小/真实名/文件数)。
+        """
+        try:
+            r = requests.get("https://whatslink.info/api/v1/link",
+                             params={"url": f"magnet:?xt=urn:btih:{btih}"},
+                             headers={"User-Agent": self.UA}, timeout=8)
+            if r.status_code != 200:
+                return None
+            d = r.json() or {}
+            if d.get("error") or not d.get("size"):
+                return None
+            return {"size": d.get("size") or 0,
+                    "name": (d.get("name") or "").strip(),
+                    "count": d.get("count") or 0}
+        except Exception:
+            return None
+
+    def __apply_meta(self, torrent: TorrentInfo, info: dict):
+        torrent.size = float(info.get("size") or 0)
+        name = info.get("name")
+        if name and len(name) >= 8:
+            # 原聚合标题挪到副标题(常含中文名,还能吃到 MP 的副标题匹配)
+            torrent.description = f"{torrent.title} | {torrent.description or ''}".strip(" |")
+            torrent.title = name
+
+    def __enrich_metadata(self, torrents: List[TorrentInfo]):
+        """
+        为无大小的结果补磁力元数据:缓存优先,未命中的并发探测(限量)。
+        """
+        try:
+            pending = []
+            for t in torrents:
+                btih = self.__btih_of(t.enclosure)
+                if not btih:
+                    continue
+                hit = self._meta_cache.get(btih)
+                if hit:
+                    self.__apply_meta(t, hit)
+                elif (t.size or 0) <= 0 and len(pending) < self._probe_limit \
+                        and btih not in self._probe_failed:
+                    pending.append((t, btih))
+            if not pending:
+                return
+            ok = 0
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(self.__probe_magnet, btih): (t, btih)
+                           for t, btih in pending}
+                for future in as_completed(futures):
+                    t, btih = futures[future]
+                    info = None
+                    try:
+                        info = future.result()
+                    except Exception:
+                        pass
+                    if info:
+                        ok += 1
+                        with self._meta_lock:
+                            self._meta_cache[btih] = info
+                        self.__apply_meta(t, info)
+                    else:
+                        self._probe_failed.add(btih)
+            with self._meta_lock:
+                if len(self._meta_cache) > 8000:
+                    # 粗略瘦身,防止无限膨胀
+                    keys = list(self._meta_cache.keys())[:4000]
+                    for k in keys:
+                        self._meta_cache.pop(k, None)
+                self.save_data("meta_cache", self._meta_cache)
+            logger.info(f"PanSou 磁力元数据探测:{ok}/{len(pending)} 命中")
+        except Exception as e:
+            logger.warn(f"PanSou 元数据探测出错:{str(e)}")
 
     @staticmethod
     def __enrich_keywords(keywords: List[str]) -> List[str]:
@@ -445,15 +538,33 @@ class PanSouIndexer(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 9},
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'probe_size',
+                                              'label': '磁力元数据探测'}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'probe_limit',
+                                              'label': '单次探测上限', 'placeholder': '15'}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
                                 'content': [{
                                     'component': 'VAlert',
                                     'props': {
                                         'type': 'info',
                                         'variant': 'tonal',
-                                        'text': '仅采集 pansou 聚合结果中的磁力(BT)资源,'
-                                                '网盘链接不采集;磁力自动被 115离线下载器 认领。'
-                                                '聚合源无做种数信息,结果排序自然靠后,定位为兜底资源源。'
+                                        'text': '仅采集 pansou 聚合结果中的磁力(BT)资源,自动被 115离线下载器 认领。'
+                                                '磁力元数据探测(whatslink.info)补全大小并以真实种子名替换聚合标题,'
+                                                '显著提高媒体匹配率;结果按 btih 永久缓存,重复搜索零开销。'
                                     }
                                 }]
                             },
@@ -467,6 +578,8 @@ class PanSouIndexer(_PluginBase):
             "src": "all",
             "max_results": 50,
             "timeout": 30,
+            "probe_size": True,
+            "probe_limit": 15,
         }
 
     def get_page(self) -> List[dict]:
