@@ -1,4 +1,16 @@
 {
+  "PanSouIndexer": {
+    "name": "PanSou索引",
+    "description": "将 pansou 聚合搜索的磁力资源接入内建搜索,作为公开 BT 兜底资源源。",
+    "labels": "搜索,站点",
+    "version": "1.0.0",
+    "icon": "spider.png",
+    "author": "Anniversor",
+    "level": 1,
+    "history": {
+      "v1.0.0": "首个版本:pansou /api/search merged 磁力接入,btih 去重,note 提取标题/大小,SeedHub 同款注册机制"
+    }
+  },
   "U115OfflineDownloader": {
     "name": "115离线下载器",
     "description": "将磁力下载路由到 OpenList 的 115 离线下载,进度显示与完成通知,配合目录监控实现全自动云端入库。",
