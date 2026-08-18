@@ -38,7 +38,7 @@ class PanSouIndexer(_PluginBase):
     # 插件图标
     plugin_icon = "spider.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -207,17 +207,63 @@ class PanSouIndexer(_PluginBase):
         if not keywords:
             # 浏览模式(最新种子)不支持
             return []
+        # 链路按关键词轮询且一有结果就停,英文原名往往轮不到;而聚合源对
+        # 中文官方译名常返回裸标题垃圾,真资源多为英文 scene 命名。
+        # 媒体搜索场景(mtype 已知)下反查识别缓存补充英文原名一起搜。
+        if mtype:
+            keywords = self.__enrich_keywords(keywords)
         try:
-            for kw in keywords[:2]:
-                results = self.__do_search(site, str(kw))
-                if results:
-                    return results
-            return []
+            # 所有关键词都搜(跨关键词按 btih 去重),轮转合并保证每个
+            # 关键词的结果都有名额——中文官方译名常命中垃圾条目,若按
+            # 顺序拼接再截断,英文原名的真资源会被整体挤掉
+            seen = set()
+            per_kw = [self.__do_search(site, str(kw), seen) for kw in keywords[:3]]
+            merged: List[TorrentInfo] = []
+            idx = 0
+            while len(merged) < self._max_results:
+                found = False
+                for lst in per_kw:
+                    if idx < len(lst):
+                        merged.append(lst[idx])
+                        found = True
+                        if len(merged) >= self._max_results:
+                            break
+                if not found:
+                    break
+                idx += 1
+            return merged
         except Exception as e:
             logger.error(f"PanSou 搜索出错:{str(e)}")
             return []
 
-    def __do_search(self, site: dict, keyword: str) -> List[TorrentInfo]:
+    @staticmethod
+    def __enrich_keywords(keywords: List[str]) -> List[str]:
+        """
+        反查识别缓存,为中文关键词补充英文原名(精确搜索场景识别刚发生过,
+        TMDB 缓存必命中,不会触发网络/AI 识别)。
+        """
+        try:
+            from app.chain.media import MediaChain
+            from app.core.metainfo import MetaInfo as _MetaInfo
+            media = MediaChain().recognize_by_meta(_MetaInfo(keywords[0]))
+            if media:
+                # 英文原名(BT 真资源多为英文 scene 命名)
+                extras = [getattr(media, "original_title", None),
+                          getattr(media, "en_title", None)]
+                # 一个中文别名(如"魔戒3:王者归来"——中文圈资源常用别名命名)
+                for name in (getattr(media, "names", None) or []):
+                    if name and re.search(r"[一-鿿]", str(name)) \
+                            and str(name) not in keywords:
+                        extras.append(str(name))
+                        break
+                for extra in extras:
+                    if extra and extra not in keywords:
+                        keywords.append(extra)
+        except Exception as e:
+            logger.debug(f"PanSou 关键词补充失败:{str(e)}")
+        return keywords
+
+    def __do_search(self, site: dict, keyword: str, seen: set) -> List[TorrentInfo]:
         try:
             res = requests.get(
                 f"{self._pansou_url}/api/search",
@@ -241,7 +287,6 @@ class PanSouIndexer(_PluginBase):
             return []
 
         torrents = []
-        seen = set()
         for m in magnets:
             url = (m.get("url") or "").strip()
             if not url.startswith("magnet:"):
@@ -253,6 +298,10 @@ class PanSouIndexer(_PluginBase):
                 continue
             seen.add(key)
             note = (m.get("note") or "").strip()
+            # 回声垃圾过滤:note 就是搜索词本身的条目(聚合站 SEO spam,
+            # 无年份无画质信息,MP 电影匹配的年份规则也必拒)
+            if note == keyword.strip():
+                continue
             title, size = self.__parse_note(note, url)
             torrents.append(TorrentInfo(
                 site=site.get("id"),
