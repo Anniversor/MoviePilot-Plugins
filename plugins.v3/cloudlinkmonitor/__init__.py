@@ -67,7 +67,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -744,6 +744,19 @@ class CloudLinkMonitor(_PluginBase):
                     logger.debug(f"{event_path} 不是媒体或字幕文件")
                     return
 
+                # 特典/附加目录整体跳过:VCB 等 BDRip 惯例把非正片放在 SPs/Menu/CDs/Scans,
+                # 其中 Web Preview 09、Menu01、NCOP02 等带数字文件会被识别为范围内正集,
+                # 在覆盖模式下反把正片顶掉(迷宫饭 BDRip 实测),按目录名整体拦下
+                _sp_dirs = {"sps", "sp", "extras", "extra", "specials", "menu",
+                            "menus", "cds", "cd", "scans", "特典", "映像特典", "特典映像"}
+                try:
+                    _rel_parts = Path(file_path).relative_to(Path(mon_path)).parts[:-1]
+                except ValueError:
+                    _rel_parts = ()
+                if any(str(p).lower() in _sp_dirs for p in _rel_parts):
+                    logger.info(f"{file_path.name} 位于特典/附加目录,跳过整理:{file_path}")
+                    return
+
                 # 判断是不是蓝光目录
                 if re.search(r"BDMV[/\\]STREAM", event_path, re.IGNORECASE):
                     # 截取BDMV前面的路径
@@ -850,7 +863,7 @@ class CloudLinkMonitor(_PluginBase):
                     valid_episodes = {getattr(e, "episode_number", None) for e in episodes_info}
                     valid_episodes.discard(None)
                     if valid_episodes and file_meta.begin_episode not in valid_episodes:
-                        if re.search(r"(?:^|[\[\s._-])(SP|OVA|OAD|SPECIALS?|特典|特別篇|特别篇|番外)(?:[\]\s._-]|$)",
+                        if re.search(r"(?:^|[\[\s._-])(SP|OVA|OAD|SPECIALS?|特典|特別篇|特别篇|番外|NCOP\d*|NCED\d*|MENU\d*|CM\d+|PV\d+|PREVIEW|TEASER|COMMENTARY|DOCUMENTARY|SAMPLE)(?:[\]\s._-]|$)",
                                      file_path.name, re.IGNORECASE):
                             logger.info(f"{file_path.name} 集数 {file_meta.begin_episode} 超出该季TMDB范围"
                                         f"且含特典标记，划入特典季 Season 0")
