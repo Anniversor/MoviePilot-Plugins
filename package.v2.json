@@ -532,7 +532,8 @@
       "v1.1": "自动转移链接（不刮削）",
       "v1.0": "监控云盘目录文件变化，按原文件名软连接",
       "v2.10.0": "转移落地后主动双层强刷目标目录(OpenList refresh -> rclone vfs/refresh,按目录60秒去重),消除挂载读空窗,strm助手就绪门控可首查即过"
-    }
+    },
+    "v3": false
   },
   "CloudStrmCompanion": {
     "name": "云盘Strm助手",
@@ -577,7 +578,8 @@
       "v1.0.2": "增加可玩性交互命令",
       "v1.0": "实时监控、定时全量增量生成strm文件",
       "v1.6.0": "就绪门控读失败时先做OpenList->rclone双层强刷(按目录60秒去重,风控友好)再立即重读,通知Emby延迟从分钟级降到秒级;新增openlist_url/token/base配置;退避队列保留兜底"
-    }
+    },
+    "v3": false
   },
   "StrmRedirect": {
     "name": "Strm重定向",
