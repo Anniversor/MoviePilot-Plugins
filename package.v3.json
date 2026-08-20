@@ -3,7 +3,7 @@
     "name": "目录实时监控",
     "description": "监控云盘目录文件变化，自动转移媒体与字幕文件，支持云端定时对账、快速探测与挂载缓存强制刷新。",
     "labels": "云盘,工具",
-    "version": "3.0.0",
+    "version": "3.0.1",
     "icon": "Linkease_A.png",
     "author": "thsrite,Anniversor",
     "level": 1,
@@ -48,7 +48,8 @@
       "v1.1": "自动转移链接（不刮削）",
       "v1.0": "监控云盘目录文件变化，按原文件名软连接",
       "v2.10.0": "转移落地后主动双层强刷目标目录(OpenList refresh -> rclone vfs/refresh,按目录60秒去重),消除挂载读空窗,strm助手就绪门控可首查即过",
-      "v3.0.0": "适配 MoviePilot V3:统一媒体标识查询历史、刮削改走 ScrapingChain"
+      "v3.0.0": "适配 MoviePilot V3:统一媒体标识查询历史、刮削改走 ScrapingChain",
+      "v3.0.1": "修复:V3 将无集数特典/附加文件判为跳过整理时无目标文件项,后续通知崩溃(NoneType.path)"
     },
     "system_version": ">=3.0.0"
   },

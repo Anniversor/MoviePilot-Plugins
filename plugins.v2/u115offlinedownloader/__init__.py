@@ -43,7 +43,7 @@ class U115OfflineDownloader(_PluginBase):
     # 插件图标
     plugin_icon = "115.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
 
     # 下载器列表注册用的自定义类型(qb/tr 模块按 type 匹配配置,不会认领此类型)
     DOWNLOADER_TYPE = "u115offline"
@@ -511,6 +511,11 @@ class U115OfflineDownloader(_PluginBase):
                 state = d.get("state")
                 error = d.get("error") or d.get("status") or ""
                 success = state == 2
+                # 115 返回 10008"任务已存在":该磁力已在 115 离线列表
+                # (此前提交过,或 OpenList 首次 add 已在 115 生效但其内部
+                # 重试撞了重复),下载在 115 侧实际正常,不应报失败
+                duplicate = (not success) and (
+                    "任务已存在" in str(error) or "10008" in str(error))
                 title = info.get("title") or btih
                 if self._notify:
                     if success:
@@ -519,13 +524,21 @@ class U115OfflineDownloader(_PluginBase):
                             title="✅ 115离线下载完成",
                             text=f"{title}\n目录:{info.get('path')}\n后续由目录监控自动整理入库"
                         )
+                    elif duplicate:
+                        self.post_message(
+                            mtype=NotificationType.Download,
+                            title="✅ 115离线任务已存在",
+                            text=f"{title}\n该磁力已在 115 离线任务中(可能已完成),"
+                                 f"文件到位后由目录监控自动整理入库"
+                        )
                     else:
                         self.post_message(
                             mtype=NotificationType.Download,
                             title="❌ 115离线下载失败",
                             text=f"{title}\n{error}"
                         )
-                logger.info(f"115离线:任务结束 {title} success={success} {error}")
+                logger.info(f"115离线:任务结束 {title} success={success} "
+                            f"duplicate={duplicate} {error}")
                 with self._tasks_lock:
                     self._tasks.pop(btih, None)
                 changed = True

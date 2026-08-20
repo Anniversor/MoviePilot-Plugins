@@ -67,7 +67,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.0.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -923,6 +923,14 @@ class CloudLinkMonitor(_PluginBase):
                         mediainfo=mediainfo,
                         transferinfo=transferinfo
                     )
+
+                # V3 会把无集数的特典/附加文件判为"跳过正片集数整理":
+                # success=True 但无 target_item/target_diritem,
+                # 后续刮削/通知/软连接/strm 均无目标可用,记录历史后直接结束
+                if not transferinfo.target_item:
+                    logger.info(f"{file_path.name} 按特典/附加文件处理,无目标文件项,"
+                                f"跳过刮削与通知")
+                    return
 
                 # 刮削（字幕文件无需刮削）
                 if self._scrape and not is_subtitle:
