@@ -59,20 +59,20 @@ CRC_RE = re.compile(r"[\(\[（【][0-9A-Fa-f]{8}[\)\]）】]")
 QUOTE_RE = re.compile(r"「[^」]*」|『[^』]*』")
 
 MANIFEST_PROMPT = (
-    "你是媒体库整理助手。输入:一个发布目录名、其中全部视频文件的编号列表(含文件大小)、该作品在 TMDB 上的季/集结构,"
-    "以及可能相关的备选作品。请为每个文件给出分类与季集映射。\n"
+    "你是媒体库整理助手。输入:一个发布目录名、其中全部视频文件的编号列表(含文件大小)、该作品在媒体库使用的"
+    "『目标编号体系』下的季/集结构,以及可能相关的备选作品。请为每个文件给出分类与季集映射。\n"
     "类别:\n"
-    "- main: 正片(对应 TMDB 某季某集;电影则为影片本体)\n"
-    "- special: 有剧情内容的特别篇/短篇/OVA/OAD/番外/总集篇等,若能对应 TMDB 第 0 季(特别篇)的某一集则给出季集\n"
-    "- extra: 非正片映像:PV/CM/NCOP/NCED(无字幕 OP/ED)/Menu/予告·次回预告·Preview/Teaser/Trailer/"
-    "Commentary(评论音轨版)/Documentary/Interview/Making/花絮/Sample/Logo 等\n"
+    "- main: 正片(对应结构中某季某集;电影则为影片本体)\n"
+    "- special: 有剧情内容的特别篇/短篇/OVA/OAD/番外/总集篇等,若能对应结构中第 0 季(特别篇)的某一集则给出季集\n"
+    "- extra: 非正片映像:PV/CM/NCOP/NCED(无字幕 OP/ED)/Menu/予告·次回预告·Preview/Teaser/Trailer/Commentary(评论音轨版)/"
+    "Documentary/Interview/Making/花絮/Sample/Logo 等\n"
     "- other: 音乐、扫图、字体、非视频等\n"
     "规则:\n"
     "1) 文件名末尾括号内的 8 位十六进制是 CRC 校验码,不是集数;「」内是集标题,不是剧名。\n"
-    "2) 只有能在 TMDB 结构中找到确切对应集的文件才给 s/e;不确定就省略 s/e(系统会跳过该文件,比放错位置好)。\n"
+    "2) s/e 必须使用『目标编号体系』中列出的季号/集号。文件名里的季集可能是另一套编号(按播出季编号、或绝对集数),"
+    "结构里每集都并列标注了绝对集数(abs)和/或按季编号,请据此换算;换算不了就省略 s/e(系统会跳过该文件,比放错位置好)。\n"
     "3) 同一 (s,e) 不能分配给多个文件。\n"
-    "4) 集号按文件名中的编号/标题与 TMDB 集标题的语义对应来确定;TMDB 若按绝对集数编排(单季很长),"
-    "要把文件的季内集号换算到 TMDB 的季集。\n"
+    "4) 集号按文件名中的编号/标题与结构中集标题的语义对应来确定,不要只靠顺序猜。\n"
     "5) 体积明显小于正片的文件(几十 MB)通常是预告/特典/短篇,不是正片。\n"
     "6) 若该批次实际属于备选作品列表中的另一部作品,在 series_tmdbid 中给出其 TMDB id;否则给出当前作品 id。\n"
     "只输出一个紧凑的 JSON 对象(不要换行缩进、不要解释):"
@@ -108,7 +108,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.2.1"
+    plugin_version = "3.3.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -165,7 +165,14 @@ class CloudLinkMonitor(_PluginBase):
     _leftover_dir = ""
     _batch_settle = 120
     _emby_reprobe = True
+    _emby_sync_group = True
+    _group_map = ""
     _batch_list_cache = None
+    # 作品编号体系(剧集组)持久化映射与进程内状态
+    _series_groups = None
+    _order_override = None
+    _group_notified = None
+    _emby_sync_pending = None
     # 批次清单(持久化)与进程内缓存
     _manifests = None
     _batch_seen = None
@@ -244,6 +251,8 @@ class CloudLinkMonitor(_PluginBase):
             except (TypeError, ValueError):
                 self._batch_settle = 120
             self._emby_reprobe = config.get("emby_reprobe", True)
+            self._emby_sync_group = config.get("emby_sync_group", True)
+            self._group_map = config.get("group_map") or ""
 
         # 重置失败重试计数与快速探测指纹
         self._retry_counts = {}
@@ -251,6 +260,10 @@ class CloudLinkMonitor(_PluginBase):
         self._busy = threading.Lock()
         self._batch_list_cache = {}
         self._manifests = self.get_data("batch_manifest") or {}
+        self._series_groups = self.get_data("series_groups") or {}
+        self._order_override = None
+        self._group_notified = set()
+        self._emby_sync_pending = set()
         self._batch_seen = {}
         self._recog_cache = {}
         self._tmdb_struct_cache = {}
@@ -404,6 +417,8 @@ class CloudLinkMonitor(_PluginBase):
             "leftover_dir": self._leftover_dir,
             "batch_settle": self._batch_settle,
             "emby_reprobe": self._emby_reprobe,
+            "emby_sync_group": self._emby_sync_group,
+            "group_map": self._group_map,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -852,6 +867,17 @@ class CloudLinkMonitor(_PluginBase):
         if cached and now - cached[0] < 60:
             return cached[1]
         media, subs = [], []
+        if batch_root.is_file():
+            # 直接位于监控目录根下的单个媒体文件:视为只有一个文件的批次
+            try:
+                st = batch_root.stat()
+                if batch_root.suffix.lower() in [str(e).lower() for e in settings.RMT_MEDIAEXT]:
+                    media.append((batch_root.name, st.st_size, st.st_mtime))
+            except Exception as e:
+                logger.warn(f"读取文件信息失败 {batch_root}:{str(e)}")
+            listing = {"media": media, "subs": subs}
+            self._batch_list_cache[key] = (now, listing)
+            return listing
         try:
             for f in SystemUtils.list_files(batch_root, settings.RMT_MEDIAEXT):
                 try:
@@ -908,8 +934,12 @@ class CloudLinkMonitor(_PluginBase):
                 return {"pending": True}
             mf = self.__build_manifest(batch_root, listing, digest)
             mf["attempts"] = (int(old.get("attempts") or 0) if old and old.get("digest") == digest else 0) + 1
-            self._manifests[key] = mf
-            self.__save_manifests()
+            if self._order_override:
+                # preview API with test switches (ignore_emby/force_default): never persist or reuse
+                self._manifests.pop(key, None)
+            else:
+                self._manifests[key] = mf
+                self.__save_manifests()
             return mf if mf.get("status") == "ok" else None
 
     def __save_manifests(self):
@@ -925,29 +955,40 @@ class CloudLinkMonitor(_PluginBase):
         """文件在清单中的条目;字幕按同目录媒体文件名前缀匹配"""
         if not mf:
             return None
-        try:
-            rel = str(Path(file_path).relative_to(batch_root)).replace("\\", "/")
-        except ValueError:
-            return None
+        if Path(batch_root).is_file() or str(file_path) == str(batch_root):
+            rel = Path(batch_root).name
+        else:
+            try:
+                rel = str(Path(file_path).relative_to(batch_root)).replace("\\", "/")
+            except ValueError:
+                return None
         files = mf.get("files") or {}
         if rel in files:
             return files[rel]
         if Path(rel).suffix.lower() in [str(e).lower() for e in settings.RMT_SUBEXT]:
+            # 字幕按媒体文件名前缀匹配:先同目录最长匹配,再全批次唯一匹配(DBD 等发布把字幕放子目录)
             parent = str(Path(rel).parent).replace("\\", "/")
             stem = Path(rel).stem
-            best = None
+            same_dir, any_dir = None, []
             for mrel, entry in files.items():
                 mp = Path(mrel)
-                if str(mp.parent).replace("\\", "/") != parent:
+                if not stem.startswith(mp.stem):
                     continue
-                if stem.startswith(mp.stem) and (best is None or len(mp.stem) > len(best[0])):
-                    best = (mp.stem, entry)
-            if best:
-                return best[1]
+                if str(mp.parent).replace("\\", "/") == parent:
+                    if same_dir is None or len(mp.stem) > len(same_dir[0]):
+                        same_dir = (mp.stem, entry)
+                else:
+                    any_dir.append((mp.stem, entry))
+            if same_dir:
+                return same_dir[1]
+            if any_dir:
+                any_dir.sort(key=lambda x: -len(x[0]))
+                if len(any_dir) == 1 or len(any_dir[0][0]) > len(any_dir[1][0]):
+                    return any_dir[0][1]
         return None
 
     def __build_manifest(self, batch_root: Path, listing: dict, digest: str) -> dict:
-        """候选作品投票 -> TMDB 季集结构 -> 规则映射(干净批次免 LLM)/LLM 映射 -> 确定性校验"""
+        """候选作品投票 -> 编号体系(剧集组)解析 -> 季集结构 -> 规则映射(干净批次免 LLM)/LLM 映射 -> 确定性校验"""
         media = listing["media"]
         rels = [m[0] for m in media]
         mf = {"digest": digest, "time": time.time(), "status": "failed", "files": {}, "media": None,
@@ -968,21 +1009,29 @@ class CloudLinkMonitor(_PluginBase):
                     marker = "文件名标记"
                 parsed[rel] = {"name": meta.name or "", "season": meta.begin_season, "episode": meta.begin_episode,
                                "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
-            candidates = self.__series_candidates(batch_root.name, parsed)
+            batch_name = batch_root.stem if batch_root.is_file() else batch_root.name
+            candidates = self.__series_candidates(batch_name, parsed)
             if not candidates:
-                logger.warn(f"批次 {batch_root.name}:无法识别所属作品,回退逐文件识别")
+                logger.warn(f"批次 {batch_name}:无法识别所属作品,回退逐文件识别")
                 mf["status"] = "no_media"
                 return mf
             primary = candidates[0]
-            structure = self.__tmdb_structure(primary) if primary["type"] == MediaType.TV.value else {}
-            files = self.__rule_mapping(batch_root.name, parsed, primary, structure)
+
+            def build_structure(series: dict):
+                if series["type"] != MediaType.TV.value:
+                    return {"group_id": None, "source": "电影", "auto": False}, {}
+                _order = self.__resolve_order(series, parsed, batch_name)
+                return _order, self.__tmdb_structure(series, _order)
+
+            order, structure = build_structure(primary)
+            files = self.__rule_mapping(batch_name, parsed, primary, structure)
             how = "规则"
             if files is None:
                 if not self._llm_classify:
-                    logger.warn(f"批次 {batch_root.name}:命名不规整且未启用 LLM 批次清单,回退逐文件识别")
+                    logger.warn(f"批次 {batch_name}:命名不规整且未启用 LLM 批次清单,回退逐文件识别")
                     mf["status"] = "no_media"
                     return mf
-                result = self.__llm_mapping(batch_root.name, rels, parsed, primary, candidates, structure)
+                result = self.__llm_mapping(batch_name, rels, parsed, primary, candidates, structure)
                 if result is None:
                     return mf
                 try:
@@ -992,20 +1041,25 @@ class CloudLinkMonitor(_PluginBase):
                 if alt_id and alt_id != primary["tmdbid"]:
                     alt = next((c for c in candidates if c["tmdbid"] == alt_id), None)
                     if alt:
-                        logger.info(f"批次 {batch_root.name}:LLM 判定属于备选作品 {alt['title']} ({alt['year']}) TMDB {alt_id}")
+                        logger.info(f"批次 {batch_name}:LLM 判定属于备选作品 {alt['title']} ({alt['year']}) TMDB {alt_id}")
                         primary = alt
-                        structure = self.__tmdb_structure(primary) if primary["type"] == MediaType.TV.value else {}
+                        order, structure = build_structure(primary)
                     else:
-                        logger.warn(f"批次 {batch_root.name}:LLM 给出的作品 TMDB {alt_id} 不在候选内,忽略")
+                        logger.warn(f"批次 {batch_name}:LLM 给出的作品 TMDB {alt_id} 不在候选内,忽略")
                 files = self.__validate_mapping(result.get("items") or [], rels, parsed, primary, structure)
                 how = "LLM"
             mf["files"] = files
             mf["media"] = {k: primary.get(k) for k in ("tmdbid", "title", "year", "type")}
+            mf["media"]["episode_group"] = order.get("group_id")
+            mf["media"]["order_source"] = order.get("source")
+            mf["sync_emby"] = bool(order.get("group_id") and self._emby_sync_group
+                                   and not str(order.get("source") or "").startswith("Emby"))
             mf["how"] = how
             mf["status"] = "ok"
             counts = Counter(v.get("c") for v in files.values())
-            logger.info(f"批次清单[{how}] {batch_root.name} -> {primary['title']} ({primary['year']}) "
-                        f"TMDB {primary['tmdbid']}:" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            logger.info(f"批次清单[{how}] {batch_name} -> {primary['title']} ({primary['year']}) "
+                        f"TMDB {primary['tmdbid']},编号体系:{self.__order_label(order)}:"
+                        + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
             mapped = [f"S{v['s']:02d}E{v['e']:02d}<={Path(r).name}" for r, v in files.items()
                       if v.get("c") in ("main", "special") and v.get("s") is not None]
             if mapped:
@@ -1018,7 +1072,7 @@ class CloudLinkMonitor(_PluginBase):
             mf["unknown"] = unknown
             if unknown:
                 detail = "; ".join(f"{Path(r).name}({files[r].get('note') or '?'})" for r in unknown[:20])
-                logger.warn(f"批次 {batch_root.name} 有 {len(unknown)} 个文件无法确定季集,已跳过待人工处理:{detail}")
+                logger.warn(f"批次 {batch_name} 有 {len(unknown)} 个文件无法确定季集,已跳过待人工处理:{detail}")
                 if self._notify:
                     self.post_message(mtype=NotificationType.Manual,
                                       title=f"{primary['title']} 批次有 {len(unknown)} 个文件无法确定季集,已跳过",
@@ -1048,7 +1102,7 @@ class CloudLinkMonitor(_PluginBase):
         """候选作品:清洗后文件名识别投票(权重=文件数) + 发布目录名识别(权重 3) + 近 7 天下载记录(权重 1)"""
         votes: Dict[str, dict] = {}
 
-        def add(tmdbid, title, year, mtype, weight, src, hint=None):
+        def add(tmdbid, title, year, mtype, weight, src, hint=None, groups=None, episode_group=None):
             try:
                 tmdbid = int(tmdbid)
             except (TypeError, ValueError):
@@ -1062,15 +1116,31 @@ class CloudLinkMonitor(_PluginBase):
                 c["src"].append(src)
             if hint and not c.get("hint"):
                 c["hint"] = hint
+            if groups and not c.get("groups"):
+                c["groups"] = [dict(g) for g in groups if isinstance(g, dict)]
+            if episode_group and not c.get("episode_group"):
+                c["episode_group"] = str(episode_group)
+
+        def mi_groups(mi):
+            return getattr(mi, "episode_groups", None) or (getattr(mi, "tmdb_info", None) or {}).get(
+                "episode_groups", {}).get("results")
 
         names = Counter(v["name"] for v in parsed.values() if v["name"] and not v["marker"])
         for name, cnt in names.most_common(6):
             mi = self.__recognize_title(name)
             if mi and getattr(mi, "tmdb_id", None):
-                add(mi.tmdb_id, mi.title, mi.year, mi.type.value, cnt, "文件名")
+                add(mi.tmdb_id, mi.title, mi.year, mi.type.value, cnt, "文件名", groups=mi_groups(mi))
         mi = self.__recognize_title(batch_name)
         if mi and getattr(mi, "tmdb_id", None):
-            add(mi.tmdb_id, mi.title, mi.year, mi.type.value, 3, "目录名")
+            add(mi.tmdb_id, mi.title, mi.year, mi.type.value, 3, "目录名", groups=mi_groups(mi))
+        try:
+            from app.db.subscribe_oper import SubscribeOper
+            for sub in (SubscribeOper().list() or []):
+                if str(getattr(sub, "media_source", "") or "") == "themoviedb" and getattr(sub, "media_id", None) \
+                        and getattr(sub, "episode_group", None):
+                    add(sub.media_id, sub.name, sub.year, sub.type, 0, "订阅", episode_group=sub.episode_group)
+        except Exception as e:
+            logger.debug(f"读取订阅失败:{str(e)}")
         try:
             # 下载记录只作低权重提示:同一作品多条记录(逐集下载)只计 1 票,不能盖过文件名/目录名识别
             cutoff = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
@@ -1082,7 +1152,8 @@ class CloudLinkMonitor(_PluginBase):
                     continue
                 seen_his.add(str(his.media_id))
                 hint = f"下载记录 {his.torrent_name or ''} {his.seasons or ''}".strip()
-                add(his.media_id, his.title, his.year, his.type, 1, "下载记录", hint)
+                add(his.media_id, his.title, his.year, his.type, 1, "下载记录", hint,
+                    episode_group=getattr(his, "episode_group", None))
         except Exception as e:
             logger.debug(f"读取下载记录失败:{str(e)}")
         result = sorted(votes.values(), key=lambda c: -c["votes"])
@@ -1092,46 +1163,253 @@ class CloudLinkMonitor(_PluginBase):
                 for c in result[:4]))
         return result
 
-    def __tmdb_structure(self, series: dict) -> Dict[int, dict]:
-        """{季号: {"count": 集数, "name": 季名, "episodes": {集号: (集名, 首播, 时长)}}}(1 小时缓存)"""
+    # ---- 编号体系(剧集组)解析 ----
+
+    def __group_map(self) -> Dict[str, str]:
+        """插件配置的手动映射:每行 tmdbid=剧集组id"""
+        result: Dict[str, str] = {}
+        for line in (self._group_map or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^(\d+)\s*[=:：]\s*([0-9a-fA-F]{24})$", line)
+            if m:
+                result[m.group(1)] = m.group(2)
+        return result
+
+    @staticmethod
+    def __pick_season_group(groups: list) -> Optional[dict]:
+        """在 TMDB 剧集组里挑"按季"类型(原播出/制作/电视 顺序,且 ≥2 季)的最完整一个;DVD/绝对/故事线/流媒体顺序不选"""
+        best, best_key = None, None
+        for g in groups or []:
+            if not isinstance(g, dict):
+                continue
+            try:
+                gtype = int(g.get("type") or 0)
+                gcount = int(g.get("group_count") or 0)
+                ecount = int(g.get("episode_count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if gtype not in (1, 6, 7) or gcount < 2:
+                continue
+            name = str(g.get("name") or "").strip()
+            # 名字就叫 Seasons/Season 的组最常见也最规范,其次名字含 season/季,再按集数多少
+            key = (2 if re.match(r"^(seasons?|按季|分季)$", name, re.IGNORECASE)
+                   else 1 if re.search(r"season|季", name, re.IGNORECASE) else 0, ecount)
+            if best_key is None or key > best_key:
+                best, best_key = g, key
+        return best
+
+    def __save_series_groups(self):
+        try:
+            self.save_data("series_groups", self._series_groups or {})
+        except Exception as e:
+            logger.warn(f"保存剧集组映射失败:{str(e)}")
+
+    @staticmethod
+    def __order_label(order: dict) -> str:
+        if order.get("group_id"):
+            return f"剧集组『{order.get('name') or ''}』({order.get('group_id')},来源 {order.get('source')})"
+        return f"TMDB 默认顺序({order.get('source') or '默认'})"
+
+    def __resolve_order(self, series: dict, parsed: Dict[str, dict], batch_name: str) -> dict:
+        """
+        决定该作品入库使用的编号体系,优先级:Emby 已配置的剧集组(tmdbeg) > MP 下载记录/订阅里的剧集组 >
+        插件手动映射 > 已记录的自动选组 > 合并季自动识别并选组(随后同步到 Emby) > TMDB 默认顺序。
+        原则:CLM 的命名必须与 Emby 取元数据用的顺序一致。
+        """
         tmdbid = series.get("tmdbid")
+        key = str(tmdbid)
+        title = series.get("title") or key
+        groups = series.get("groups") or []
+        override = self._order_override or {}
+
+        def gname(gid):
+            return next((str(g.get("name") or "") for g in groups if str(g.get("id")) == str(gid)), "")
+
+        def valid(gid):
+            return bool(gid) and (not groups or any(str(g.get("id")) == str(gid) for g in groups))
+
+        if override.get("force_default"):
+            return {"group_id": None, "name": "", "source": "测试强制默认", "auto": False}
+        emby = None if override.get("ignore_emby") else self.__emby_series_info(tmdbid)
+        if emby:
+            if emby.get("tmdbeg"):
+                gid = str(emby["tmdbeg"])
+                if not valid(gid):
+                    logger.warn(f"Emby 为《{title}》配置的剧集组 {gid} 不在 TMDB 当前剧集组列表中,仍以 Emby 为准")
+                return {"group_id": gid, "name": gname(gid), "source": "Emby", "auto": False}
+            display_order = str(emby.get("display_order") or "")
+            if display_order and display_order.lower() not in ("aired", "default"):
+                logger.warn(f"Emby 对《{title}》使用显示顺序 {display_order},插件不支持该顺序,按 TMDB 默认顺序整理")
+            return {"group_id": None, "name": "", "source": "Emby默认顺序", "auto": False, "emby_exists": True}
+        for src, gid in (("下载记录/订阅", series.get("episode_group")),
+                         ("配置映射", self.__group_map().get(key)),
+                         ("已记录", (self._series_groups or {}).get(key, {}).get("group_id"))):
+            if valid(gid):
+                return {"group_id": str(gid), "name": gname(gid), "source": src, "auto": False}
+        # 合并季识别:TMDB 默认只有一个正规季,且(集数很多 或 发布明确写着 ≥2 季),并存在按季类型剧集组
+        default_struct = self.__tmdb_structure(series, {"group_id": None})
+        regular = sorted(sn for sn in (default_struct.get("seasons") or {}) if sn > 0)
+        release_season = max([int(v["season"]) for v in parsed.values() if v.get("season")] or [0])
+        try:
+            release_season = max(release_season, int(MetaInfo(title=batch_name).begin_season or 0))
+        except Exception:
+            pass
+        if len(regular) == 1 and (self.__season_size(default_struct, regular[0]) >= 40 or release_season >= 2):
+            pick = self.__pick_season_group(groups)
+            if pick:
+                gid = str(pick.get("id"))
+                if self._series_groups is None:
+                    self._series_groups = {}
+                self._series_groups[key] = {"group_id": gid, "name": pick.get("name"), "title": title,
+                                            "source": "auto", "time": time.time()}
+                self.__save_series_groups()
+                logger.warn(f"《{title}》在 TMDB 为合并单季({self.__season_size(default_struct, regular[0])} 集),"
+                            f"自动选用按季剧集组『{pick.get('name')}』({gid}),入库后将同步设置到 Emby")
+                if self._notify and key not in self._group_notified:
+                    self._group_notified.add(key)
+                    self.post_message(mtype=NotificationType.Manual,
+                                      title=f"{title}:已自动启用剧集组『{pick.get('name')}』",
+                                      text=f"TMDB 把该剧合并为单季,按季整理需要剧集组。已选用 {gid},"
+                                           f"入库后会自动同步到 Emby;如需更换,在插件配置里写 {key}={gid} 形式的映射")
+                return {"group_id": gid, "name": pick.get("name"), "source": "自动(合并季)", "auto": True}
+            logger.warn(f"《{title}》在 TMDB 为合并单季但没有可用的按季剧集组,按默认顺序(绝对集数)整理")
+        return {"group_id": None, "name": "", "source": "TMDB默认", "auto": False}
+
+    # ---- 季集结构(目标编号体系)与换算 ----
+
+    def __tmdb_structure(self, series: dict, order: dict) -> dict:
+        """
+        目标编号体系下的季集结构:
+        {"seasons": {季号: {"count","name","episodes": {集号: (集名, 首播, 时长)}}}, "offsets": {季号: 绝对集数偏移},
+         "order": 编号体系, "merged": 默认顺序是否为合并单季, "ref": [{"season","start","count","name"}](合并季时的按季参考边界)}
+        """
+        tmdbid = series.get("tmdbid")
+        gid = (order or {}).get("group_id")
+        cache_key = f"{tmdbid}:{gid or ''}"
         if self._tmdb_struct_cache is None:
             self._tmdb_struct_cache = {}
-        cached = self._tmdb_struct_cache.get(tmdbid)
+        cached = self._tmdb_struct_cache.get(cache_key)
         if cached and time.time() - cached[0] < 3600:
-            return cached[1]
-        struct: Dict[int, dict] = {}
+            struct = dict(cached[1])
+            struct["order"] = order
+            return struct
+        seasons: Dict[int, dict] = {}
         try:
-            seasons = self.tmdbchain.tmdb_seasons(tmdbid=tmdbid) or []
-            total = sum(int(getattr(s, "episode_count", 0) or 0) for s in seasons)
-            for s in seasons:
-                sn = getattr(s, "season_number", None)
-                if sn is None:
-                    continue
-                entry = {"count": int(getattr(s, "episode_count", 0) or 0),
-                         "name": getattr(s, "name", "") or "", "episodes": {}}
-                if total <= 600 or int(sn) == 0:
-                    for e in (self.tmdbchain.tmdb_episodes(tmdbid=tmdbid, season=int(sn)) or []):
+            if gid:
+                for s in (self.tmdbchain.tmdb_group_seasons(group_id=gid) or []):
+                    sn = getattr(s, "season_number", None)
+                    if sn is None:
+                        continue
+                    eps = self.tmdbchain.tmdb_episodes(tmdbid=tmdbid, season=int(sn), episode_group=gid) or []
+                    entry = {"count": int(getattr(s, "episode_count", 0) or 0),
+                             "name": getattr(s, "name", "") or "", "episodes": {}}
+                    for e in eps:
                         num = getattr(e, "episode_number", None)
                         if num is None:
                             continue
                         entry["episodes"][int(num)] = (getattr(e, "name", "") or "", getattr(e, "air_date", "") or "",
                                                        getattr(e, "runtime", None))
                     entry["count"] = max(entry["count"], len(entry["episodes"]))
-                struct[int(sn)] = entry
+                    seasons[int(sn)] = entry
+            else:
+                all_seasons = self.tmdbchain.tmdb_seasons(tmdbid=tmdbid) or []
+                total = sum(int(getattr(s, "episode_count", 0) or 0) for s in all_seasons)
+                for s in all_seasons:
+                    sn = getattr(s, "season_number", None)
+                    if sn is None:
+                        continue
+                    entry = {"count": int(getattr(s, "episode_count", 0) or 0),
+                             "name": getattr(s, "name", "") or "", "episodes": {}}
+                    if total <= 600 or int(sn) == 0:
+                        for e in (self.tmdbchain.tmdb_episodes(tmdbid=tmdbid, season=int(sn)) or []):
+                            num = getattr(e, "episode_number", None)
+                            if num is None:
+                                continue
+                            entry["episodes"][int(num)] = (getattr(e, "name", "") or "",
+                                                           getattr(e, "air_date", "") or "",
+                                                           getattr(e, "runtime", None))
+                        entry["count"] = max(entry["count"], len(entry["episodes"]))
+                    seasons[int(sn)] = entry
         except Exception as e:
-            logger.warn(f"获取 TMDB {tmdbid} 季集结构失败:{str(e)}")
-        self._tmdb_struct_cache[tmdbid] = (time.time(), struct)
+            logger.warn(f"获取 TMDB {tmdbid} 季集结构失败({'剧集组 ' + gid if gid else '默认顺序'}):{str(e)}")
+        regular = sorted(sn for sn in seasons if sn > 0)
+        offsets: Dict[int, int] = {}
+        cum = 0
+        for sn in regular:
+            offsets[sn] = cum
+            cum += max(int(seasons[sn].get("count") or 0), len(seasons[sn].get("episodes") or {}))
+        merged = (not gid) and len(regular) == 1 and cum >= 40
+        ref, ref_name = [], ""
+        if merged:
+            pick = self.__pick_season_group(series.get("groups") or [])
+            if pick:
+                try:
+                    cum_ref = 0
+                    for s in (self.tmdbchain.tmdb_group_seasons(group_id=str(pick.get("id"))) or []):
+                        sn = getattr(s, "season_number", None)
+                        cnt = int(getattr(s, "episode_count", 0) or 0)
+                        if sn is None or int(sn) <= 0 or cnt <= 0:
+                            continue
+                        ref.append({"season": int(sn), "start": cum_ref + 1, "count": cnt,
+                                    "name": getattr(s, "name", "") or ""})
+                        cum_ref += cnt
+                    ref_name = str(pick.get("name") or "")
+                except Exception as e:
+                    logger.debug(f"获取按季参考剧集组失败:{str(e)}")
+        struct = {"seasons": seasons, "offsets": offsets, "order": order, "merged": merged,
+                  "ref": ref, "ref_name": ref_name}
+        self._tmdb_struct_cache[cache_key] = (time.time(), dict(struct))
         return struct
 
     @staticmethod
-    def __season_size(structure: Dict[int, dict], season: int) -> int:
-        entry = structure.get(season) or {}
+    def __season_size(structure: dict, season: int) -> int:
+        entry = (structure.get("seasons") or {}).get(season) or {}
         return max(int(entry.get("count") or 0), len(entry.get("episodes") or {}))
 
+    def __abs_to_target(self, structure: dict, abs_no: int) -> Optional[Tuple[int, int]]:
+        """绝对集数 -> 目标编号体系的 (季, 集)"""
+        for sn in sorted(structure.get("offsets") or {}):
+            off = structure["offsets"][sn]
+            cnt = self.__season_size(structure, sn)
+            if off < abs_no <= off + cnt:
+                return sn, abs_no - off
+        return None
+
+    def __season_ep_to_target(self, structure: dict, season: int, episode: int) -> Optional[Tuple[int, int]]:
+        """发布的(季, 集) -> 目标编号体系的 (季, 集):目标有该季直接用;合并季目标按参考边界换算成绝对集数"""
+        if season in (structure.get("seasons") or {}) and 1 <= episode <= self.__season_size(structure, season):
+            return season, episode
+        for r in structure.get("ref") or []:
+            if r["season"] == season and 1 <= episode <= r["count"]:
+                return self.__abs_to_target(structure, r["start"] + episode - 1)
+        return None
+
+    def __plausible_targets(self, structure: dict, season: Optional[int], episode: Optional[int]) -> Optional[set]:
+        """文件名季集在目标编号体系下的所有合理落点;None 表示文件名无集号、不设约束"""
+        if episode is None:
+            return None
+        result = set()
+        if season is not None:
+            target = self.__season_ep_to_target(structure, season, episode)
+            if target:
+                result.add(target)
+            return result
+        for sn in sorted(structure.get("offsets") or {}):
+            if 1 <= episode <= self.__season_size(structure, sn):
+                result.add((sn, episode))
+        target = self.__abs_to_target(structure, episode)
+        if target:
+            result.add(target)
+        return result
+
     def __rule_mapping(self, batch_name: str, parsed: Dict[str, dict], primary: dict,
-                       structure: Dict[int, dict]) -> Optional[Dict[str, dict]]:
-        """命名整齐、季集全部落在 TMDB 一季范围内且无歧义的批次直接按解析映射(免 LLM);否则返回 None"""
+                       structure: dict) -> Optional[Dict[str, dict]]:
+        """
+        命名整齐、每个文件都能唯一换算到目标编号体系且无歧义的批次直接映射(免 LLM);否则返回 None。
+        支持:目标按季 + 发布绝对集数;目标合并季(绝对) + 发布按季;显式 SxxExx。
+        """
         files: Dict[str, dict] = {}
         cands: Dict[str, dict] = {}
         for rel, v in parsed.items():
@@ -1148,51 +1426,88 @@ class CloudLinkMonitor(_PluginBase):
             return files
         if len({v["pattern"] for v in cands.values()}) > 1 or len({v["name"] for v in cands.values()}) > 1:
             return None
-        seasons = {v["season"] for v in cands.values()}
-        if len(seasons) > 1:
-            return None
-        season = next(iter(seasons))
-        if season is None:
-            season = MetaInfo(title=batch_name).begin_season
-            if season is None:
-                regular = [sn for sn in structure if sn > 0]
-                if len(regular) != 1:
-                    return None
-                season = regular[0]
-        if season not in structure:
-            return None
-        count = self.__season_size(structure, season)
-        eps = [v["episode"] for v in cands.values()]
-        if any(e is None for e in eps) or len(set(eps)) != len(eps) or any(e < 1 or e > count for e in eps):
+        try:
+            batch_season = MetaInfo(title=batch_name).begin_season
+        except Exception:
+            batch_season = None
+        regular = sorted(structure.get("offsets") or {})
+        mapping: Dict[str, Tuple[int, int]] = {}
+        for rel, v in cands.items():
+            if v["episode"] is None:
+                return None
+            ep = int(v["episode"])
+            if v["season"] is not None:
+                target = self.__season_ep_to_target(structure, int(v["season"]), ep)
+            else:
+                options = self.__plausible_targets(structure, None, ep) or set()
+                target = None
+                if batch_season is not None:
+                    # 目录名给出季号:优先该季直接对应,其次按季换算(合并季目标);集号超出该季范围则按绝对集数处理
+                    if (batch_season, ep) in options:
+                        target = (batch_season, ep)
+                    else:
+                        target = self.__season_ep_to_target(structure, int(batch_season), ep)
+                if target is None:
+                    if len(options) == 1:
+                        target = next(iter(options))
+                    elif len(regular) == 1 and (regular[0], ep) in options:
+                        target = (regular[0], ep)
+            if not target:
+                return None
+            mapping[rel] = target
+        if len(set(mapping.values())) != len(mapping):
             return None
         sizes = sorted(v["size"] for v in cands.values())
         median = sizes[len(sizes) // 2]
         if median and sizes[0] < 0.35 * median:
             return None
-        for rel, v in cands.items():
-            files[rel] = {"c": "main", "s": int(season), "e": int(v["episode"]), "how": "rule"}
+        for rel, (s, e) in mapping.items():
+            note = None
+            if parsed[rel]["episode"] != e or (parsed[rel]["season"] is not None and parsed[rel]["season"] != s):
+                note = f"由文件名 S{parsed[rel]['season'] or '?'}E{parsed[rel]['episode']} 换算"
+            files[rel] = {"c": "main", "s": int(s), "e": int(e), "how": "rule"}
+            if note:
+                files[rel]["note"] = note
         return files
 
-    def __structure_text(self, structure: Dict[int, dict]) -> str:
-        lines = []
-        for sn in sorted(structure.keys()):
-            entry = structure[sn]
+    def __structure_text(self, structure: dict) -> str:
+        order = structure.get("order") or {}
+        lines = [f"目标编号体系: {self.__order_label(order)}"]
+        if structure.get("merged"):
+            if structure.get("ref"):
+                bounds = "、".join(f"{r['name'] or 'S' + str(r['season'])}=第{r['start']}–{r['start'] + r['count'] - 1}集"
+                                  for r in structure["ref"])
+                lines.append(f"(默认顺序为合并单季绝对集数;按季参考『{structure.get('ref_name')}』:{bounds})")
+            else:
+                lines.append("(默认顺序为合并单季绝对集数)")
+        offsets = structure.get("offsets") or {}
+        multi = len(offsets) > 1
+        for sn in sorted((structure.get("seasons") or {}).keys()):
+            entry = structure["seasons"][sn]
             lines.append(f"Season {sn} ({entry.get('name') or ''}), {self.__season_size(structure, sn)} 集:")
             for num in sorted(entry.get("episodes") or {}):
                 name, air, runtime = entry["episodes"][num]
-                lines.append(f"  S{sn}E{num}: {name} ({(air or '')[:7]}{', ' + str(runtime) + 'min' if runtime else ''})")
+                tag = ""
+                if sn > 0 and multi and sn in offsets:
+                    tag = f" (abs {offsets[sn] + num})"
+                elif sn > 0 and structure.get("merged") and structure.get("ref"):
+                    for r in structure["ref"]:
+                        if r["start"] <= num < r["start"] + r["count"]:
+                            tag = f" (按季 S{r['season']}E{num - r['start'] + 1:02d})"
+                            break
+                lines.append(f"  S{sn}E{num}{tag}: {name} ({(air or '')[:7]}{', ' + str(runtime) + 'min' if runtime else ''})")
         return "\n".join(lines) or "(无季集结构/电影)"
 
     def __llm_mapping(self, batch_name: str, rels: List[str], parsed: Dict[str, dict], primary: dict,
-                      candidates: List[dict], structure: Dict[int, dict]) -> Optional[dict]:
-        """一批一次:编号文件列表 + TMDB 季集结构 -> LLM 按编号输出分类与季集(输出极小,不会截断)"""
+                      candidates: List[dict], structure: dict) -> Optional[dict]:
+        """一批一次:编号文件列表 + 目标编号体系季集结构 -> LLM 按编号输出分类与季集(输出极小,不会截断)"""
         listing = "\n".join(f"{i + 1}. {self.__fmt_size(parsed[r]['size'])} {r}" for i, r in enumerate(rels))
         alts = [c for c in candidates if c["tmdbid"] != primary["tmdbid"]][:5]
         alt_text = "; ".join(f"TMDB {c['tmdbid']} {c['title']} ({c['year']}) {c['type']}" for c in alts) or "无"
         hint = f"\n提示: {primary['hint']}" if primary.get("hint") else ""
         user_msg = (f"发布目录名: {batch_name}\n当前作品: TMDB {primary['tmdbid']} {primary['title']} "
                     f"({primary['year']}) 类型:{primary['type']}{hint}\n文件列表(编号. 大小 文件名):\n{listing}\n\n"
-                    f"TMDB 季集结构:\n{self.__structure_text(structure)}\n\n备选作品(可能相关): {alt_text}")
+                    f"季集结构:\n{self.__structure_text(structure)}\n\n备选作品(可能相关): {alt_text}")
         logger.info(f"批次 {batch_name}:调用 LLM 建立季集映射({len(rels)} 个文件)...")
         t0 = time.time()
         text = self.__llm_invoke(MANIFEST_PROMPT, user_msg, timeout=300)
@@ -1297,16 +1612,12 @@ class CloudLinkMonitor(_PluginBase):
         except Exception:
             return None
 
-    def __absolute_index(self, structure: Dict[int, dict], season: int, episode: int) -> int:
-        """按 TMDB 常规季顺序换算绝对集数(不含第 0 季)"""
-        before = sum(self.__season_size(structure, sn) for sn in structure if 0 < sn < season)
-        return before + episode
-
     def __validate_mapping(self, items: list, rels: List[str], parsed: Dict[str, dict], primary: dict,
-                           structure: Dict[int, dict]) -> Dict[str, dict]:
+                           structure: dict) -> Dict[str, dict]:
         """
-        LLM 只有提案权:标记文件一律 extra;季集必须存在于 TMDB、不重复、正片与文件名解析集号不冲突
-        (允许绝对集数换算)、正片体积不能远小于同批正片中位数;不通过一律 unknown(跳过,绝不猜)
+        LLM 只有提案权:标记文件一律 extra;季集必须存在于目标编号体系、不重复;正片的季集必须是文件名季集
+        在目标体系下的合理落点之一(直接对应 / 绝对集数换算 / 按季换算);正片体积不能远小于同批正片中位数;
+        不通过一律 unknown(跳过,绝不猜)
         """
         got: Dict[str, dict] = {}
         for it in items:
@@ -1319,23 +1630,9 @@ class CloudLinkMonitor(_PluginBase):
             if 1 <= idx <= len(rels):
                 got[rels[idx - 1]] = it
         is_tv = primary["type"] == MediaType.TV.value
+        seasons = structure.get("seasons") or {}
         files: Dict[str, dict] = {}
         used: Dict[tuple, str] = {}
-        # 发布按季编号而 TMDB 按绝对集数编排(如 Re:Zero S2 第01話 -> TMDB S1E26)时,
-        # LLM 给出的集号与文件名集号会相差一个固定偏移;全批正片偏移一致且为正时视为换算而非冲突
-        deltas = set()
-        for rel in rels:
-            it = got.get(rel) or {}
-            v = parsed[rel]
-            if v["marker"] or str(it.get("c") or "").lower() != "main" or v["episode"] is None:
-                continue
-            try:
-                deltas.add(int(it.get("e")) - int(v["episode"]))
-            except (TypeError, ValueError):
-                deltas.add(None)
-        shift = next(iter(deltas)) if len(deltas) == 1 and None not in deltas and next(iter(deltas)) > 0 else 0
-        if shift:
-            logger.info(f"批次正片集号与文件名集号存在一致偏移 +{shift}(按发布季换算 TMDB 绝对集数)")
         for rel in rels:
             v = parsed[rel]
             if v["marker"]:
@@ -1351,20 +1648,27 @@ class CloudLinkMonitor(_PluginBase):
                     s, e = int(it.get("s")), int(it.get("e"))
                 except (TypeError, ValueError):
                     s, e = None, None
-                if s is None or s not in structure:
+                plausible = self.__plausible_targets(structure, v["season"], v["episode"]) if cls == "main" else None
+                if s is None or s not in seasons:
                     entry = {"c": "unknown", "how": "llm", "note": f"LLM 未给出有效季集({it.get('s')}/{it.get('e')})"}
                 elif not 1 <= e <= self.__season_size(structure, s):
-                    entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 超出 TMDB 范围"}
-                elif cls == "main" and v["episode"] is not None and v["episode"] != e \
-                        and v["episode"] != self.__absolute_index(structure, s, e) \
-                        and v["episode"] + shift != e:
-                    entry = {"c": "unknown", "how": "llm", "note": f"文件名集号 {v['episode']} 与 LLM S{s}E{e} 冲突"}
+                    entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 超出范围"}
+                elif plausible is not None and not plausible:
+                    entry = {"c": "unknown", "how": "llm",
+                             "note": f"文件名 S{v['season'] or '?'}E{v['episode']} 无法换算到目标编号体系"}
+                elif plausible is not None and (s, e) not in plausible:
+                    entry = {"c": "unknown", "how": "llm",
+                             "note": f"LLM S{s}E{e} 与文件名 S{v['season'] or '?'}E{v['episode']} 的换算结果"
+                                     f"{sorted(plausible)}不符"}
                 elif (s, e) in used:
                     entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 与 {Path(used[(s, e)]).name} 重复"}
                     files[used[(s, e)]] = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 与 {Path(rel).name} 重复"}
                 else:
                     used[(s, e)] = rel
                     entry.update({"s": s, "e": e})
+                    if cls == "main" and v["episode"] is not None and \
+                            (v["episode"] != e or (v["season"] is not None and v["season"] != s)):
+                        entry["note"] = f"由文件名 S{v['season'] or '?'}E{v['episode']} 换算"
             files[rel] = entry
         mains = [(rel, parsed[rel]["size"]) for rel, v in files.items() if v.get("c") == "main"]
         if len(mains) >= 3:
@@ -1401,7 +1705,7 @@ class CloudLinkMonitor(_PluginBase):
 
     # endregion
 
-    # region Emby 覆盖重探(StrmAssistant ReprobeMediaInfo)
+    # region Emby 联动:系列信息(剧集组)/覆盖重探/剧集组同步
 
     def __emby_server(self) -> Optional[Tuple[str, str]]:
         if self._emby_cache is None:
@@ -1423,25 +1727,62 @@ class CloudLinkMonitor(_PluginBase):
         self._emby_cache["server"] = server
         return server
 
+    def __emby_admin_id(self) -> Optional[str]:
+        server = self.__emby_server()
+        if not server:
+            return None
+        if self._emby_cache.get("admin"):
+            return self._emby_cache["admin"]
+        host, key = server
+        try:
+            users = requests.get(f"{host}/emby/Users", params={"api_key": key}, timeout=10).json() or []
+            admin = next((u for u in users if (u.get("Policy") or {}).get("IsAdministrator")), None) \
+                or (users[0] if users else None)
+            if admin:
+                self._emby_cache["admin"] = str(admin.get("Id"))
+                return self._emby_cache["admin"]
+        except Exception as e:
+            logger.debug(f"查询 Emby 用户失败:{str(e)}")
+        return None
+
+    def __emby_series_info(self, tmdbid, refresh: bool = False) -> Optional[dict]:
+        """Emby 中该剧(按 TMDB id)的条目信息:{"id","name","tmdbeg","display_order"};不存在返回 None(缓存 10 分钟)"""
+        server = self.__emby_server()
+        if not server or tmdbid is None:
+            return None
+        host, key = server
+        cache = self._emby_cache.setdefault("series", {})
+        hit = cache.get(str(tmdbid))
+        if hit and not refresh and time.time() - hit[0] < 600:
+            return hit[1]
+        info = None
+        try:
+            resp = requests.get(f"{host}/emby/Items", params={
+                "IncludeItemTypes": "Series", "Recursive": "true", "AnyProviderIdEquals": f"tmdb.{tmdbid}",
+                "Fields": "ProviderIds,DisplayOrder", "api_key": key}, timeout=10).json()
+            items = resp.get("Items") or []
+            if items:
+                it = items[0]
+                pids = {str(k).lower(): v for k, v in (it.get("ProviderIds") or {}).items()}
+                info = {"id": str(it.get("Id")), "name": it.get("Name"),
+                        "tmdbeg": pids.get("tmdbeg") or None, "display_order": it.get("DisplayOrder")}
+        except Exception as e:
+            logger.debug(f"查询 Emby 系列失败:{str(e)}")
+            return None
+        cache[str(tmdbid)] = (time.time(), info)
+        return info
+
     def __emby_episode_item(self, tmdbid, season, episode) -> Optional[str]:
-        """Emby 中该剧(按 TMDB id)对应季集的条目 id,不存在返回 None"""
+        """Emby 中该剧对应季集的条目 id,不存在返回 None"""
         server = self.__emby_server()
         if not server or tmdbid is None or season is None or episode is None:
             return None
         host, key = server
         try:
-            series = self._emby_cache.setdefault("series", {})
-            sid = series.get(str(tmdbid))
-            if sid is None:
-                resp = requests.get(f"{host}/emby/Items", params={
-                    "IncludeItemTypes": "Series", "Recursive": "true",
-                    "AnyProviderIdEquals": f"tmdb.{tmdbid}", "api_key": key}, timeout=10).json()
-                items = resp.get("Items") or []
-                sid = str(items[0].get("Id")) if items else ""
-                series[str(tmdbid)] = sid
-            if not sid:
+            info = self.__emby_series_info(tmdbid)
+            if not info:
                 return None
-            resp = requests.get(f"{host}/emby/Shows/{sid}/Episodes",
+            resp = requests.get(f"{host}/emby/Shows/{info['id']}/Episodes",
                                 params={"Season": int(season), "api_key": key}, timeout=10).json()
             for it in resp.get("Items") or []:
                 if it.get("ParentIndexNumber") == int(season) and it.get("IndexNumber") == int(episode):
@@ -1471,6 +1812,75 @@ class CloudLinkMonitor(_PluginBase):
         timer = threading.Timer(delay, _run)
         timer.daemon = True
         timer.start()
+
+    def __emby_set_group(self, series_id: str, group_id: str) -> bool:
+        """给 Emby 系列写入 TMDB 剧集组(ProviderIds.tmdbeg,与 Emby 元数据编辑器勾选剧集组等效)并整体刷新元数据"""
+        server = self.__emby_server()
+        admin = self.__emby_admin_id()
+        if not server or not admin:
+            return False
+        host, key = server
+        try:
+            dto = requests.get(f"{host}/emby/Users/{admin}/Items/{series_id}", params={"api_key": key},
+                               timeout=15).json()
+            if not dto or not dto.get("Id"):
+                return False
+            pids = dict(dto.get("ProviderIds") or {})
+            pids["tmdbeg"] = str(group_id)
+            dto["ProviderIds"] = pids
+            resp = requests.post(f"{host}/emby/Items/{series_id}", params={"api_key": key}, json=dto, timeout=30)
+            if resp.status_code not in (200, 204):
+                logger.warn(f"Emby 更新系列 {series_id} 剧集组失败:HTTP {resp.status_code} {resp.text[:120]}")
+                return False
+            requests.post(f"{host}/emby/Items/{series_id}/Refresh", params={
+                "Recursive": "true", "MetadataRefreshMode": "FullRefresh", "ImageRefreshMode": "Default",
+                "ReplaceAllMetadata": "true", "api_key": key}, timeout=30)
+            return True
+        except Exception as e:
+            logger.warn(f"Emby 设置剧集组失败:{str(e)}")
+            return False
+
+    def __emby_sync_group(self, tmdbid, group_id: str, title: str):
+        """
+        新剧按剧集组入库后,等 Emby 建出该系列(最多 10 分钟),把同一个剧集组写入 Emby 并刷新元数据,
+        保证 Emby 取元数据的顺序与文件命名一致。Emby 已配置其他剧集组时不覆盖,只告警。
+        """
+        if not self._emby_sync_group or not group_id or tmdbid is None:
+            return
+        key = str(tmdbid)
+        if self._emby_sync_pending is None:
+            self._emby_sync_pending = set()
+        if key in self._emby_sync_pending:
+            return
+        self._emby_sync_pending.add(key)
+
+        def _run():
+            try:
+                for _ in range(10):
+                    time.sleep(60)
+                    info = self.__emby_series_info(tmdbid, refresh=True)
+                    if not info:
+                        continue
+                    if info.get("tmdbeg") == str(group_id):
+                        logger.info(f"Emby 已为《{title}》配置剧集组 {group_id},无需同步")
+                        return
+                    if info.get("tmdbeg"):
+                        logger.warn(f"Emby 为《{title}》配置的剧集组 {info.get('tmdbeg')} 与入库使用的 {group_id} 不同,"
+                                    f"未覆盖;请统一后重新整理")
+                        return
+                    if self.__emby_set_group(info["id"], str(group_id)):
+                        logger.info(f"已为 Emby 系列《{title}》设置剧集组 {group_id} 并触发元数据刷新")
+                        if self._notify:
+                            self.post_message(mtype=NotificationType.Manual,
+                                              title=f"{title}:Emby 已同步剧集组",
+                                              text=f"剧集组 {group_id} 已写入 Emby 并刷新元数据,季集顺序与入库文件一致")
+                    return
+                logger.warn(f"等待 10 分钟后 Emby 仍未出现《{title}》,剧集组 {group_id} 未同步;下次入库会再尝试")
+            finally:
+                self._emby_sync_pending.discard(key)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
 
     # endregion
 
@@ -1628,13 +2038,15 @@ class CloudLinkMonitor(_PluginBase):
                 batch_root = self.__batch_root(file_path, mon_path)
                 manifest = None
                 entry = None
-                if batch_root is not None and self._dirconf.get(mon_path) is not None:
-                    manifest = self.__get_manifest(batch_root)
+                # 直接位于监控目录根下的单个媒体文件(单文件种子):按"只有一个文件的批次"走同一套清单逻辑
+                manifest_root = batch_root if batch_root is not None else (None if is_subtitle else file_path)
+                if manifest_root is not None and self._dirconf.get(mon_path) is not None:
+                    manifest = self.__get_manifest(manifest_root)
                     if manifest and manifest.get("pending"):
                         logger.debug(f"批次 {batch_root.name} 尚未稳定,本轮跳过:{file_path.name}")
                         return
                     if manifest:
-                        entry = self.__manifest_entry(manifest, batch_root, file_path)
+                        entry = self.__manifest_entry(manifest, manifest_root, file_path)
                 if entry:
                     if entry.get("c") in ("extra", "other"):
                         logger.info(f"{file_path.name} 批次清单判定为{entry.get('c')}"
@@ -1680,6 +2092,11 @@ class CloudLinkMonitor(_PluginBase):
                     if entry.get("e") is not None:
                         file_meta.begin_episode = int(entry["e"])
                         file_meta.end_episode = None
+                    if media.get("episode_group"):
+                        try:
+                            file_meta.episode_group = media.get("episode_group")
+                        except Exception:
+                            pass
                 else:
                     file_meta = self.__clean_meta(file_path)
                 if not file_meta.name:
@@ -1734,7 +2151,7 @@ class CloudLinkMonitor(_PluginBase):
                     media = manifest.get("media") or {}
                     mediainfo: MediaInfo = self.mediaChain.recognize_media(
                         meta=file_meta, mtype=file_meta.type, media_source=MediaSource.TMDB,
-                        media_id=str(media.get("tmdbid")))
+                        media_id=str(media.get("tmdbid")), episode_group=media.get("episode_group") or None)
                 else:
                     # 回退路径:chain 层完整识别链(原生失败回退辅助识别);辅助识别改写了季集时必须过门控
                     snapshot = (file_meta.name, file_meta.begin_season, file_meta.begin_episode)
@@ -1776,8 +2193,11 @@ class CloudLinkMonitor(_PluginBase):
 
                 # 获取集数据
                 if mediainfo.type == MediaType.TV:
+                    episode_group = ((manifest.get("media") or {}).get("episode_group") if entry else None) \
+                        or getattr(mediainfo, "episode_group", None) or None
                     episodes_info = self.tmdbchain.tmdb_episodes(tmdbid=mediainfo.tmdb_id,
-                                                                 season=1 if file_meta.begin_season is None else file_meta.begin_season)
+                                                                 season=1 if file_meta.begin_season is None else file_meta.begin_season,
+                                                                 episode_group=episode_group)
                 else:
                     episodes_info = None
 
@@ -1972,6 +2392,9 @@ class CloudLinkMonitor(_PluginBase):
 
                 if pre_item:
                     self.__emby_reprobe_later(pre_item, file_path.name)
+                if entry and manifest.get("sync_emby") and not is_subtitle:
+                    media = manifest.get("media") or {}
+                    self.__emby_sync_group(media.get("tmdbid"), media.get("episode_group"), media.get("title") or "")
 
                 # 移动模式删除空目录（必须确认媒体/字幕/音轨文件都已清空，防止误删未整理的字幕）
                 if transfer_type == "move":
@@ -2088,13 +2511,16 @@ class CloudLinkMonitor(_PluginBase):
             "description": "对指定批次目录建立/查看批次清单(作品识别 + 季集映射),不整理文件;rebuild=true 强制重建",
         }]
 
-    def batch_manifest(self, path: str, rebuild: bool = False) -> schemas.Response:
+    def batch_manifest(self, path: str, rebuild: bool = False, ignore_emby: bool = False,
+                       force_default: bool = False) -> schemas.Response:
         """
-        API:批次清单预览(不整理文件)
+        API:批次清单预览(不整理文件);ignore_emby/force_default 用于模拟"Emby 无此剧"/"按默认顺序"的场景
         """
         batch_root = Path(path)
-        if not batch_root.is_dir():
-            return schemas.Response(success=False, message=f"目录不存在:{path}")
+        if not batch_root.exists():
+            return schemas.Response(success=False, message=f"路径不存在:{path}")
+        self._order_override = {"ignore_emby": bool(ignore_emby), "force_default": bool(force_default)} \
+            if (ignore_emby or force_default) else None
         key = str(batch_root)
         if rebuild:
             if self._manifests:
@@ -2109,6 +2535,7 @@ class CloudLinkMonitor(_PluginBase):
             mf = self.__get_manifest(batch_root)
         finally:
             self._batch_settle = saved
+            self._order_override = None
         data = mf if mf else (self._manifests or {}).get(key)
         return schemas.Response(success=bool(mf), message="" if mf else "清单未建立(见插件日志)", data=data)
 
@@ -2609,7 +3036,35 @@ class CloudLinkMonitor(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'emby_sync_group',
+                                            'label': '新剧自动同步剧集组到 Emby',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'group_map',
+                                            'label': '剧集组映射(tmdbid=剧集组id)',
+                                            'rows': 2,
+                                            'placeholder': '65942=641eb9d6b234b9007ac67063'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
                                 'content': [
                                     {
                                         'component': 'VAlert',
@@ -2617,9 +3072,11 @@ class CloudLinkMonitor(_PluginBase):
                                             'type': 'info',
                                             'variant': 'tonal',
                                             'density': 'compact',
-                                            'text': '批次清单:同一发布目录先整体识别作品并拉取 TMDB 季集结构,'
-                                                    '命名不规整时由 LLM 一次给出每个文件的分类与季集,再经范围/重复/'
-                                                    '集号冲突/体积校验;不确定的文件跳过并通知,绝不猜。'
+                                            'text': '批次清单:同一发布目录先整体识别作品、决定编号体系(Emby 已配置的剧集组 > '
+                                                    '下载记录/订阅的剧集组 > 映射 > 合并季自动选组并同步 Emby > TMDB 默认顺序),'
+                                                    '拉取该体系下的季集结构;绝对集数/按季编号的资源都换算到目标体系;'
+                                                    '命名不规整时由 LLM 一次给出分类与季集,再经范围/换算/重复/体积校验;'
+                                                    '不确定的文件跳过并通知,绝不猜。'
                                         }
                                     }
                                 ]
@@ -2858,7 +3315,9 @@ class CloudLinkMonitor(_PluginBase):
             "leftover_policy": "quarantine",
             "leftover_dir": "",
             "batch_settle": 120,
-            "emby_reprobe": True
+            "emby_reprobe": True,
+            "emby_sync_group": True,
+            "group_map": ""
         }
 
     def get_page(self) -> List[dict]:
