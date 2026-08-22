@@ -57,6 +57,13 @@ SP_FILE_RE = re.compile(
 # 8 位十六进制 CRC(括号内)与「」『』集标题:MP 解析器会把 (08377E86) 当成 E86、把「レム」当成剧名
 CRC_RE = re.compile(r"[\(\[（【][0-9A-Fa-f]{8}[\)\]）】]")
 QUOTE_RE = re.compile(r"「[^」]*」|『[^』]*』")
+# "4th - 08" / "[4th]" 这类序数词季号(后面不接 Season 的)归一化为 S4;"4th Season" MP 本身认识,不动
+ORDINAL_SEASON_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})(?:st|nd|rd|th)(?=\s*[-\]\)）】])", re.IGNORECASE)
+# 文件名里显式写了季号的依据;没有这些依据而解析器仍给出季号(典型:把"- 08"当 S01E08)时季号视为未知
+EXPLICIT_SEASON_RE = re.compile(
+    r"(?<![A-Za-z0-9])S\d{1,2}(?:E\d{1,4})?(?![A-Za-z0-9])|Season\s*\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s*Season"
+    r"|第\s*[0-9一二三四五六七八九十]+\s*[季期部]|(?<![A-Za-z0-9])(?:II|III|IV)(?![A-Za-z0-9])", re.IGNORECASE)
+EP_RANGE_RE = re.compile(r"E(\d{1,4})(?:\s*-\s*E?(\d{1,4}))?", re.IGNORECASE)
 
 MANIFEST_PROMPT = (
     "你是媒体库整理助手。输入:一个发布目录名、其中全部视频文件的编号列表(含文件大小)、该作品在媒体库使用的"
@@ -108,7 +115,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.3.1"
+    plugin_version = "3.3.2"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -786,6 +793,7 @@ class CloudLinkMonitor(_PluginBase):
         """剥掉 8 位十六进制 CRC 与「」『』内的集标题(MP 解析器会把 CRC 当集数、把集标题当剧名)"""
         cleaned = CRC_RE.sub(" ", name or "")
         cleaned = QUOTE_RE.sub(" ", cleaned)
+        cleaned = ORDINAL_SEASON_RE.sub(lambda m: f"S{int(m.group(1))}", cleaned)
         return re.sub(r"\s{2,}", " ", cleaned).strip()
 
     def __clean_meta(self, file_path: Path):
@@ -1059,7 +1067,11 @@ class CloudLinkMonitor(_PluginBase):
                 if not marker and not re.search(r"S\d{1,2}E\d{1,3}", cleaned, re.IGNORECASE) \
                         and SP_FILE_RE.search(cleaned):
                     marker = "文件名标记"
-                parsed[rel] = {"name": meta.name or "", "season": meta.begin_season, "episode": meta.begin_episode,
+                season = meta.begin_season
+                if season is not None and not EXPLICIT_SEASON_RE.search(cleaned):
+                    # 解析器凭空给出的季号(如 "[4th - 08]" -> S01E08)不可信,按未知处理,交给下载记录/目录名/LLM
+                    season = None
+                parsed[rel] = {"name": meta.name or "", "season": season, "episode": meta.begin_episode,
                                "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
             batch_name = batch_root.stem if batch_root.is_file() else batch_root.name
             candidates = self.__series_candidates(batch_name, parsed)
@@ -1076,6 +1088,11 @@ class CloudLinkMonitor(_PluginBase):
                 return _order, self.__tmdb_structure(series, _order)
 
             order, structure = build_structure(primary)
+            binding = self.__history_binding(batch_name, parsed, primary)
+            if binding:
+                primary["binding"] = binding
+                logger.info(f"批次 {batch_name}:绑定下载记录 S{binding['season']:02d} "
+                            f"{binding.get('episodes_text') or ''} <= {binding['torrent_name'][:80]}")
             files = self.__rule_mapping(batch_name, parsed, primary, structure)
             how = "规则"
             if files is None:
@@ -1149,6 +1166,64 @@ class CloudLinkMonitor(_PluginBase):
             logger.debug(f"识别 {title} 失败:{str(e)}")
         self._recog_cache[title] = mediainfo or False
         return mediainfo
+
+    def __history_binding(self, batch_name: str, parsed: Dict[str, dict], primary: dict) -> Optional[dict]:
+        """
+        把批次(或单文件)对应到 MP 的下载记录:同一作品、14 天内、种子名含有批次的发布组/发布标记,
+        且记录的集号范围覆盖批次文件的集号(无集号的整季记录只认单季)。命中且季号一致时返回
+        {"season", "episodes", "episodes_text", "group", "torrent_name"};否则 None。
+        """
+        try:
+            tmdbid = str(primary.get("tmdbid") or "")
+            if not tmdbid:
+                return None
+            tags = [x.strip() for x in re.findall(r"[\[【]([^\]】]{2,40})[\]】]", batch_name)]
+            tags = [x for x in tags if not re.fullmatch(r"[\d\s\-~_.xXpPkK×]+|(?:WEB|BD|TV)[\w\s\-]*", x, re.IGNORECASE)]
+            if not tags:
+                head = re.split(r"[\s\-_\[]", batch_name.strip(), 1)[0]
+                tags = [head] if len(head) >= 3 else []
+            if not tags:
+                return None
+            file_eps = {int(v["episode"]) for v in parsed.values() if not v["marker"] and v.get("episode") is not None}
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+            hits = []
+            for his in (self.downloadhis.list_by_page(1, 100) or []):
+                if str(getattr(his, "media_source", "") or "") != "themoviedb" or str(his.media_id or "") != tmdbid:
+                    continue
+                if str(getattr(his, "date", "") or "") < cutoff:
+                    continue
+                tname = str(his.torrent_name or "")
+                tnorm = tname.lower().replace("【", "[").replace("】", "]")
+                if not any(tag.lower() in tnorm for tag in tags):
+                    continue
+                seasons = re.findall(r"S(\d{1,2})", str(his.seasons or ""), re.IGNORECASE)
+                if len(set(seasons)) != 1:
+                    continue
+                season = int(seasons[0])
+                eps = set()
+                for m in EP_RANGE_RE.finditer(str(his.episodes or "")):
+                    a = int(m.group(1))
+                    b = int(m.group(2)) if m.group(2) else a
+                    eps.update(range(min(a, b), max(a, b) + 1))
+                if eps:
+                    if not file_eps or not file_eps <= eps:
+                        continue
+                elif len(parsed) > 1 and len(file_eps) > 1:
+                    pass  # 整季记录允许覆盖整批文件
+                hits.append({"season": season, "episodes": eps, "group": getattr(his, "episode_group", None),
+                             "torrent_name": tname})
+            if not hits:
+                return None
+            if len({h["season"] for h in hits}) != 1:
+                logger.warn(f"批次 {batch_name}:多条下载记录季号不一致,不绑定")
+                return None
+            best = max(hits, key=lambda h: len(h["episodes"]))
+            eps = sorted(best["episodes"])
+            best["episodes_text"] = (f"E{eps[0]:02d}" if len(eps) == 1 else f"E{eps[0]:02d}-E{eps[-1]:02d}") if eps else "整季"
+            return best
+        except Exception as e:
+            logger.debug(f"下载记录绑定失败:{str(e)}")
+            return None
 
     def __series_candidates(self, batch_name: str, parsed: Dict[str, dict]) -> List[dict]:
         """候选作品:清洗后文件名识别投票(权重=文件数) + 发布目录名识别(权重 3) + 近 7 天下载记录(权重 1)"""
@@ -1295,7 +1370,7 @@ class CloudLinkMonitor(_PluginBase):
             if display_order and display_order.lower() not in ("aired", "default"):
                 logger.warn(f"Emby 对《{title}》使用显示顺序 {display_order},插件不支持该顺序,按 TMDB 默认顺序整理")
             return {"group_id": None, "name": "", "source": "Emby默认顺序", "auto": False, "emby_exists": True}
-        for src, gid in (("下载记录/订阅", series.get("episode_group")),
+        for src, gid in (("下载记录/订阅", (series.get("binding") or {}).get("group") or series.get("episode_group")),
                          ("配置映射", self.__group_map().get(key)),
                          ("已记录", (self._series_groups or {}).get(key, {}).get("group_id"))):
             if valid(gid):
@@ -1484,9 +1559,19 @@ class CloudLinkMonitor(_PluginBase):
         if len({v["pattern"] for v in cands.values()}) > 1 or len({v["name"] for v in cands.values()}) > 1:
             return None
         try:
-            batch_season = MetaInfo(title=batch_name).begin_season
+            batch_season = MetaInfo(title=self.__clean_name(batch_name) or batch_name).begin_season
+            if batch_season is not None and not EXPLICIT_SEASON_RE.search(self.__clean_name(batch_name) or batch_name):
+                batch_season = None
         except Exception:
             batch_season = None
+        binding = primary.get("binding") or {}
+        if binding.get("season") is not None:
+            # 下载记录(订阅匹配时判定的季)优先于目录名;与文件名显式季号冲突时不猜,交给 LLM
+            for v in cands.values():
+                if v["season"] is not None and int(v["season"]) != int(binding["season"]):
+                    logger.warn(f"批次 {batch_name}:文件名季号 S{v['season']} 与下载记录 S{binding['season']} 冲突,交给 LLM 判断")
+                    return None
+            batch_season = int(binding["season"])
         regular = sorted(structure.get("offsets") or {})
         mapping: Dict[str, Tuple[int, int]] = {}
         for rel, v in cands.items():
@@ -1562,6 +1647,10 @@ class CloudLinkMonitor(_PluginBase):
         alts = [c for c in candidates if c["tmdbid"] != primary["tmdbid"]][:5]
         alt_text = "; ".join(f"TMDB {c['tmdbid']} {c['title']} ({c['year']}) {c['type']}" for c in alts) or "无"
         hint = f"\n提示: {primary['hint']}" if primary.get("hint") else ""
+        if primary.get("binding"):
+            b = primary["binding"]
+            hint += (f"\n下载记录(MP 订阅匹配时已判定,可信): 该批次属于 S{b['season']:02d} {b.get('episodes_text') or ''}"
+                     f",种子名 {b['torrent_name'][:100]}")
         user_msg = (f"发布目录名: {batch_name}\n当前作品: TMDB {primary['tmdbid']} {primary['title']} "
                     f"({primary['year']}) 类型:{primary['type']}{hint}\n文件列表(编号. 大小 文件名):\n{listing}\n\n"
                     f"季集结构:\n{self.__structure_text(structure)}\n\n备选作品(可能相关): {alt_text}")
