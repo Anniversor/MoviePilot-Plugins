@@ -108,7 +108,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -1321,6 +1321,21 @@ class CloudLinkMonitor(_PluginBase):
         is_tv = primary["type"] == MediaType.TV.value
         files: Dict[str, dict] = {}
         used: Dict[tuple, str] = {}
+        # 发布按季编号而 TMDB 按绝对集数编排(如 Re:Zero S2 第01話 -> TMDB S1E26)时,
+        # LLM 给出的集号与文件名集号会相差一个固定偏移;全批正片偏移一致且为正时视为换算而非冲突
+        deltas = set()
+        for rel in rels:
+            it = got.get(rel) or {}
+            v = parsed[rel]
+            if v["marker"] or str(it.get("c") or "").lower() != "main" or v["episode"] is None:
+                continue
+            try:
+                deltas.add(int(it.get("e")) - int(v["episode"]))
+            except (TypeError, ValueError):
+                deltas.add(None)
+        shift = next(iter(deltas)) if len(deltas) == 1 and None not in deltas and next(iter(deltas)) > 0 else 0
+        if shift:
+            logger.info(f"批次正片集号与文件名集号存在一致偏移 +{shift}(按发布季换算 TMDB 绝对集数)")
         for rel in rels:
             v = parsed[rel]
             if v["marker"]:
@@ -1341,7 +1356,8 @@ class CloudLinkMonitor(_PluginBase):
                 elif not 1 <= e <= self.__season_size(structure, s):
                     entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 超出 TMDB 范围"}
                 elif cls == "main" and v["episode"] is not None and v["episode"] != e \
-                        and v["episode"] != self.__absolute_index(structure, s, e):
+                        and v["episode"] != self.__absolute_index(structure, s, e) \
+                        and v["episode"] + shift != e:
                     entry = {"c": "unknown", "how": "llm", "note": f"文件名集号 {v['episode']} 与 LLM S{s}E{e} 冲突"}
                 elif (s, e) in used:
                     entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 与 {Path(used[(s, e)]).name} 重复"}
