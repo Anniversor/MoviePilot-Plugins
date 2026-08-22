@@ -43,7 +43,7 @@ class U115OfflineDownloader(_PluginBase):
     # 插件图标
     plugin_icon = "115.png"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.0"
 
     # 下载器列表注册用的自定义类型(qb/tr 模块按 type 匹配配置,不会认领此类型)
     DOWNLOADER_TYPE = "u115offline"
@@ -231,7 +231,98 @@ class U115OfflineDownloader(_PluginBase):
             "download": self.download,
             "list_torrents": self.list_torrents,
             "downloader_info": self.downloader_info,
+            "remove_torrents": self.remove_torrents,
+            "start_torrents": self.start_torrents,
+            "stop_torrents": self.stop_torrents,
         }
+
+    def __owned_hashes(self, hashs: Union[str, list], downloader: Optional[str] = None) -> Optional[List[str]]:
+        """
+        本下载器认领的 Hash 列表:显式指定了其他下载器或没有任何本插件跟踪中的任务时返回 None(放行其他模块)
+        """
+        if not self.get_state():
+            return None
+        if downloader and downloader != self._downloader_name:
+            return None
+        wanted = [str(h).lower() for h in ([hashs] if isinstance(hashs, str) else (hashs or []))]
+        with self._tasks_lock:
+            owned = [h for h in wanted if h in self._tasks]
+        return owned or None
+
+    def __find_openlist_task(self, btih: str) -> Tuple[Optional[dict], Optional[str]]:
+        """按 btih(hex/base32 双形式)在 OpenList 未完成/已完成任务中查找,返回 (任务, 所在列表)"""
+        forms = self.__btih_forms(btih)
+        for kind in ("undone", "done"):
+            for task in self.__fetch_tasks(kind):
+                if any(f in str(task.get("name", "")).lower() for f in forms):
+                    return task, kind
+        return None, None
+
+    def remove_torrents(self, hashs: Union[str, list], delete_file: Optional[bool] = True,
+                        downloader: Optional[str] = None, **kwargs) -> Optional[bool]:
+        """
+        删除任务模块:取消并删除 OpenList 离线任务(115 Open 工具的 Remove 会同步删除 115 侧离线任务,
+        已落盘文件保留),并停止本插件跟踪。非本插件任务返回 None 放行。
+        """
+        owned = self.__owned_hashes(hashs, downloader)
+        if not owned:
+            return None
+        ok_all = True
+        for btih in owned:
+            with self._tasks_lock:
+                info = dict(self._tasks.get(btih) or {})
+            title = info.get("title") or btih
+            task, kind = self.__find_openlist_task(btih)
+            if task:
+                tid = task.get("id")
+                if kind == "undone":
+                    self.__api(f"/api/admin/task/offline_download/cancel?tid={tid}", "POST")
+                    # 等任务退出运行态(最多 ~8s)再删记录,否则 OpenList 会拒绝删除运行中的任务
+                    for _ in range(8):
+                        time.sleep(1)
+                        again, kind_again = self.__find_openlist_task(btih)
+                        if again is None or kind_again == "done":
+                            break
+                deleted = self.__api(f"/api/admin/task/offline_download/delete?tid={tid}", "POST")
+                if deleted is None:
+                    ok_all = False
+                    logger.warn(f"115离线:OpenList 任务 {title} ({tid}) 删除失败,已停止跟踪,请在 OpenList 任务页手动清理")
+                else:
+                    logger.info(f"115离线:已取消并删除 OpenList 任务 {title} ({tid})")
+            else:
+                logger.info(f"115离线:OpenList 中未找到 {title} 的任务记录,仅停止跟踪")
+            with self._tasks_lock:
+                self._tasks.pop(btih, None)
+                self.save_data("offline_tasks", self._tasks)
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.Download,
+                    title="🗑️ 115离线任务已删除",
+                    text=f"{title}\n115 侧离线任务已取消;已落盘的文件(如有)保留在 {info.get('path') or self._target_path}"
+                )
+        return ok_all
+
+    def stop_torrents(self, hashs: Union[list, str], downloader: Optional[str] = None,
+                      **kwargs) -> Optional[bool]:
+        """
+        暂停模块:115 云端离线任务不支持暂停,明确返回失败(如需停止请删除任务);非本插件任务放行。
+        """
+        owned = self.__owned_hashes(hashs, downloader)
+        if not owned:
+            return None
+        logger.warn(f"115离线:云端离线任务不支持暂停({', '.join(owned)}),如需停止请删除任务")
+        return False
+
+    def start_torrents(self, hashs: Union[list, str], downloader: Optional[str] = None,
+                       **kwargs) -> Optional[bool]:
+        """
+        开始模块:115 云端离线任务提交后即由 115 执行,无需也无法手动开始;非本插件任务放行。
+        """
+        owned = self.__owned_hashes(hashs, downloader)
+        if not owned:
+            return None
+        logger.info(f"115离线:云端离线任务无需手动开始({', '.join(owned)})")
+        return True
 
     def downloader_info(self, downloader: Optional[str] = None, **kwargs) -> Optional[list]:
         """
