@@ -43,7 +43,7 @@ class U115OfflineDownloader(_PluginBase):
     # 插件图标
     plugin_icon = "115.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
 
     # 下载器列表注册用的自定义类型(qb/tr 模块按 type 匹配配置,不会认领此类型)
     DOWNLOADER_TYPE = "u115offline"
@@ -294,6 +294,9 @@ class U115OfflineDownloader(_PluginBase):
                 magnet += f"&dn={quote(title_hint)}"
 
         btih = self.__parse_btih(magnet)
+        # 磁力 hash 归一化为 hex(动漫花园等站点给的是 base32),否则 OpenList 任务名里是 base32,
+        # 轮询用 hex 永远匹配不上 -> 任务永远"进行中"(混沌武士实测)
+        magnet = self.__normalize_magnet(magnet, btih)
         title = title_hint or self.__parse_dn(magnet) or btih
 
         # 已在跟踪中的任务不重复提交
@@ -411,6 +414,24 @@ class U115OfflineDownloader(_PluginBase):
         return hashlib.md5(magnet.encode()).hexdigest()
 
     @staticmethod
+    def __normalize_magnet(magnet: str, btih: str) -> str:
+        m = re.search(r"urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})", magnet)
+        if m and len(m.group(1)) == 32 and len(btih) == 40:
+            return magnet[:m.start(1)] + btih + magnet[m.end(1):]
+        return magnet
+
+    @staticmethod
+    def __btih_forms(btih: str) -> list:
+        """同一 infohash 的 hex 与 base32 两种写法(兼容历史任务名保留原始磁力的情况)"""
+        forms = [btih.lower()]
+        try:
+            if len(btih) == 40:
+                forms.append(base64.b32encode(bytes.fromhex(btih)).decode("ascii").lower())
+        except Exception:
+            pass
+        return forms
+
+    @staticmethod
     def __parse_dn(magnet: str) -> Optional[str]:
         m = re.search(r"[?&]dn=([^&]+)", magnet)
         if not m:
@@ -494,9 +515,10 @@ class U115OfflineDownloader(_PluginBase):
             tracked = dict(self._tasks)
 
         for btih, info in tracked.items():
-            needle = btih.lower()
+            forms = self.__btih_forms(btih)
             # 进行中:更新进度
-            u = next((t for t in undone if needle in str(t.get("name", "")).lower()), None)
+            u = next((t for t in undone
+                      if any(f in str(t.get("name", "")).lower() for f in forms)), None)
             if u is not None:
                 progress = round(float(u.get("progress") or 0.0), 1)
                 status = str(u.get("status") or "")
@@ -506,7 +528,8 @@ class U115OfflineDownloader(_PluginBase):
                         self._tasks[btih]["status"] = status
                 continue
             # 已结束:通知并移除跟踪
-            d = next((t for t in done if needle in str(t.get("name", "")).lower()), None)
+            d = next((t for t in done
+                      if any(f in str(t.get("name", "")).lower() for f in forms)), None)
             if d is not None:
                 state = d.get("state")
                 error = d.get("error") or d.get("status") or ""

@@ -1,9 +1,13 @@
+import asyncio
 import datetime
+import hashlib
+import inspect
 import json
 import re
 import shutil
 import socket
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -39,6 +43,32 @@ from app.utils.system import SystemUtils
 
 lock = threading.Lock()
 
+# 特典/附加子目录名(任意一级子目录命中即整体跳过;不作用于种子根目录)
+SP_DIR_RE = re.compile(
+    r"(?:^|[\s_\-.\[\(（【])(bonus(?:es)?|extras?|specials?|sps?|nc(?:op|ed)?|pv|cm|menus?|previews?|trailers?|"
+    r"scans?|cds?|bk|booklet|gallery|fonts?|samples?|others?)(?:$|[\s_\-.\]\)）】])"
+    r"|特典|番外|映像|特報|预告|扫图|画集|原声|音乐", re.IGNORECASE)
+# 文件名特典标记(无条件按特典处理;SP/OVA/OAD/番外 这类有内容的特别篇不在此列,仍走超范围->Season 0 逻辑)
+SP_FILE_RE = re.compile(
+    r"(?:^|[\s_\-.\[\(（【])(NC(?:OP|ED)\d*|MENU\d*|PV\d*|CM\d*|(?:WEB\s*|THEATER\s*)?PREVIEW\s*\d*|TEASER\d*|"
+    r"TRAILER\d*|COMMENTARY|DOCUMENTARY\d*|SAMPLE|INTERVIEW|MAKING|DIGEST|LOGO|TV\s*SPOT|CREDITLESS|PROMO|"
+    r"映像特典|预告|宣传|特報)(?:$|[\s_\-.\]\)）】])", re.IGNORECASE)
+
+LLM_CLASSIFY_PROMPT = (
+    "你是媒体库整理助手。给你一个动漫/影视发布目录名和其中全部视频文件的相对路径列表,"
+    "请把每个文件归入且仅归入以下一类:\n"
+    "main: 正片(带集数编号的正集,或电影本体)\n"
+    "special: 有实际剧情内容的特别篇/OVA/OAD/番外/SP/总集篇\n"
+    "extra: 非正片映像,如 PV/CM/NCOP/NCED(无字幕 OP/ED)/Menu(菜单)/Preview(预告、预览片)/Teaser/Trailer/"
+    "Commentary(评论音轨版)/Documentary/Interview/Making/花絮/Sample/Logo 等\n"
+    "other: 音乐、扫图、字体、非视频等\n"
+    "判断依据:文件名中的标记(如 [01]、S01E01 为正片;PV1、NCOP、Menu01、Web Preview 09 为 extra)、"
+    "所在子目录(Bonus/SPs/Extras/CDs/Scans 等通常为 extra 或 other)以及与其他文件的对比。"
+    "注意 PV1、Menu01 这类'标记+数字'不是集数。\n"
+    "只输出一个 JSON 对象,键为 main、special、extra、other,值为文件相对路径(与输入完全一致)的数组,"
+    "不要输出任何解释。"
+)
+
 
 class FileMonitorHandler(FileSystemEventHandler):
     """
@@ -67,7 +97,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.2"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -119,6 +149,11 @@ class CloudLinkMonitor(_PluginBase):
     _junk_exts = ".url,.html,.htm,.txt"
     # 快速探测间隔(秒)，0为关闭
     _fast_interval = 0
+    _llm_classify = True
+    _leftover_policy = "quarantine"
+    _leftover_dir = ""
+    _batch_cls = None
+    _batch_list_cache = None
     # 内置垃圾/广告文件名模式（与排除关键词合并生效，防止配置被误清后失去防线）
     _builtin_junk_patterns = ["【更多", "更多.*(下载|访问)", "TVBOXNOW", r"\.url$"]
     # 失败重试计数(进程内)
@@ -181,11 +216,16 @@ class CloudLinkMonitor(_PluginBase):
                 self._fast_interval = int(config.get("fast_interval") or 0)
             except (TypeError, ValueError):
                 self._fast_interval = 0
+            self._llm_classify = config.get("llm_classify", True)
+            self._leftover_policy = config.get("leftover_policy") or "quarantine"
+            self._leftover_dir = (config.get("leftover_dir") or "").rstrip("/")
 
         # 重置失败重试计数与快速探测指纹
         self._retry_counts = {}
         self._fast_fp = None
         self._busy = threading.Lock()
+        self._batch_cls = self.get_data("batch_classify") or {}
+        self._batch_list_cache = {}
 
         # 停止现有任务
         self.stop_service()
@@ -329,6 +369,9 @@ class CloudLinkMonitor(_PluginBase):
             "junk_clean": self._junk_clean,
             "junk_exts": self._junk_exts,
             "fast_interval": self._fast_interval,
+            "llm_classify": self._llm_classify,
+            "leftover_policy": self._leftover_policy,
+            "leftover_dir": self._leftover_dir,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -397,6 +440,11 @@ class CloudLinkMonitor(_PluginBase):
                     self.__clean_junk_dirs()
                 except Exception as e:
                     logger.error(f"清理垃圾目录失败：{str(e)}")
+            if self._leftover_policy and self._leftover_policy != "off":
+                try:
+                    self.__clean_leftover_dirs()
+                except Exception as e:
+                    logger.error(f"清理整理残留失败：{str(e)}")
             logger.info("云盘目录定时对账完成")
         finally:
             if self._busy:
@@ -671,6 +719,303 @@ class CloudLinkMonitor(_PluginBase):
                 except Exception as e:
                     logger.warn(f"对账清理 {child} 失败：{str(e)}")
 
+
+    # region 特典/附加内容识别 + LLM 批次分类 + 整理残留清理
+
+    def __extra_verdict(self, file_path: Path, mon_path: str) -> Optional[str]:
+        """
+        判定文件是否为特典/附加内容,返回原因描述;None 表示按正片处理。
+        LLM 批次分类结果优先(能分辨 Specials/OVA 这类有内容的特别篇),LLM 不可用或无意见时按启发式:
+        ① 文件名特典标记(带显式 SxxExx 的文件视为正片,避免剧集标题误伤)
+        ② 子目录名正则(不含种子根目录,避免 "xxx SP" 这类特别篇发布被整体拦下)
+        第③层(更小文件不得覆盖已入库正片)由监控目录覆盖模式 size 交给 MP 核心兜底。
+        """
+        file_path = Path(file_path)
+        try:
+            rel = file_path.relative_to(Path(mon_path))
+        except ValueError:
+            rel = None
+        sub_dirs = list(rel.parts[1:-1]) if rel and len(rel.parts) > 2 else []
+        stem = file_path.stem
+
+        llm_cls = None
+        if self._llm_classify and rel is not None:
+            try:
+                llm_cls = self.__llm_classification(file_path, mon_path)
+            except Exception as e:
+                logger.warn(f"LLM 批次分类异常,回退启发式:{str(e)}")
+        if llm_cls in ("extra", "other"):
+            return f"特典/附加内容(LLM:{llm_cls})"
+        if llm_cls in ("main", "special"):
+            return None
+
+        for part in sub_dirs:
+            if SP_DIR_RE.search(str(part)):
+                return f"特典/附加目录({part})"
+        if not re.search(r"S\d{1,2}E\d{1,3}", stem, re.IGNORECASE) and SP_FILE_RE.search(stem):
+            return "特典/附加文件(文件名标记)"
+        return None
+
+    def __batch_root(self, file_path: Path, mon_path: str) -> Optional[Path]:
+        """文件所属批次根目录(监控目录下的一级子目录);直接位于监控目录的单文件无批次"""
+        try:
+            rel = Path(file_path).relative_to(Path(mon_path))
+        except ValueError:
+            return None
+        if len(rel.parts) < 2:
+            return None
+        return Path(mon_path) / rel.parts[0]
+
+    def __batch_files(self, batch_root: Path) -> List[str]:
+        """批次内全部媒体文件相对路径(60 秒缓存,避免对账时反复遍历挂载目录)"""
+        key = str(batch_root)
+        now = time.time()
+        if self._batch_list_cache is None:
+            self._batch_list_cache = {}
+        cached = self._batch_list_cache.get(key)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+        try:
+            files = SystemUtils.list_files(batch_root, settings.RMT_MEDIAEXT)
+        except Exception as e:
+            logger.warn(f"列举批次文件失败 {batch_root}:{str(e)}")
+            files = []
+        rel_files = sorted(str(Path(f).relative_to(batch_root)).replace("\\", "/") for f in files)
+        self._batch_list_cache[key] = (now, rel_files)
+        return rel_files
+
+    @staticmethod
+    def __batch_needs_llm(rel_files: List[str]) -> bool:
+        """命名整齐的单层批次无需 LLM;含子目录、命名模式不一致或带特典标记时才调用"""
+        if any("/" in f for f in rel_files):
+            return True
+        patterns = {re.sub(r"\d+", "#", Path(f).stem.lower()) for f in rel_files}
+        if len(patterns) > 1:
+            return True
+        return any(SP_FILE_RE.search(Path(f).stem) for f in rel_files)
+
+    def __llm_classification(self, file_path: Path, mon_path: str) -> Optional[str]:
+        """返回该文件在其批次中的 LLM 分类(main/special/extra/other),无法判断返回 None"""
+        batch_root = self.__batch_root(file_path, mon_path)
+        if not batch_root:
+            return None
+        rel_file = str(Path(file_path).relative_to(batch_root)).replace("\\", "/")
+        rel_files = self.__batch_files(batch_root)
+        if len(rel_files) < 2:
+            return None
+        digest = hashlib.md5("\n".join(rel_files).encode("utf-8")).hexdigest()
+        key = str(batch_root)
+        if self._batch_cls is None:
+            self._batch_cls = {}
+        cache = self._batch_cls.get(key)
+        if cache and cache.get("digest") == digest:
+            if not (cache.get("failed") and time.time() - (cache.get("time") or 0) > 600):
+                return (cache.get("map") or {}).get(rel_file)
+        if not self.__batch_needs_llm(rel_files):
+            self._batch_cls[key] = {"digest": digest, "map": {}, "time": time.time()}
+            self.__save_batch_cls()
+            return None
+        logger.info(f"批次 {batch_root.name} 含 {len(rel_files)} 个媒体文件且命名不一致,调用 LLM 分类 ...")
+        result = self.__llm_classify_files(batch_root.name, rel_files)
+        if result is None:
+            self._batch_cls[key] = {"digest": digest, "map": {}, "time": time.time(), "failed": True}
+            self.__save_batch_cls()
+            return None
+        counts: Dict[str, int] = {}
+        for v in result.values():
+            counts[v] = counts.get(v, 0) + 1
+        logger.info(f"LLM 分类完成 {batch_root.name}:" + ", ".join(f"{k}={v}" for k, v in counts.items()))
+        extras = [f for f, c in result.items() if c in ("extra", "other")]
+        if extras:
+            logger.info("LLM 判定为特典/附加:" + "; ".join(extras[:20]) + (" ..." if len(extras) > 20 else ""))
+        self._batch_cls[key] = {"digest": digest, "map": result, "time": time.time()}
+        self.__save_batch_cls()
+        return result.get(rel_file)
+
+    def __save_batch_cls(self):
+        now = time.time()
+        self._batch_cls = {k: v for k, v in (self._batch_cls or {}).items()
+                           if now - (v.get("time") or 0) < 7 * 86400}
+        try:
+            self.save_data("batch_classify", self._batch_cls)
+        except Exception as e:
+            logger.warn(f"保存批次分类缓存失败:{str(e)}")
+
+    def __llm_classify_files(self, batch_name: str, rel_files: List[str]) -> Optional[Dict[str, str]]:
+        """调用 MoviePilot 系统 LLM 对批次文件分类;失败返回 None(调用方回退启发式)"""
+        try:
+            from app.agent.llm import LLMHelper
+            from langchain_core.messages import HumanMessage, SystemMessage
+        except Exception as e:
+            logger.warn(f"LLM 组件不可用,跳过批次分类:{str(e)}")
+            return None
+        api_key = getattr(settings, "LLM_API_KEY", None)
+        model = getattr(settings, "LLM_MODEL", None)
+        if not api_key or not model:
+            logger.warn("系统未配置 LLM(API Key/模型),跳过批次分类")
+            return None
+
+        listing = "\n".join(f"{i + 1}. {f}" for i, f in enumerate(rel_files))
+        user_msg = f"发布目录名:{batch_name}\n文件列表:\n{listing}"
+        holder: Dict[str, Any] = {}
+
+        def _worker():
+            try:
+                llm = LLMHelper.get_llm(
+                    streaming=False,
+                    provider=getattr(settings, "LLM_PROVIDER", None),
+                    model=model,
+                    thinking_level=getattr(settings, "LLM_THINKING_LEVEL", None),
+                    api_key=api_key,
+                    base_url=getattr(settings, "LLM_BASE_URL", None),
+                    base_url_preset=getattr(settings, "LLM_BASE_URL_PRESET", None),
+                    user_agent=getattr(settings, "LLM_USER_AGENT", None),
+                    use_proxy=getattr(settings, "LLM_USE_PROXY", False),
+                )
+                if inspect.isawaitable(llm):
+                    llm = asyncio.run(llm)
+                completion = llm.invoke([SystemMessage(content=LLM_CLASSIFY_PROMPT),
+                                         HumanMessage(content=user_msg)])
+                holder["text"] = self.__llm_text(completion)
+            except Exception as e:
+                holder["error"] = str(e)
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        worker.join(timeout=120)
+        if worker.is_alive():
+            logger.warn(f"LLM 批次分类超时(120s):{batch_name}")
+            return None
+        if "error" in holder:
+            logger.warn(f"LLM 批次分类失败:{holder['error']}")
+            return None
+        text = holder.get("text") or ""
+        data = self.__extract_json(text)
+        if not isinstance(data, dict):
+            logger.warn(f"LLM 返回非 JSON 对象:{text[:200]}")
+            return None
+        valid = set(rel_files)
+        result: Dict[str, str] = {}
+        for cls in ("main", "special", "extra", "other"):
+            for item in data.get(cls) or []:
+                name = str(item).strip()
+                if name in valid:
+                    result[name] = cls
+                elif name.isdigit() and 1 <= int(name) <= len(rel_files):
+                    result[rel_files[int(name) - 1]] = cls
+        if not result:
+            logger.warn(f"LLM 分类结果为空:{text[:200]}")
+            return None
+        return result
+
+    @staticmethod
+    def __llm_text(completion: Any) -> str:
+        content = getattr(completion, "content", completion)
+        try:
+            from app.agent.llm import LLMHelper
+            extractor = getattr(LLMHelper, "extract_text_content", None) \
+                or getattr(LLMHelper, "_extract_text_content", None)
+            if callable(extractor):
+                return str(extractor(content) or "").strip()
+        except Exception:
+            pass
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict) and block.get("type") in (None, "text") and not block.get("thought"):
+                    parts.append(str(block.get("text") or ""))
+            return "".join(parts).strip()
+        return str(content or "").strip()
+
+    @staticmethod
+    def __extract_json(text: str) -> Any:
+        text = (text or "").strip()
+        m = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", text, re.IGNORECASE)
+        if m:
+            text = m.group(1).strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            s, e = text.find("{"), text.rfind("}")
+            if s >= 0 and e > s:
+                text = text[s:e + 1]
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    def __clean_leftover_dirs(self):
+        """
+        整理残留清理:监控目录下一级子目录内已无待整理正片/字幕(剩余仅特典、附加、音乐、扫图等),
+        且 30 分钟内无变动时,按策略隔离或删除整个目录。仅对移动模式的监控目录生效(复制/链接模式源文件是种子,不动);
+        存在整理失败记录的目录保守不动。
+        """
+        policy = (self._leftover_policy or "off").lower()
+        if policy not in ("quarantine", "delete"):
+            return
+        media_exts = [str(e).lower() for e in settings.RMT_MEDIAEXT]
+        sub_exts = [str(e).lower() for e in settings.RMT_SUBEXT]
+        keywords = self.__exclude_patterns()
+        for mon_path in list(self._dirconf.keys()):
+            if self._dirconf.get(mon_path) is None:
+                continue
+            transfer_type = self._transferconf.get(mon_path) or self._transfer_type
+            if transfer_type not in ("move", "rclone_move"):
+                continue
+            root = Path(mon_path)
+            if not root.exists():
+                continue
+            leftover_dir = Path(self._leftover_dir) if self._leftover_dir else root.parent / "整理残留"
+            for child in root.iterdir():
+                try:
+                    if not child.is_dir() or child.name.startswith("."):
+                        continue
+                    if str(child) == str(leftover_dir):
+                        continue
+                    files = [f for f in child.rglob("*") if f.is_file()]
+                    if not files:
+                        continue
+                    newest = max(f.stat().st_mtime for f in files)
+                    if time.time() - newest < 1800:
+                        continue
+                    pending, failed = [], []
+                    for f in files:
+                        suffix = f.suffix.lower()
+                        if suffix not in media_exts and suffix not in sub_exts:
+                            continue
+                        his = self.transferhis.get_by_src(str(f))
+                        if his:
+                            if his.status:
+                                continue
+                            failed.append(f)
+                            continue
+                        if self.__match_any(keywords, str(f)):
+                            continue
+                        if self.__extra_verdict(f, mon_path):
+                            continue
+                        pending.append(f)
+                    if failed:
+                        logger.info(f"残留清理:{child.name} 含 {len(failed)} 个整理失败文件,保守不动")
+                        continue
+                    if pending:
+                        continue
+                    if policy == "delete":
+                        logger.warn(f"残留清理:删除 {child}(剩余 {len(files)} 个特典/附加/杂项文件)")
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        leftover_dir.mkdir(parents=True, exist_ok=True)
+                        dest = leftover_dir / child.name
+                        if dest.exists():
+                            dest = leftover_dir / f"{child.name}_{int(time.time())}"
+                        logger.warn(f"残留清理:隔离 {child} -> {dest}(剩余 {len(files)} 个特典/附加/杂项文件)")
+                        shutil.move(str(child), str(dest))
+                except Exception as e:
+                    logger.warn(f"残留清理 {child} 失败:{str(e)}")
+
+    # endregion
+
     def event_handler(self, event, mon_path: str, text: str, event_path: str):
         """
         处理文件变化
@@ -744,17 +1089,11 @@ class CloudLinkMonitor(_PluginBase):
                     logger.debug(f"{event_path} 不是媒体或字幕文件")
                     return
 
-                # 特典/附加目录整体跳过:VCB 等 BDRip 惯例把非正片放在 SPs/Menu/CDs/Scans,
-                # 其中 Web Preview 09、Menu01、NCOP02 等带数字文件会被识别为范围内正集,
-                # 在覆盖模式下反把正片顶掉(迷宫饭 BDRip 实测),按目录名整体拦下
-                _sp_dirs = {"sps", "sp", "extras", "extra", "specials", "menu",
-                            "menus", "cds", "cd", "scans", "特典", "映像特典", "特典映像"}
-                try:
-                    _rel_parts = Path(file_path).relative_to(Path(mon_path)).parts[:-1]
-                except ValueError:
-                    _rel_parts = ()
-                if any(str(p).lower() in _sp_dirs for p in _rel_parts):
-                    logger.info(f"{file_path.name} 位于特典/附加目录,跳过整理:{file_path}")
+                # 特典/附加内容识别(LLM 批次分类优先,其次文件名标记/子目录名启发式;
+                # 第三层由监控目录覆盖模式 size 兜底:更小的文件永远顶不掉已入库正片)
+                verdict = self.__extra_verdict(file_path, mon_path)
+                if verdict:
+                    logger.info(f"{file_path.name} 判定为{verdict},跳过整理:{file_path}")
                     return
 
                 # 判断是不是蓝光目录
@@ -1564,6 +1903,56 @@ class CloudLinkMonitor(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'llm_classify',
+                                            'label': 'LLM 批次识别特典',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'leftover_policy',
+                                            'label': '整理残留处理',
+                                            'items': [
+                                                {'title': '不处理', 'value': 'off'},
+                                                {'title': '隔离到残留目录', 'value': 'quarantine'},
+                                                {'title': '直接删除', 'value': 'delete'}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'leftover_dir',
+                                            'label': '残留隔离目录',
+                                            'placeholder': '留空=监控目录同级的 整理残留'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
                                 'props': {
                                     'cols': 12,
                                     'md': 4
@@ -1786,7 +2175,10 @@ class CloudLinkMonitor(_PluginBase):
             "rc_mount_prefix": "",
             "junk_clean": False,
             "junk_exts": ".url,.html,.htm,.txt",
-            "fast_interval": 0
+            "fast_interval": 0,
+            "llm_classify": True,
+            "leftover_policy": "quarantine",
+            "leftover_dir": ""
         }
 
     def get_page(self) -> List[dict]:
