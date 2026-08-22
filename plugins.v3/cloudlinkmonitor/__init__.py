@@ -9,6 +9,7 @@ import socket
 import threading
 import time
 import traceback
+from collections import Counter
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -29,7 +30,7 @@ from app.chain.transfer import TransferChain
 from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event
-from app.core.metainfo import MetaInfoPath
+from app.core.metainfo import MetaInfo, MetaInfoPath
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.helper.directory import DirectoryHelper
@@ -37,7 +38,7 @@ from app.log import logger
 from app.modules.filemanager import FileManagerModule
 from app.plugins import _PluginBase
 from app.schemas import NotificationType, TransferInfo, TransferDirectoryConf
-from app.schemas.types import EventType, MediaType, SystemConfigKey
+from app.schemas.types import EventType, MediaSource, MediaType, SystemConfigKey
 from app.utils.string import StringUtils
 from app.utils.system import SystemUtils
 
@@ -48,25 +49,35 @@ SP_DIR_RE = re.compile(
     r"(?:^|[\s_\-.\[\(（【])(bonus(?:es)?|extras?|specials?|sps?|nc(?:op|ed)?|pv|cm|menus?|previews?|trailers?|"
     r"scans?|cds?|bk|booklet|gallery|fonts?|samples?|others?)(?:$|[\s_\-.\]\)）】])"
     r"|特典|番外|映像|特報|预告|扫图|画集|原声|音乐", re.IGNORECASE)
-# 文件名特典标记(无条件按特典处理;SP/OVA/OAD/番外 这类有内容的特别篇不在此列,仍走超范围->Season 0 逻辑)
+# 文件名特典标记(无条件按特典处理;SP/OVA/OAD/番外 这类有内容的特别篇不在此列,由批次清单按 TMDB 第 0 季映射)
 SP_FILE_RE = re.compile(
     r"(?:^|[\s_\-.\[\(（【])(NC(?:OP|ED)\d*|MENU\d*|PV\d*|CM\d*|(?:WEB\s*|THEATER\s*)?PREVIEW\s*\d*|TEASER\d*|"
     r"TRAILER\d*|COMMENTARY|DOCUMENTARY\d*|SAMPLE|INTERVIEW|MAKING|DIGEST|LOGO|TV\s*SPOT|CREDITLESS|PROMO|"
-    r"映像特典|预告|宣传|特報)(?:$|[\s_\-.\]\)）】])", re.IGNORECASE)
+    r"映像特典|特典映像|予告編?|次回予告|预告|預告|宣传|特報|特报)(?:$|[\s_\-.\]\)）】\(（#])", re.IGNORECASE)
+# 8 位十六进制 CRC(括号内)与「」『』集标题:MP 解析器会把 (08377E86) 当成 E86、把「レム」当成剧名
+CRC_RE = re.compile(r"[\(\[（【][0-9A-Fa-f]{8}[\)\]）】]")
+QUOTE_RE = re.compile(r"「[^」]*」|『[^』]*』")
 
-LLM_CLASSIFY_PROMPT = (
-    "你是媒体库整理助手。给你一个动漫/影视发布目录名和其中全部视频文件的相对路径列表,"
-    "请把每个文件归入且仅归入以下一类:\n"
-    "main: 正片(带集数编号的正集,或电影本体)\n"
-    "special: 有实际剧情内容的特别篇/OVA/OAD/番外/SP/总集篇\n"
-    "extra: 非正片映像,如 PV/CM/NCOP/NCED(无字幕 OP/ED)/Menu(菜单)/Preview(预告、预览片)/Teaser/Trailer/"
+MANIFEST_PROMPT = (
+    "你是媒体库整理助手。输入:一个发布目录名、其中全部视频文件的编号列表(含文件大小)、该作品在 TMDB 上的季/集结构,"
+    "以及可能相关的备选作品。请为每个文件给出分类与季集映射。\n"
+    "类别:\n"
+    "- main: 正片(对应 TMDB 某季某集;电影则为影片本体)\n"
+    "- special: 有剧情内容的特别篇/短篇/OVA/OAD/番外/总集篇等,若能对应 TMDB 第 0 季(特别篇)的某一集则给出季集\n"
+    "- extra: 非正片映像:PV/CM/NCOP/NCED(无字幕 OP/ED)/Menu/予告·次回预告·Preview/Teaser/Trailer/"
     "Commentary(评论音轨版)/Documentary/Interview/Making/花絮/Sample/Logo 等\n"
-    "other: 音乐、扫图、字体、非视频等\n"
-    "判断依据:文件名中的标记(如 [01]、S01E01 为正片;PV1、NCOP、Menu01、Web Preview 09 为 extra)、"
-    "所在子目录(Bonus/SPs/Extras/CDs/Scans 等通常为 extra 或 other)以及与其他文件的对比。"
-    "注意 PV1、Menu01 这类'标记+数字'不是集数。\n"
-    "只输出一个 JSON 对象,键为 main、special、extra、other,值为文件相对路径(与输入完全一致)的数组,"
-    "不要输出任何解释。"
+    "- other: 音乐、扫图、字体、非视频等\n"
+    "规则:\n"
+    "1) 文件名末尾括号内的 8 位十六进制是 CRC 校验码,不是集数;「」内是集标题,不是剧名。\n"
+    "2) 只有能在 TMDB 结构中找到确切对应集的文件才给 s/e;不确定就省略 s/e(系统会跳过该文件,比放错位置好)。\n"
+    "3) 同一 (s,e) 不能分配给多个文件。\n"
+    "4) 集号按文件名中的编号/标题与 TMDB 集标题的语义对应来确定;TMDB 若按绝对集数编排(单季很长),"
+    "要把文件的季内集号换算到 TMDB 的季集。\n"
+    "5) 体积明显小于正片的文件(几十 MB)通常是预告/特典/短篇,不是正片。\n"
+    "6) 若该批次实际属于备选作品列表中的另一部作品,在 series_tmdbid 中给出其 TMDB id;否则给出当前作品 id。\n"
+    "只输出一个紧凑的 JSON 对象(不要换行缩进、不要解释):"
+    "{\"series_tmdbid\": 数字, \"items\": [{\"i\": 文件编号, \"c\": \"main|special|extra|other\", \"s\": 季号, \"e\": 集号}, ...]}"
+    " s/e 只在 main/special 且确定时给出。每个文件编号都必须且只能出现一次。"
 )
 
 
@@ -97,7 +108,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.1.0"
+    plugin_version = "3.2.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -152,8 +163,16 @@ class CloudLinkMonitor(_PluginBase):
     _llm_classify = True
     _leftover_policy = "quarantine"
     _leftover_dir = ""
-    _batch_cls = None
+    _batch_settle = 120
+    _emby_reprobe = True
     _batch_list_cache = None
+    # 批次清单(持久化)与进程内缓存
+    _manifests = None
+    _batch_seen = None
+    _recog_cache = None
+    _tmdb_struct_cache = None
+    _emby_cache = None
+    _manifest_lock = None
     # 内置垃圾/广告文件名模式（与排除关键词合并生效，防止配置被误清后失去防线）
     _builtin_junk_patterns = ["【更多", "更多.*(下载|访问)", "TVBOXNOW", r"\.url$"]
     # 失败重试计数(进程内)
@@ -219,13 +238,24 @@ class CloudLinkMonitor(_PluginBase):
             self._llm_classify = config.get("llm_classify", True)
             self._leftover_policy = config.get("leftover_policy") or "quarantine"
             self._leftover_dir = (config.get("leftover_dir") or "").rstrip("/")
+            try:
+                self._batch_settle = int(config.get("batch_settle")) \
+                    if config.get("batch_settle") not in (None, "") else 120
+            except (TypeError, ValueError):
+                self._batch_settle = 120
+            self._emby_reprobe = config.get("emby_reprobe", True)
 
         # 重置失败重试计数与快速探测指纹
         self._retry_counts = {}
         self._fast_fp = None
         self._busy = threading.Lock()
-        self._batch_cls = self.get_data("batch_classify") or {}
         self._batch_list_cache = {}
+        self._manifests = self.get_data("batch_manifest") or {}
+        self._batch_seen = {}
+        self._recog_cache = {}
+        self._tmdb_struct_cache = {}
+        self._emby_cache = {}
+        self._manifest_lock = threading.RLock()
 
         # 停止现有任务
         self.stop_service()
@@ -372,6 +402,8 @@ class CloudLinkMonitor(_PluginBase):
             "llm_classify": self._llm_classify,
             "leftover_policy": self._leftover_policy,
             "leftover_dir": self._leftover_dir,
+            "batch_settle": self._batch_settle,
+            "emby_reprobe": self._emby_reprobe,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -433,8 +465,16 @@ class CloudLinkMonitor(_PluginBase):
                     continue
                 if media_files or sub_files:
                     logger.info(f"对账：{mon_path} 发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
-                for file_path in media_files + sub_files:
-                    self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
+                # 按批次分组:先建批次清单(一批一次),再按 正片(季集序)->特别篇->字幕 的顺序处理
+                for batch_root, group in self.__group_by_batch(mon_path, media_files + sub_files):
+                    if batch_root is not None:
+                        mf = self.__get_manifest(batch_root)
+                        if mf and mf.get("pending"):
+                            logger.info(f"批次 {batch_root.name} 尚未稳定(文件仍在变化),本轮跳过 {len(group)} 个文件")
+                            continue
+                        group = self.__order_batch(mf, batch_root, group)
+                    for file_path in group:
+                        self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
             if self._junk_clean:
                 try:
                     self.__clean_junk_dirs()
@@ -720,15 +760,37 @@ class CloudLinkMonitor(_PluginBase):
                     logger.warn(f"对账清理 {child} 失败：{str(e)}")
 
 
-    # region 特典/附加内容识别 + LLM 批次分类 + 整理残留清理
+    # region 批次清单:批次级识别(候选作品投票 + TMDB 季集结构 + 规则/LLM 映射 + 确定性校验)
+
+    @staticmethod
+    def __clean_name(name: str) -> str:
+        """剥掉 8 位十六进制 CRC 与「」『』内的集标题(MP 解析器会把 CRC 当集数、把集标题当剧名)"""
+        cleaned = CRC_RE.sub(" ", name or "")
+        cleaned = QUOTE_RE.sub(" ", cleaned)
+        return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+    def __clean_meta(self, file_path: Path):
+        """基于清洗后文件名解析元数据;清洗无变化时沿用带路径上下文的 MetaInfoPath"""
+        cleaned = self.__clean_name(file_path.stem)
+        if cleaned and cleaned != file_path.stem:
+            meta = MetaInfo(title=cleaned)
+            if meta.name:
+                return meta
+        return MetaInfoPath(file_path)
+
+    @staticmethod
+    def __fmt_size(size) -> str:
+        size = float(size or 0)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024:
+                return f"{size:.0f}{unit}" if unit in ("B", "KB") else f"{size:.1f}{unit}"
+            size /= 1024
+        return f"{size:.2f}TB"
 
     def __extra_verdict(self, file_path: Path, mon_path: str) -> Optional[str]:
         """
-        判定文件是否为特典/附加内容,返回原因描述;None 表示按正片处理。
-        LLM 批次分类结果优先(能分辨 Specials/OVA 这类有内容的特别篇),LLM 不可用或无意见时按启发式:
-        ① 文件名特典标记(带显式 SxxExx 的文件视为正片,避免剧集标题误伤)
-        ② 子目录名正则(不含种子根目录,避免 "xxx SP" 这类特别篇发布被整体拦下)
-        第③层(更小文件不得覆盖已入库正片)由监控目录覆盖模式 size 交给 MP 核心兜底。
+        启发式特典判定(无批次清单时的回退,也用于残留清理):① 子目录名(不含种子根目录)
+        ② 清洗后文件名标记(带显式 SxxExx 的视为正片,避免剧集标题误伤);None 表示按正片处理
         """
         file_path = Path(file_path)
         try:
@@ -736,22 +798,10 @@ class CloudLinkMonitor(_PluginBase):
         except ValueError:
             rel = None
         sub_dirs = list(rel.parts[1:-1]) if rel and len(rel.parts) > 2 else []
-        stem = file_path.stem
-
-        llm_cls = None
-        if self._llm_classify and rel is not None:
-            try:
-                llm_cls = self.__llm_classification(file_path, mon_path)
-            except Exception as e:
-                logger.warn(f"LLM 批次分类异常,回退启发式:{str(e)}")
-        if llm_cls in ("extra", "other"):
-            return f"特典/附加内容(LLM:{llm_cls})"
-        if llm_cls in ("main", "special"):
-            return None
-
         for part in sub_dirs:
             if SP_DIR_RE.search(str(part)):
                 return f"特典/附加目录({part})"
+        stem = self.__clean_name(file_path.stem)
         if not re.search(r"S\d{1,2}E\d{1,3}", stem, re.IGNORECASE) and SP_FILE_RE.search(stem):
             return "特典/附加文件(文件名标记)"
         return None
@@ -766,8 +816,34 @@ class CloudLinkMonitor(_PluginBase):
             return None
         return Path(mon_path) / rel.parts[0]
 
-    def __batch_files(self, batch_root: Path) -> List[str]:
-        """批次内全部媒体文件相对路径(60 秒缓存,避免对账时反复遍历挂载目录)"""
+    def __group_by_batch(self, mon_path: str, files: list) -> List[Tuple[Optional[Path], List[Path]]]:
+        groups: Dict[str, Tuple[Optional[Path], List[Path]]] = {}
+        for f in files:
+            root = self.__batch_root(Path(f), mon_path)
+            groups.setdefault(str(root) if root else "", (root, []))[1].append(Path(f))
+        return list(groups.values())
+
+    def __order_batch(self, mf: Optional[dict], batch_root: Path, files: List[Path]) -> List[Path]:
+        """按清单排序:正片(季集序) -> 特别篇 -> 对应字幕 -> 其余;无清单按路径排序"""
+        if not mf or mf.get("status") != "ok":
+            return sorted(files)
+        rank = {"main": 0, "special": 1}
+        sub_exts = [str(e).lower() for e in settings.RMT_SUBEXT]
+
+        def key(f: Path):
+            entry = self.__manifest_entry(mf, batch_root, f) or {}
+            cls = entry.get("c")
+            order = rank.get(cls, 8)
+            if f.suffix.lower() in sub_exts:
+                order = 4 if cls in rank else 9
+            season = entry.get("s") if entry.get("s") is not None else 999
+            episode = entry.get("e") if entry.get("e") is not None else 999
+            return order, season, episode, str(f)
+
+        return sorted(files, key=key)
+
+    def __batch_listing(self, batch_root: Path) -> Dict[str, list]:
+        """批次内媒体文件 (相对路径, 大小, mtime) 与字幕相对路径(60 秒缓存,避免反复遍历挂载目录)"""
         key = str(batch_root)
         now = time.time()
         if self._batch_list_cache is None:
@@ -775,89 +851,378 @@ class CloudLinkMonitor(_PluginBase):
         cached = self._batch_list_cache.get(key)
         if cached and now - cached[0] < 60:
             return cached[1]
+        media, subs = [], []
         try:
-            files = SystemUtils.list_files(batch_root, settings.RMT_MEDIAEXT)
+            for f in SystemUtils.list_files(batch_root, settings.RMT_MEDIAEXT):
+                try:
+                    st = Path(f).stat()
+                except Exception:
+                    continue
+                media.append((str(Path(f).relative_to(batch_root)).replace("\\", "/"), st.st_size, st.st_mtime))
+            for f in SystemUtils.list_files(batch_root, settings.RMT_SUBEXT):
+                subs.append(str(Path(f).relative_to(batch_root)).replace("\\", "/"))
         except Exception as e:
             logger.warn(f"列举批次文件失败 {batch_root}:{str(e)}")
-            files = []
-        rel_files = sorted(str(Path(f).relative_to(batch_root)).replace("\\", "/") for f in files)
-        self._batch_list_cache[key] = (now, rel_files)
-        return rel_files
+        media.sort()
+        subs.sort()
+        listing = {"media": media, "subs": subs}
+        self._batch_list_cache[key] = (now, listing)
+        return listing
 
-    @staticmethod
-    def __batch_needs_llm(rel_files: List[str]) -> bool:
-        """命名整齐的单层批次无需 LLM;含子目录、命名模式不一致或带特典标记时才调用"""
-        if any("/" in f for f in rel_files):
-            return True
-        patterns = {re.sub(r"\d+", "#", Path(f).stem.lower()) for f in rel_files}
-        if len(patterns) > 1:
-            return True
-        return any(SP_FILE_RE.search(Path(f).stem) for f in rel_files)
-
-    def __llm_classification(self, file_path: Path, mon_path: str) -> Optional[str]:
-        """返回该文件在其批次中的 LLM 分类(main/special/extra/other),无法判断返回 None"""
-        batch_root = self.__batch_root(file_path, mon_path)
-        if not batch_root:
-            return None
-        rel_file = str(Path(file_path).relative_to(batch_root)).replace("\\", "/")
-        rel_files = self.__batch_files(batch_root)
-        if len(rel_files) < 2:
-            return None
-        digest = hashlib.md5("\n".join(rel_files).encode("utf-8")).hexdigest()
+    def __get_manifest(self, batch_root: Path) -> Optional[dict]:
+        """
+        取批次清单:None=无法建立(回退逐文件识别);{"pending": True}=批次未稳定(文件仍在变化),本轮跳过。
+        清单按批次目录持久化;文件被搬走不重算,出现新文件才重建;建立失败按次数退避重试(10 分钟起,最长 6 小时)。
+        """
         key = str(batch_root)
-        if self._batch_cls is None:
-            self._batch_cls = {}
-        cache = self._batch_cls.get(key)
-        if cache and cache.get("digest") == digest:
-            if not (cache.get("failed") and time.time() - (cache.get("time") or 0) > 600):
-                return (cache.get("map") or {}).get(rel_file)
-        if not self.__batch_needs_llm(rel_files):
-            self._batch_cls[key] = {"digest": digest, "map": {}, "time": time.time()}
-            self.__save_batch_cls()
+        listing = self.__batch_listing(batch_root)
+        media = listing["media"]
+        if not media:
             return None
-        logger.info(f"批次 {batch_root.name} 含 {len(rel_files)} 个媒体文件且命名不一致,调用 LLM 分类 ...")
-        result = self.__llm_classify_files(batch_root.name, rel_files)
-        if result is None:
-            self._batch_cls[key] = {"digest": digest, "map": {}, "time": time.time(), "failed": True}
-            self.__save_batch_cls()
-            return None
-        counts: Dict[str, int] = {}
-        for v in result.values():
-            counts[v] = counts.get(v, 0) + 1
-        logger.info(f"LLM 分类完成 {batch_root.name}:" + ", ".join(f"{k}={v}" for k, v in counts.items()))
-        extras = [f for f, c in result.items() if c in ("extra", "other")]
-        if extras:
-            logger.info("LLM 判定为特典/附加:" + "; ".join(extras[:20]) + (" ..." if len(extras) > 20 else ""))
-        self._batch_cls[key] = {"digest": digest, "map": result, "time": time.time()}
-        self.__save_batch_cls()
-        return result.get(rel_file)
-
-    def __save_batch_cls(self):
         now = time.time()
-        self._batch_cls = {k: v for k, v in (self._batch_cls or {}).items()
+        rels = [m[0] for m in media]
+        digest = hashlib.md5("\n".join(rels).encode("utf-8")).hexdigest()
+        if self._manifest_lock is None:
+            self._manifest_lock = threading.RLock()
+        with self._manifest_lock:
+            if self._manifests is None:
+                self._manifests = {}
+            old = self._manifests.get(key)
+            if old:
+                if old.get("status") == "ok" and (old.get("digest") == digest
+                                                  or set(rels) <= set((old.get("files") or {}).keys())):
+                    return old
+                if old.get("status") in ("failed", "no_media") and old.get("digest") == digest:
+                    attempts = int(old.get("attempts") or 1)
+                    if now - (old.get("time") or 0) < min(6 * 3600, 600 * attempts):
+                        return None
+            if self._batch_seen is None:
+                self._batch_seen = {}
+            seen = self._batch_seen.get(key)
+            if not seen or seen[0] != digest:
+                seen = (digest, now)
+                self._batch_seen[key] = seen
+            settle = max(0, int(self._batch_settle or 0))
+            newest = max(m[2] for m in media)
+            if settle and (now - seen[1] < settle or now - newest < settle):
+                return {"pending": True}
+            mf = self.__build_manifest(batch_root, listing, digest)
+            mf["attempts"] = (int(old.get("attempts") or 0) if old and old.get("digest") == digest else 0) + 1
+            self._manifests[key] = mf
+            self.__save_manifests()
+            return mf if mf.get("status") == "ok" else None
+
+    def __save_manifests(self):
+        now = time.time()
+        self._manifests = {k: v for k, v in (self._manifests or {}).items()
                            if now - (v.get("time") or 0) < 7 * 86400}
         try:
-            self.save_data("batch_classify", self._batch_cls)
+            self.save_data("batch_manifest", self._manifests)
         except Exception as e:
-            logger.warn(f"保存批次分类缓存失败:{str(e)}")
+            logger.warn(f"保存批次清单失败:{str(e)}")
 
-    def __llm_classify_files(self, batch_name: str, rel_files: List[str]) -> Optional[Dict[str, str]]:
-        """调用 MoviePilot 系统 LLM 对批次文件分类;失败返回 None(调用方回退启发式)"""
+    def __manifest_entry(self, mf: dict, batch_root: Path, file_path: Path) -> Optional[dict]:
+        """文件在清单中的条目;字幕按同目录媒体文件名前缀匹配"""
+        if not mf:
+            return None
+        try:
+            rel = str(Path(file_path).relative_to(batch_root)).replace("\\", "/")
+        except ValueError:
+            return None
+        files = mf.get("files") or {}
+        if rel in files:
+            return files[rel]
+        if Path(rel).suffix.lower() in [str(e).lower() for e in settings.RMT_SUBEXT]:
+            parent = str(Path(rel).parent).replace("\\", "/")
+            stem = Path(rel).stem
+            best = None
+            for mrel, entry in files.items():
+                mp = Path(mrel)
+                if str(mp.parent).replace("\\", "/") != parent:
+                    continue
+                if stem.startswith(mp.stem) and (best is None or len(mp.stem) > len(best[0])):
+                    best = (mp.stem, entry)
+            if best:
+                return best[1]
+        return None
+
+    def __build_manifest(self, batch_root: Path, listing: dict, digest: str) -> dict:
+        """候选作品投票 -> TMDB 季集结构 -> 规则映射(干净批次免 LLM)/LLM 映射 -> 确定性校验"""
+        media = listing["media"]
+        rels = [m[0] for m in media]
+        mf = {"digest": digest, "time": time.time(), "status": "failed", "files": {}, "media": None,
+              "how": "", "unknown": []}
+        try:
+            parsed: Dict[str, dict] = {}
+            for rel, size, _ in media:
+                p = Path(rel)
+                cleaned = self.__clean_name(p.stem) or p.stem
+                meta = MetaInfo(title=cleaned)
+                marker = None
+                for part in p.parts[:-1]:
+                    if SP_DIR_RE.search(str(part)):
+                        marker = f"目录 {part}"
+                        break
+                if not marker and not re.search(r"S\d{1,2}E\d{1,3}", cleaned, re.IGNORECASE) \
+                        and SP_FILE_RE.search(cleaned):
+                    marker = "文件名标记"
+                parsed[rel] = {"name": meta.name or "", "season": meta.begin_season, "episode": meta.begin_episode,
+                               "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
+            candidates = self.__series_candidates(batch_root.name, parsed)
+            if not candidates:
+                logger.warn(f"批次 {batch_root.name}:无法识别所属作品,回退逐文件识别")
+                mf["status"] = "no_media"
+                return mf
+            primary = candidates[0]
+            structure = self.__tmdb_structure(primary) if primary["type"] == MediaType.TV.value else {}
+            files = self.__rule_mapping(batch_root.name, parsed, primary, structure)
+            how = "规则"
+            if files is None:
+                if not self._llm_classify:
+                    logger.warn(f"批次 {batch_root.name}:命名不规整且未启用 LLM 批次清单,回退逐文件识别")
+                    mf["status"] = "no_media"
+                    return mf
+                result = self.__llm_mapping(batch_root.name, rels, parsed, primary, candidates, structure)
+                if result is None:
+                    return mf
+                try:
+                    alt_id = int(result.get("series_tmdbid")) if result.get("series_tmdbid") is not None else None
+                except (TypeError, ValueError):
+                    alt_id = None
+                if alt_id and alt_id != primary["tmdbid"]:
+                    alt = next((c for c in candidates if c["tmdbid"] == alt_id), None)
+                    if alt:
+                        logger.info(f"批次 {batch_root.name}:LLM 判定属于备选作品 {alt['title']} ({alt['year']}) TMDB {alt_id}")
+                        primary = alt
+                        structure = self.__tmdb_structure(primary) if primary["type"] == MediaType.TV.value else {}
+                    else:
+                        logger.warn(f"批次 {batch_root.name}:LLM 给出的作品 TMDB {alt_id} 不在候选内,忽略")
+                files = self.__validate_mapping(result.get("items") or [], rels, parsed, primary, structure)
+                how = "LLM"
+            mf["files"] = files
+            mf["media"] = {k: primary.get(k) for k in ("tmdbid", "title", "year", "type")}
+            mf["how"] = how
+            mf["status"] = "ok"
+            counts = Counter(v.get("c") for v in files.values())
+            logger.info(f"批次清单[{how}] {batch_root.name} -> {primary['title']} ({primary['year']}) "
+                        f"TMDB {primary['tmdbid']}:" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            mapped = [f"S{v['s']:02d}E{v['e']:02d}<={Path(r).name}" for r, v in files.items()
+                      if v.get("c") in ("main", "special") and v.get("s") is not None]
+            if mapped:
+                logger.info("季集映射:" + " | ".join(mapped[:60]) + (" ..." if len(mapped) > 60 else ""))
+            skipped = [f"{Path(r).name}({v.get('note') or v.get('c')})" for r, v in files.items()
+                       if v.get("c") in ("extra", "other")]
+            if skipped:
+                logger.info("跳过(特典/附加/杂项):" + "; ".join(skipped[:40]) + (" ..." if len(skipped) > 40 else ""))
+            unknown = [r for r, v in files.items() if v.get("c") == "unknown"]
+            mf["unknown"] = unknown
+            if unknown:
+                detail = "; ".join(f"{Path(r).name}({files[r].get('note') or '?'})" for r in unknown[:20])
+                logger.warn(f"批次 {batch_root.name} 有 {len(unknown)} 个文件无法确定季集,已跳过待人工处理:{detail}")
+                if self._notify:
+                    self.post_message(mtype=NotificationType.Manual,
+                                      title=f"{primary['title']} 批次有 {len(unknown)} 个文件无法确定季集,已跳过",
+                                      text="\n".join(Path(r).name for r in unknown[:15]))
+            return mf
+        except Exception as e:
+            logger.error(f"建立批次清单失败 {batch_root}:{str(e)} - {traceback.format_exc()}")
+            return mf
+
+    def __recognize_title(self, title: str):
+        """按标题原生识别(不触发辅助识别),进程内缓存"""
+        if self._recog_cache is None:
+            self._recog_cache = {}
+        if title in self._recog_cache:
+            return self._recog_cache[title] or None
+        mediainfo = None
+        try:
+            meta = MetaInfo(title=title)
+            if meta.name:
+                mediainfo = self.mediaChain.recognize_media(meta=meta)
+        except Exception as e:
+            logger.debug(f"识别 {title} 失败:{str(e)}")
+        self._recog_cache[title] = mediainfo or False
+        return mediainfo
+
+    def __series_candidates(self, batch_name: str, parsed: Dict[str, dict]) -> List[dict]:
+        """候选作品:清洗后文件名识别投票(权重=文件数) + 发布目录名识别(权重 3) + 近 7 天下载记录(权重 1)"""
+        votes: Dict[str, dict] = {}
+
+        def add(tmdbid, title, year, mtype, weight, src, hint=None):
+            try:
+                tmdbid = int(tmdbid)
+            except (TypeError, ValueError):
+                return
+            if not tmdbid:
+                return
+            c = votes.setdefault(str(tmdbid), {"tmdbid": tmdbid, "title": title, "year": year,
+                                               "type": mtype, "votes": 0, "src": []})
+            c["votes"] += weight
+            if src not in c["src"]:
+                c["src"].append(src)
+            if hint and not c.get("hint"):
+                c["hint"] = hint
+
+        names = Counter(v["name"] for v in parsed.values() if v["name"] and not v["marker"])
+        for name, cnt in names.most_common(6):
+            mi = self.__recognize_title(name)
+            if mi and getattr(mi, "tmdb_id", None):
+                add(mi.tmdb_id, mi.title, mi.year, mi.type.value, cnt, "文件名")
+        mi = self.__recognize_title(batch_name)
+        if mi and getattr(mi, "tmdb_id", None):
+            add(mi.tmdb_id, mi.title, mi.year, mi.type.value, 3, "目录名")
+        try:
+            # 下载记录只作低权重提示:同一作品多条记录(逐集下载)只计 1 票,不能盖过文件名/目录名识别
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+            seen_his = set()
+            for his in (self.downloadhis.list_by_page(1, 50) or []):
+                if str(getattr(his, "media_source", "") or "") != "themoviedb" or not getattr(his, "media_id", None):
+                    continue
+                if str(getattr(his, "date", "") or "") < cutoff or str(his.media_id) in seen_his:
+                    continue
+                seen_his.add(str(his.media_id))
+                hint = f"下载记录 {his.torrent_name or ''} {his.seasons or ''}".strip()
+                add(his.media_id, his.title, his.year, his.type, 1, "下载记录", hint)
+        except Exception as e:
+            logger.debug(f"读取下载记录失败:{str(e)}")
+        result = sorted(votes.values(), key=lambda c: -c["votes"])
+        if result:
+            logger.info("批次候选作品:" + "; ".join(
+                f"{c['title']} ({c['year']}) TMDB {c['tmdbid']} 票数 {c['votes']} [{'/'.join(c['src'])}]"
+                for c in result[:4]))
+        return result
+
+    def __tmdb_structure(self, series: dict) -> Dict[int, dict]:
+        """{季号: {"count": 集数, "name": 季名, "episodes": {集号: (集名, 首播, 时长)}}}(1 小时缓存)"""
+        tmdbid = series.get("tmdbid")
+        if self._tmdb_struct_cache is None:
+            self._tmdb_struct_cache = {}
+        cached = self._tmdb_struct_cache.get(tmdbid)
+        if cached and time.time() - cached[0] < 3600:
+            return cached[1]
+        struct: Dict[int, dict] = {}
+        try:
+            seasons = self.tmdbchain.tmdb_seasons(tmdbid=tmdbid) or []
+            total = sum(int(getattr(s, "episode_count", 0) or 0) for s in seasons)
+            for s in seasons:
+                sn = getattr(s, "season_number", None)
+                if sn is None:
+                    continue
+                entry = {"count": int(getattr(s, "episode_count", 0) or 0),
+                         "name": getattr(s, "name", "") or "", "episodes": {}}
+                if total <= 600 or int(sn) == 0:
+                    for e in (self.tmdbchain.tmdb_episodes(tmdbid=tmdbid, season=int(sn)) or []):
+                        num = getattr(e, "episode_number", None)
+                        if num is None:
+                            continue
+                        entry["episodes"][int(num)] = (getattr(e, "name", "") or "", getattr(e, "air_date", "") or "",
+                                                       getattr(e, "runtime", None))
+                    entry["count"] = max(entry["count"], len(entry["episodes"]))
+                struct[int(sn)] = entry
+        except Exception as e:
+            logger.warn(f"获取 TMDB {tmdbid} 季集结构失败:{str(e)}")
+        self._tmdb_struct_cache[tmdbid] = (time.time(), struct)
+        return struct
+
+    @staticmethod
+    def __season_size(structure: Dict[int, dict], season: int) -> int:
+        entry = structure.get(season) or {}
+        return max(int(entry.get("count") or 0), len(entry.get("episodes") or {}))
+
+    def __rule_mapping(self, batch_name: str, parsed: Dict[str, dict], primary: dict,
+                       structure: Dict[int, dict]) -> Optional[Dict[str, dict]]:
+        """命名整齐、季集全部落在 TMDB 一季范围内且无歧义的批次直接按解析映射(免 LLM);否则返回 None"""
+        files: Dict[str, dict] = {}
+        cands: Dict[str, dict] = {}
+        for rel, v in parsed.items():
+            if v["marker"]:
+                files[rel] = {"c": "extra", "how": "rule", "note": v["marker"]}
+            else:
+                cands[rel] = v
+        if primary["type"] != MediaType.TV.value:
+            if len(cands) == 1:
+                files[next(iter(cands))] = {"c": "main", "how": "rule"}
+                return files
+            return None
+        if not cands:
+            return files
+        if len({v["pattern"] for v in cands.values()}) > 1 or len({v["name"] for v in cands.values()}) > 1:
+            return None
+        seasons = {v["season"] for v in cands.values()}
+        if len(seasons) > 1:
+            return None
+        season = next(iter(seasons))
+        if season is None:
+            season = MetaInfo(title=batch_name).begin_season
+            if season is None:
+                regular = [sn for sn in structure if sn > 0]
+                if len(regular) != 1:
+                    return None
+                season = regular[0]
+        if season not in structure:
+            return None
+        count = self.__season_size(structure, season)
+        eps = [v["episode"] for v in cands.values()]
+        if any(e is None for e in eps) or len(set(eps)) != len(eps) or any(e < 1 or e > count for e in eps):
+            return None
+        sizes = sorted(v["size"] for v in cands.values())
+        median = sizes[len(sizes) // 2]
+        if median and sizes[0] < 0.35 * median:
+            return None
+        for rel, v in cands.items():
+            files[rel] = {"c": "main", "s": int(season), "e": int(v["episode"]), "how": "rule"}
+        return files
+
+    def __structure_text(self, structure: Dict[int, dict]) -> str:
+        lines = []
+        for sn in sorted(structure.keys()):
+            entry = structure[sn]
+            lines.append(f"Season {sn} ({entry.get('name') or ''}), {self.__season_size(structure, sn)} 集:")
+            for num in sorted(entry.get("episodes") or {}):
+                name, air, runtime = entry["episodes"][num]
+                lines.append(f"  S{sn}E{num}: {name} ({(air or '')[:7]}{', ' + str(runtime) + 'min' if runtime else ''})")
+        return "\n".join(lines) or "(无季集结构/电影)"
+
+    def __llm_mapping(self, batch_name: str, rels: List[str], parsed: Dict[str, dict], primary: dict,
+                      candidates: List[dict], structure: Dict[int, dict]) -> Optional[dict]:
+        """一批一次:编号文件列表 + TMDB 季集结构 -> LLM 按编号输出分类与季集(输出极小,不会截断)"""
+        listing = "\n".join(f"{i + 1}. {self.__fmt_size(parsed[r]['size'])} {r}" for i, r in enumerate(rels))
+        alts = [c for c in candidates if c["tmdbid"] != primary["tmdbid"]][:5]
+        alt_text = "; ".join(f"TMDB {c['tmdbid']} {c['title']} ({c['year']}) {c['type']}" for c in alts) or "无"
+        hint = f"\n提示: {primary['hint']}" if primary.get("hint") else ""
+        user_msg = (f"发布目录名: {batch_name}\n当前作品: TMDB {primary['tmdbid']} {primary['title']} "
+                    f"({primary['year']}) 类型:{primary['type']}{hint}\n文件列表(编号. 大小 文件名):\n{listing}\n\n"
+                    f"TMDB 季集结构:\n{self.__structure_text(structure)}\n\n备选作品(可能相关): {alt_text}")
+        logger.info(f"批次 {batch_name}:调用 LLM 建立季集映射({len(rels)} 个文件)...")
+        t0 = time.time()
+        text = self.__llm_invoke(MANIFEST_PROMPT, user_msg, timeout=300)
+        if text is None:
+            return None
+        data = self.__extract_json(text)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            logger.warn(f"LLM 批次清单返回非预期 JSON:{text[:200]}")
+            return None
+        logger.info(f"LLM 季集映射完成,耗时 {time.time() - t0:.1f}s,{len(data.get('items'))} 条")
+        return data
+
+    def __llm_invoke(self, system_prompt: str, user_msg: str, timeout: int = 180) -> Optional[str]:
+        """调用 MoviePilot 系统 LLM(协程在线程内 asyncio.run);thinking=off 在部分端点会触发超长推理,映射为 low"""
         try:
             from app.agent.llm import LLMHelper
             from langchain_core.messages import HumanMessage, SystemMessage
         except Exception as e:
-            logger.warn(f"LLM 组件不可用,跳过批次分类:{str(e)}")
+            logger.warn(f"LLM 组件不可用:{str(e)}")
             return None
         api_key = getattr(settings, "LLM_API_KEY", None)
         model = getattr(settings, "LLM_MODEL", None)
         if not api_key or not model:
-            logger.warn("系统未配置 LLM(API Key/模型),跳过批次分类")
+            logger.warn("系统未配置 LLM(API Key/模型)")
             return None
-
-        listing = "\n".join(f"{i + 1}. {f}" for i, f in enumerate(rel_files))
-        user_msg = f"发布目录名:{batch_name}\n文件列表:\n{listing}"
+        thinking = getattr(settings, "LLM_THINKING_LEVEL", None)
+        if not thinking or str(thinking).lower() in ("off", "auto"):
+            thinking = "low"
         holder: Dict[str, Any] = {}
+        started = time.time()
 
         def _worker():
             try:
@@ -865,7 +1230,7 @@ class CloudLinkMonitor(_PluginBase):
                     streaming=False,
                     provider=getattr(settings, "LLM_PROVIDER", None),
                     model=model,
-                    thinking_level=getattr(settings, "LLM_THINKING_LEVEL", None),
+                    thinking_level=thinking,
                     api_key=api_key,
                     base_url=getattr(settings, "LLM_BASE_URL", None),
                     base_url_preset=getattr(settings, "LLM_BASE_URL_PRESET", None),
@@ -874,39 +1239,25 @@ class CloudLinkMonitor(_PluginBase):
                 )
                 if inspect.isawaitable(llm):
                     llm = asyncio.run(llm)
-                completion = llm.invoke([SystemMessage(content=LLM_CLASSIFY_PROMPT),
-                                         HumanMessage(content=user_msg)])
+                completion = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_msg)])
                 holder["text"] = self.__llm_text(completion)
             except Exception as e:
                 holder["error"] = str(e)
+            if holder.get("abandoned"):
+                logger.warn(f"LLM 调用在超时后才返回,实际耗时 {time.time() - started:.0f}s"
+                            f"({'失败:' + holder['error'][:120] if holder.get('error') else '结果已丢弃'})")
 
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
-        worker.join(timeout=120)
+        worker.join(timeout=timeout)
         if worker.is_alive():
-            logger.warn(f"LLM 批次分类超时(120s):{batch_name}")
+            holder["abandoned"] = True
+            logger.warn(f"LLM 调用超时({timeout}s,thinking={thinking})")
             return None
         if "error" in holder:
-            logger.warn(f"LLM 批次分类失败:{holder['error']}")
+            logger.warn(f"LLM 调用失败:{holder['error']}")
             return None
-        text = holder.get("text") or ""
-        data = self.__extract_json(text)
-        if not isinstance(data, dict):
-            logger.warn(f"LLM 返回非 JSON 对象:{text[:200]}")
-            return None
-        valid = set(rel_files)
-        result: Dict[str, str] = {}
-        for cls in ("main", "special", "extra", "other"):
-            for item in data.get(cls) or []:
-                name = str(item).strip()
-                if name in valid:
-                    result[name] = cls
-                elif name.isdigit() and 1 <= int(name) <= len(rel_files):
-                    result[rel_files[int(name) - 1]] = cls
-        if not result:
-            logger.warn(f"LLM 分类结果为空:{text[:200]}")
-            return None
-        return result
+        return holder.get("text") or ""
 
     @staticmethod
     def __llm_text(completion: Any) -> str:
@@ -945,6 +1296,167 @@ class CloudLinkMonitor(_PluginBase):
             return json.loads(text)
         except Exception:
             return None
+
+    def __absolute_index(self, structure: Dict[int, dict], season: int, episode: int) -> int:
+        """按 TMDB 常规季顺序换算绝对集数(不含第 0 季)"""
+        before = sum(self.__season_size(structure, sn) for sn in structure if 0 < sn < season)
+        return before + episode
+
+    def __validate_mapping(self, items: list, rels: List[str], parsed: Dict[str, dict], primary: dict,
+                           structure: Dict[int, dict]) -> Dict[str, dict]:
+        """
+        LLM 只有提案权:标记文件一律 extra;季集必须存在于 TMDB、不重复、正片与文件名解析集号不冲突
+        (允许绝对集数换算)、正片体积不能远小于同批正片中位数;不通过一律 unknown(跳过,绝不猜)
+        """
+        got: Dict[str, dict] = {}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                idx = int(it.get("i"))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= idx <= len(rels):
+                got[rels[idx - 1]] = it
+        is_tv = primary["type"] == MediaType.TV.value
+        files: Dict[str, dict] = {}
+        used: Dict[tuple, str] = {}
+        for rel in rels:
+            v = parsed[rel]
+            if v["marker"]:
+                files[rel] = {"c": "extra", "how": "rule", "note": v["marker"]}
+                continue
+            it = got.get(rel) or {}
+            cls = str(it.get("c") or "unknown").lower()
+            if cls not in ("main", "special", "extra", "other"):
+                cls = "unknown"
+            entry: Dict[str, Any] = {"c": cls, "how": "llm"}
+            if cls in ("main", "special") and is_tv:
+                try:
+                    s, e = int(it.get("s")), int(it.get("e"))
+                except (TypeError, ValueError):
+                    s, e = None, None
+                if s is None or s not in structure:
+                    entry = {"c": "unknown", "how": "llm", "note": f"LLM 未给出有效季集({it.get('s')}/{it.get('e')})"}
+                elif not 1 <= e <= self.__season_size(structure, s):
+                    entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 超出 TMDB 范围"}
+                elif cls == "main" and v["episode"] is not None and v["episode"] != e \
+                        and v["episode"] != self.__absolute_index(structure, s, e):
+                    entry = {"c": "unknown", "how": "llm", "note": f"文件名集号 {v['episode']} 与 LLM S{s}E{e} 冲突"}
+                elif (s, e) in used:
+                    entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 与 {Path(used[(s, e)]).name} 重复"}
+                    files[used[(s, e)]] = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 与 {Path(rel).name} 重复"}
+                else:
+                    used[(s, e)] = rel
+                    entry.update({"s": s, "e": e})
+            files[rel] = entry
+        mains = [(rel, parsed[rel]["size"]) for rel, v in files.items() if v.get("c") == "main"]
+        if len(mains) >= 3:
+            median = sorted(sz for _, sz in mains)[len(mains) // 2]
+            for rel, sz in mains:
+                if median and sz < 0.3 * median:
+                    files[rel] = {"c": "unknown", "how": "llm",
+                                  "note": f"体积 {self.__fmt_size(sz)} 远小于正片中位数 {self.__fmt_size(median)}"}
+        return files
+
+    def __aux_gate(self, file_path: Path, batch_root: Optional[Path], snapshot: tuple, file_meta,
+                   is_subtitle: bool) -> Optional[str]:
+        """
+        回退路径的辅助识别门控:辅助识别(ChatGPT 插件)按文件名猜测并会整体覆盖季集,
+        与文件名解析的集号冲突、或文件体积远小于同批主体文件时拒绝,返回原因
+        """
+        if is_subtitle:
+            return None
+        parsed_ep = snapshot[2]
+        if parsed_ep is not None and file_meta.begin_episode is not None and parsed_ep != file_meta.begin_episode:
+            return f"文件名集号 {parsed_ep} 与辅助识别 {file_meta.begin_episode} 不一致"
+        if batch_root is not None and file_meta.begin_episode is not None:
+            sizes = sorted((m[1] for m in self.__batch_listing(batch_root)["media"]), reverse=True)
+            if len(sizes) >= 3:
+                top = sizes[:max(1, int(len(sizes) * 0.4))]
+                median = top[len(top) // 2]
+                try:
+                    size = file_path.stat().st_size
+                except Exception:
+                    size = 0
+                if median and size < 0.3 * median:
+                    return f"体积 {self.__fmt_size(size)} 远小于批次主体文件 {self.__fmt_size(median)},疑似特典/预告"
+        return None
+
+    # endregion
+
+    # region Emby 覆盖重探(StrmAssistant ReprobeMediaInfo)
+
+    def __emby_server(self) -> Optional[Tuple[str, str]]:
+        if self._emby_cache is None:
+            self._emby_cache = {}
+        if "server" in self._emby_cache:
+            return self._emby_cache["server"]
+        server = None
+        try:
+            for s in (self.systemconfig.get(SystemConfigKey.MediaServers) or []):
+                if str(s.get("type") or "").lower() != "emby" or s.get("enabled") is False:
+                    continue
+                conf = s.get("config") or {}
+                host, key = (conf.get("host") or "").rstrip("/"), conf.get("apikey")
+                if host and key:
+                    server = (host, key)
+                    break
+        except Exception as e:
+            logger.debug(f"读取媒体服务器配置失败:{str(e)}")
+        self._emby_cache["server"] = server
+        return server
+
+    def __emby_episode_item(self, tmdbid, season, episode) -> Optional[str]:
+        """Emby 中该剧(按 TMDB id)对应季集的条目 id,不存在返回 None"""
+        server = self.__emby_server()
+        if not server or tmdbid is None or season is None or episode is None:
+            return None
+        host, key = server
+        try:
+            series = self._emby_cache.setdefault("series", {})
+            sid = series.get(str(tmdbid))
+            if sid is None:
+                resp = requests.get(f"{host}/emby/Items", params={
+                    "IncludeItemTypes": "Series", "Recursive": "true",
+                    "AnyProviderIdEquals": f"tmdb.{tmdbid}", "api_key": key}, timeout=10).json()
+                items = resp.get("Items") or []
+                sid = str(items[0].get("Id")) if items else ""
+                series[str(tmdbid)] = sid
+            if not sid:
+                return None
+            resp = requests.get(f"{host}/emby/Shows/{sid}/Episodes",
+                                params={"Season": int(season), "api_key": key}, timeout=10).json()
+            for it in resp.get("Items") or []:
+                if it.get("ParentIndexNumber") == int(season) and it.get("IndexNumber") == int(episode):
+                    return str(it.get("Id"))
+        except Exception as e:
+            logger.debug(f"查询 Emby 条目失败:{str(e)}")
+        return None
+
+    def __emby_reprobe_later(self, item_id: str, label: str, delay: int = 45):
+        """入库覆盖了 Emby 已有条目的文件后,延迟通知 StrmAssistant 强制重探媒体信息(持久化媒体信息不会自动更新)"""
+        server = self.__emby_server()
+        if not server:
+            return
+        host, key = server
+
+        def _run():
+            try:
+                resp = requests.post(f"{host}/emby/Items/{item_id}/ReprobeMediaInfo",
+                                     params={"api_key": key}, timeout=30)
+                if resp.status_code in (200, 204):
+                    logger.info(f"已通知 Emby 重探媒体信息:{label}(条目 {item_id})")
+                else:
+                    logger.warn(f"Emby 重探接口返回 {resp.status_code}:{label}(需 StrmAssistant ≥ 2.3.1)")
+            except Exception as e:
+                logger.warn(f"通知 Emby 重探失败:{label} - {str(e)}")
+
+        timer = threading.Timer(delay, _run)
+        timer.daemon = True
+        timer.start()
+
+    # endregion
 
     def __clean_leftover_dirs(self):
         """
@@ -993,6 +1505,13 @@ class CloudLinkMonitor(_PluginBase):
                             continue
                         if self.__match_any(keywords, str(f)):
                             continue
+                        mf = (self._manifests or {}).get(str(child))
+                        entry = self.__manifest_entry(mf, child, f) if mf and mf.get("status") == "ok" else None
+                        if entry:
+                            if entry.get("c") in ("extra", "other"):
+                                continue
+                            pending.append(f)
+                            continue
                         if self.__extra_verdict(f, mon_path):
                             continue
                         pending.append(f)
@@ -1013,8 +1532,6 @@ class CloudLinkMonitor(_PluginBase):
                         shutil.move(str(child), str(dest))
                 except Exception as e:
                     logger.warn(f"残留清理 {child} 失败:{str(e)}")
-
-    # endregion
 
     def event_handler(self, event, mon_path: str, text: str, event_path: str):
         """
@@ -1089,12 +1606,35 @@ class CloudLinkMonitor(_PluginBase):
                     logger.debug(f"{event_path} 不是媒体或字幕文件")
                     return
 
-                # 特典/附加内容识别(LLM 批次分类优先,其次文件名标记/子目录名启发式;
-                # 第三层由监控目录覆盖模式 size 兜底:更小的文件永远顶不掉已入库正片)
-                verdict = self.__extra_verdict(file_path, mon_path)
-                if verdict:
-                    logger.info(f"{file_path.name} 判定为{verdict},跳过整理:{file_path}")
-                    return
+                # 批次清单:批次级识别(候选作品投票 + TMDB 季集结构 + 规则/LLM 映射 + 确定性校验),
+                # 正片/特别篇按清单季集直接入库,特典/附加/未知一律跳过;无清单时回退 启发式 + 逐文件识别。
+                # 最后一层由监控目录覆盖模式 size 兜底:更小的文件永远顶不掉已入库正片
+                batch_root = self.__batch_root(file_path, mon_path)
+                manifest = None
+                entry = None
+                if batch_root is not None and self._dirconf.get(mon_path) is not None:
+                    manifest = self.__get_manifest(batch_root)
+                    if manifest and manifest.get("pending"):
+                        logger.debug(f"批次 {batch_root.name} 尚未稳定,本轮跳过:{file_path.name}")
+                        return
+                    if manifest:
+                        entry = self.__manifest_entry(manifest, batch_root, file_path)
+                if entry:
+                    if entry.get("c") in ("extra", "other"):
+                        logger.info(f"{file_path.name} 批次清单判定为{entry.get('c')}"
+                                    f"({entry.get('note') or entry.get('how')}),跳过整理")
+                        return
+                    if entry.get("c") == "unknown" or (
+                            (manifest.get("media") or {}).get("type") == MediaType.TV.value
+                            and (entry.get("s") is None or entry.get("e") is None)):
+                        logger.info(f"{file_path.name} 批次清单无法确定季集({entry.get('note') or '未知'}),"
+                                    f"跳过整理待人工处理")
+                        return
+                else:
+                    verdict = self.__extra_verdict(file_path, mon_path)
+                    if verdict:
+                        logger.info(f"{file_path.name} 判定为{verdict},跳过整理:{file_path}")
+                        return
 
                 # 判断是不是蓝光目录
                 if re.search(r"BDMV[/\\]STREAM", event_path, re.IGNORECASE):
@@ -1107,8 +1647,25 @@ class CloudLinkMonitor(_PluginBase):
                         logger.info(f"{file_path} 已整理过")
                         return
 
-                # 元数据
-                file_meta = MetaInfoPath(file_path)
+                # 元数据:清单命中时按清单季集构造(不依赖文件名解析);否则用清洗后的文件名解析(剥 CRC/集标题)
+                if entry:
+                    media = manifest.get("media") or {}
+                    file_meta = MetaInfoPath(file_path)
+                    try:
+                        file_meta.type = MediaType(media.get("type"))
+                    except Exception:
+                        file_meta.type = MediaType.TV
+                    if media.get("title"):
+                        file_meta.name = media.get("title")
+                    file_meta.year = media.get("year")
+                    if entry.get("s") is not None:
+                        file_meta.begin_season = int(entry["s"])
+                        file_meta.end_season = None
+                    if entry.get("e") is not None:
+                        file_meta.begin_episode = int(entry["e"])
+                        file_meta.end_episode = None
+                else:
+                    file_meta = self.__clean_meta(file_path)
                 if not file_meta.name:
                     logger.error(f"{file_path.name} 无法识别有效信息")
                     return
@@ -1156,9 +1713,23 @@ class CloudLinkMonitor(_PluginBase):
                     if normalized_name != file_item.name:
                         logger.info(f"字幕语言标记归一化：{file_item.name} -> {normalized_name}")
                         file_item.name = normalized_name
-                # 识别媒体信息（走chain层完整识别链：原生识别失败时自动回退AI辅助识别，
-                # 辅助识别以原始文件名请求LLM并回填季集信息，解决复杂命名解析失败问题）
-                mediainfo: MediaInfo = self.mediaChain.recognize_by_meta(file_meta)
+                if entry:
+                    # 清单命中:按 TMDB id 直接取媒体信息,不做标题搜索、不触发辅助识别
+                    media = manifest.get("media") or {}
+                    mediainfo: MediaInfo = self.mediaChain.recognize_media(
+                        meta=file_meta, mtype=file_meta.type, media_source=MediaSource.TMDB,
+                        media_id=str(media.get("tmdbid")))
+                else:
+                    # 回退路径:chain 层完整识别链(原生失败回退辅助识别);辅助识别改写了季集时必须过门控
+                    snapshot = (file_meta.name, file_meta.begin_season, file_meta.begin_episode)
+                    mediainfo: MediaInfo = self.mediaChain.recognize_by_meta(file_meta)
+                    if mediainfo and (file_meta.name, file_meta.begin_season, file_meta.begin_episode) != snapshot:
+                        reason = self.__aux_gate(file_path, batch_root, snapshot, file_meta, is_subtitle)
+                        if reason:
+                            logger.warn(f"{file_path.name} 辅助识别结果未通过校验({reason}),跳过整理待人工处理")
+                            if self._history:
+                                self.transferhis.add_fail(fileitem=file_item, mode=transfer_type, meta=file_meta)
+                            return
                 if not mediainfo:
                     logger.warn(f'未识别到媒体信息，标题：{file_meta.name}')
                     # 新增转移成功历史记录
@@ -1211,6 +1782,15 @@ class CloudLinkMonitor(_PluginBase):
                         else:
                             logger.warn(f"{file_path.name} 集数 {file_meta.begin_episode} 超出TMDB该季集数范围"
                                         f"（可能为绝对集数命名），按原识别结果整理")
+
+                # Emby 已有同季集条目时,入库覆盖后要通知 StrmAssistant 重探媒体信息(持久化媒体信息不会自动更新)
+                pre_item = None
+                if self._emby_reprobe and not is_subtitle and mediainfo.type == MediaType.TV \
+                        and file_meta.begin_episode is not None:
+                    pre_item = self.__emby_episode_item(
+                        mediainfo.tmdb_id,
+                        1 if file_meta.begin_season is None else file_meta.begin_season,
+                        file_meta.begin_episode)
 
                 # 查询转移目的目录
                 target_dir = DirectoryHelper().get_dir(mediainfo, src_path=Path(mon_path))
@@ -1374,6 +1954,9 @@ class CloudLinkMonitor(_PluginBase):
                         'action': 'cloudstrm_file'
                     })
 
+                if pre_item:
+                    self.__emby_reprobe_later(pre_item, file_path.name)
+
                 # 移动模式删除空目录（必须确认媒体/字幕/音轨文件都已清空，防止误删未整理的字幕）
                 if transfer_type == "move":
                     for file_dir in file_path.parents:
@@ -1481,7 +2064,37 @@ class CloudLinkMonitor(_PluginBase):
             "methods": ["GET"],
             "summary": "云盘实时监控同步",
             "description": "云盘实时监控同步",
+        }, {
+            "path": "/batch_manifest",
+            "endpoint": self.batch_manifest,
+            "methods": ["GET"],
+            "summary": "批次清单预览",
+            "description": "对指定批次目录建立/查看批次清单(作品识别 + 季集映射),不整理文件;rebuild=true 强制重建",
         }]
+
+    def batch_manifest(self, path: str, rebuild: bool = False) -> schemas.Response:
+        """
+        API:批次清单预览(不整理文件)
+        """
+        batch_root = Path(path)
+        if not batch_root.is_dir():
+            return schemas.Response(success=False, message=f"目录不存在:{path}")
+        key = str(batch_root)
+        if rebuild:
+            if self._manifests:
+                self._manifests.pop(key, None)
+            if self._batch_seen:
+                self._batch_seen.pop(key, None)
+            if self._batch_list_cache:
+                self._batch_list_cache.pop(key, None)
+        saved = self._batch_settle
+        self._batch_settle = 0
+        try:
+            mf = self.__get_manifest(batch_root)
+        finally:
+            self._batch_settle = saved
+        data = mf if mf else (self._manifests or {}).get(key)
+        return schemas.Response(success=bool(mf), message="" if mf else "清单未建立(见插件日志)", data=data)
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -1909,7 +2522,7 @@ class CloudLinkMonitor(_PluginBase):
                                         'component': 'VSwitch',
                                         'props': {
                                             'model': 'llm_classify',
-                                            'label': 'LLM 批次识别特典',
+                                            'label': 'LLM 批次清单(作品识别+季集映射)',
                                         }
                                     }
                                 ]
@@ -1942,6 +2555,55 @@ class CloudLinkMonitor(_PluginBase):
                                             'model': 'leftover_dir',
                                             'label': '残留隔离目录',
                                             'placeholder': '留空=监控目录同级的 整理残留'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'batch_settle',
+                                            'label': '批次稳定等待(秒)',
+                                            'placeholder': '120'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'emby_reprobe',
+                                            'label': '覆盖后通知 Emby 重探媒体信息',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'density': 'compact',
+                                            'text': '批次清单:同一发布目录先整体识别作品并拉取 TMDB 季集结构,'
+                                                    '命名不规整时由 LLM 一次给出每个文件的分类与季集,再经范围/重复/'
+                                                    '集号冲突/体积校验;不确定的文件跳过并通知,绝不猜。'
                                         }
                                     }
                                 ]
@@ -2178,7 +2840,9 @@ class CloudLinkMonitor(_PluginBase):
             "fast_interval": 0,
             "llm_classify": True,
             "leftover_policy": "quarantine",
-            "leftover_dir": ""
+            "leftover_dir": "",
+            "batch_settle": 120,
+            "emby_reprobe": True
         }
 
     def get_page(self) -> List[dict]:
