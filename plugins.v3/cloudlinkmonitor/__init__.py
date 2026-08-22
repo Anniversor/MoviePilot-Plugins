@@ -115,7 +115,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.3.2"
+    plugin_version = "3.3.3"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -1179,6 +1179,12 @@ class CloudLinkMonitor(_PluginBase):
                 return None
             tags = [x.strip() for x in re.findall(r"[\[【]([^\]】]{2,40})[\]】]", batch_name)]
             tags = [x for x in tags if not re.fullmatch(r"[\d\s\-~_.xXpPkK×]+|(?:WEB|BD|TV)[\w\s\-]*", x, re.IGNORECASE)]
+            # 剧名本身(方括号里的 Re Zero kara ... / 中文名)不是发布标记,会撞到其他发布组的记录,剔除
+            def _norm(s):
+                return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(s or "").lower())
+            names = {_norm(primary.get("title"))} | {_norm(v.get("name")) for v in parsed.values()}
+            names.discard("")
+            tags = [x for x in tags if _norm(x) and not any(_norm(x) == n or _norm(x) in n or n in _norm(x) for n in names)]
             if not tags:
                 head = re.split(r"[\s\-_\[]", batch_name.strip(), 1)[0]
                 tags = [head] if len(head) >= 3 else []
