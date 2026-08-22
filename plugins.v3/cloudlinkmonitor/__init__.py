@@ -115,7 +115,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.3.4"
+    plugin_version = "3.4.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -181,6 +181,12 @@ class CloudLinkMonitor(_PluginBase):
     _group_notified = None
     _emby_sync_pending = None
     _recheck_pending = None
+    # 通知型目录(无目的目录)的云端探测与已通知集合
+    _notify_probe_interval = 180
+    _notify_fp = None
+    _notify_last = 0
+    _notified = None
+    _notified_dirty = False
     # 批次清单(持久化)与进程内缓存
     _manifests = None
     _batch_seen = None
@@ -260,6 +266,10 @@ class CloudLinkMonitor(_PluginBase):
                 self._batch_settle = 120
             self._emby_reprobe = config.get("emby_reprobe", True)
             self._emby_sync_group = config.get("emby_sync_group", True)
+            try:
+                self._notify_probe_interval = int(config.get("notify_probe_interval") or 180)
+            except (TypeError, ValueError):
+                self._notify_probe_interval = 180
             self._group_map = config.get("group_map") or ""
 
         # 重置失败重试计数与快速探测指纹
@@ -273,6 +283,10 @@ class CloudLinkMonitor(_PluginBase):
         self._group_notified = set()
         self._emby_sync_pending = set()
         self._recheck_pending = set()
+        self._notify_fp = {}
+        self._notify_last = 0
+        self._notified = self.get_data("notified_files") or {}
+        self._notified_dirty = False
         self._batch_seen = {}
         self._recog_cache = {}
         self._tmdb_struct_cache = {}
@@ -427,6 +441,7 @@ class CloudLinkMonitor(_PluginBase):
             "batch_settle": self._batch_settle,
             "emby_reprobe": self._emby_reprobe,
             "emby_sync_group": self._emby_sync_group,
+            "notify_probe_interval": self._notify_probe_interval,
             "group_map": self._group_map,
         })
 
@@ -461,7 +476,9 @@ class CloudLinkMonitor(_PluginBase):
             # 遍历目录下所有文件（先媒体后字幕，保证字幕改名与视频一致时目标目录已就绪）
             for file_path in media_files + sub_files:
                 logger.info(f"开始处理文件 {file_path} ...")
-                self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
+                self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True,
+                                   force_notify=True)
+            self.__save_notified()
         logger.info("全量同步云盘实时监控目录完成！")
 
     def sync_reconcile(self):
@@ -480,6 +497,11 @@ class CloudLinkMonitor(_PluginBase):
                 logger.error(f"对账刷新缓存失败：{str(e)}")
             for mon_path in list(self._dirconf.keys()):
                 if self._dirconf.get(mon_path) is None:
+                    # 通知型目录:不强刷云端(零 QPS),只按挂载缓存补发漏掉的文件
+                    try:
+                        self.__notify_scan(mon_path, source="对账")
+                    except Exception as e:
+                        logger.error(f"对账扫描通知型目录 {mon_path} 失败:{str(e)}")
                     continue
                 try:
                     media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
@@ -523,6 +545,10 @@ class CloudLinkMonitor(_PluginBase):
         """
         if not self._enabled:
             return
+        try:
+            self.__notify_probe()
+        except Exception as e:
+            logger.error(f"通知型目录探测失败:{str(e)}")
         if self._busy and self._busy.locked():
             return
         fp = self.__collect_fingerprint()
@@ -688,9 +714,9 @@ class CloudLinkMonitor(_PluginBase):
             logger.warn(f"rclone rc {endpoint} 调用失败：{str(e)}")
             return False
 
-    def __vfs_refresh(self, local_path: str) -> bool:
+    def __vfs_refresh(self, local_path: str, recursive: bool = True) -> bool:
         """
-        强制刷新 rclone VFS 目录缓存（递归）
+        强制刷新 rclone VFS 目录缓存(默认递归;通知型目录的定向刷新用非递归,避免 rclone 重新拉整棵树)
         """
         if not self._rc_fs or not self._rc_mount_prefix \
                 or not str(local_path).startswith(self._rc_mount_prefix):
@@ -698,7 +724,8 @@ class CloudLinkMonitor(_PluginBase):
         rel = str(local_path)[len(self._rc_mount_prefix):].strip("/")
         if not rel:
             return False
-        return self.__rc_call("vfs/refresh", {"fs": self._rc_fs, "dir": rel, "recursive": "true"})
+        return self.__rc_call("vfs/refresh", {"fs": self._rc_fs, "dir": rel,
+                                              "recursive": "true" if recursive else "false"})
 
     def __exclude_patterns(self) -> List[str]:
         """
@@ -1001,6 +1028,129 @@ class CloudLinkMonitor(_PluginBase):
         timer = threading.Timer(max(5, int(delay)), _run)
         timer.daemon = True
         timer.start()
+
+    # region 通知型监控目录:最小 QPS 的变动探测与对账
+
+    @staticmethod
+    def __notify_key(file_path: Path) -> Optional[str]:
+        try:
+            st = Path(file_path).stat()
+            return f"{st.st_size}:{int(st.st_mtime)}"
+        except Exception:
+            return None
+
+    def __save_notified(self):
+        if not self._notified_dirty:
+            return
+        try:
+            self.save_data("notified_files", self._notified or {})
+            self._notified_dirty = False
+        except Exception as e:
+            logger.warn(f"保存已通知集合失败:{str(e)}")
+
+    def __notify_scan(self, mon_path: str, subpaths: Optional[List[str]] = None, refresh: bool = False,
+                      source: str = ""):
+        """
+        扫描通知型目录(或其中若干子路径),对未通知过/已变化的文件发 strm 事件。
+        refresh=True 时只对给定子路径做定向刷新:OpenList 该文件夹 1 次直连刷新 + rclone 非递归 vfs/refresh。
+        全目录扫描时顺带清掉已消失文件的记录。
+        """
+        if self._dirconf.get(mon_path) is not None or not self._strm:
+            return
+        roots = [Path(p) for p in (subpaths or [mon_path])]
+        if refresh:
+            for r in roots:
+                if r.is_dir() or not r.exists():
+                    ol_path = self.__map_openlist_path(str(r))
+                    if ol_path and self._openlist_url and self._openlist_token:
+                        self.__openlist_refresh_walk(ol_path, budget=[6])
+                if self._rc_socket and self._rc_fs:
+                    self.__vfs_refresh(str(r) if r.is_dir() else str(r.parent), recursive=False)
+        files: List[Path] = []
+        for r in roots:
+            try:
+                if r.is_file():
+                    files.append(r)
+                elif r.is_dir():
+                    files += SystemUtils.list_files(r, settings.RMT_MEDIAEXT) + \
+                        SystemUtils.list_files(r, settings.RMT_SUBEXT)
+            except Exception as e:
+                logger.debug(f"扫描 {r} 失败:{str(e)}")
+        if self._notified is None:
+            self._notified = {}
+        notified = self._notified.setdefault(mon_path, {})
+        sent = 0
+        for f in files:
+            key = self.__notify_key(f)
+            if key and notified.get(str(f)) == key:
+                continue
+            self.__handle_file(event_path=str(f), mon_path=mon_path, from_reconcile=True)
+            if key and notified.get(str(f)) == key:
+                sent += 1
+        if not subpaths:
+            for p in [p for p in notified if not Path(p).exists()]:
+                notified.pop(p, None)
+                self._notified_dirty = True
+        self.__save_notified()
+        if sent:
+            logger.info(f"{source}:通知型目录 {mon_path} 新通知 {sent} 个文件给 strm 助手")
+
+    def __notify_probe(self):
+        """
+        通知型目录的云端变动探测:每 notify_probe_interval 秒对顶层做 1 次 OpenList 直连列表,
+        比较 名称/大小/modified(115 文件夹的 modified 随内容变化更新),只对变化的条目定向刷新并扫描。
+        稳态开销:每个通知型目录每周期 1 次 115 调用;有变化时 +1 次/变化文件夹。
+        """
+        dirs = [m for m in (self._dirconf or {}) if self._dirconf.get(m) is None]
+        if not dirs or not self._strm or not self._notify_probe_interval or self._notify_probe_interval <= 0:
+            return
+        now = time.time()
+        if now - (self._notify_last or 0) < self._notify_probe_interval:
+            return
+        self._notify_last = now
+        if not self._openlist_url or not self._openlist_token:
+            return
+        if self._notify_fp is None:
+            self._notify_fp = {}
+        for mon_path in dirs:
+            ol_path = self.__map_openlist_path(mon_path)
+            if not ol_path:
+                continue
+            top = self.__openlist_list(ol_path)
+            if top is None:
+                continue
+            fp = {str(i.get("name")): (bool(i.get("is_dir")), i.get("size"), i.get("modified")) for i in top}
+            old = self._notify_fp.get(mon_path)
+            self._notify_fp[mon_path] = fp
+            if old is None:
+                logger.info(f"通知型目录 {mon_path} 探测基线:{len(fp)} 个顶层条目")
+                continue
+            changed = [n for n, v in fp.items() if old.get(n) != v]
+            removed = [n for n in old if n not in fp]
+            if removed and self._notified:
+                notified = self._notified.get(mon_path) or {}
+                for n in removed:
+                    prefix = str(Path(mon_path) / n)
+                    for p in [p for p in notified if p == prefix or p.startswith(prefix + "/")]:
+                        notified.pop(p, None)
+                        self._notified_dirty = True
+                self.__save_notified()
+            if not changed:
+                continue
+            logger.info(f"通知型目录 {mon_path} 云端变化:{', '.join(changed[:6])}{' ...' if len(changed) > 6 else ''},定向刷新")
+            top_files = [str(Path(mon_path) / n) for n in changed if not fp[n][0]]
+            sub_dirs = [str(Path(mon_path) / n) for n in changed if fp[n][0]]
+            if top_files:
+                if self._rc_socket and self._rc_fs:
+                    self.__vfs_refresh(mon_path, recursive=False)
+                self.__notify_scan(mon_path, top_files, refresh=False, source="快速探测")
+            if sub_dirs:
+                if self._rc_socket and self._rc_fs:
+                    # 新文件夹要先让挂载的顶层列表看到它
+                    self.__vfs_refresh(mon_path, recursive=False)
+                self.__notify_scan(mon_path, sub_dirs, refresh=True, source="快速探测")
+
+    # endregion
 
     def __save_manifests(self):
         now = time.time()
@@ -2126,12 +2276,14 @@ class CloudLinkMonitor(_PluginBase):
             logger.debug("文件%s：%s" % (text, event_path))
             self.__handle_file(event_path=event_path, mon_path=mon_path)
 
-    def __handle_file(self, event_path: str, mon_path: str, from_reconcile: bool = False):
+    def __handle_file(self, event_path: str, mon_path: str, from_reconcile: bool = False,
+                      force_notify: bool = False):
         """
         同步一个文件
         :param event_path: 事件文件路径
         :param mon_path: 监控目录
         :param from_reconcile: 是否来自定时对账（失败记录允许有限次重试）
+        :param force_notify: 通知型目录忽略已通知集合,强制重发(立即运行一次)
         """
         file_path = Path(event_path)
         try:
@@ -2269,12 +2421,22 @@ class CloudLinkMonitor(_PluginBase):
                 target: Path = self._dirconf.get(mon_path)
 
                 if self._strm and target is None:
-                    # 通知Strm助手生成
+                    # 通知型目录:只对新出现/内容变化(大小或 mtime)的文件发事件,避免对账/探测重复打扰下游
+                    key = self.__notify_key(file_path)
+                    notified = self._notified.setdefault(mon_path, {}) if self._notified is not None else {}
+                    if not force_notify and key and notified.get(str(file_path)) == key:
+                        logger.debug(f"{file_path} 已通知过 strm 助手,跳过")
+                        return
                     logger.info(f"{file_path} 直接通知strm助手生成strm!")
                     self.eventmanager.send_event(EventType.PluginAction, {
                         'file_path': str(file_path),
                         'action': 'cloudstrm_file'
                     })
+                    if key:
+                        notified[str(file_path)] = key
+                        self._notified_dirty = True
+                        if not from_reconcile:
+                            self.__save_notified()
                     return
 
                 # 查询转移方式
@@ -3220,6 +3382,20 @@ class CloudLinkMonitor(_PluginBase):
                             },
                             {
                                 'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'notify_probe_interval',
+                                            'label': '通知型目录探测间隔(秒,0=关)',
+                                            'placeholder': '180'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
                                 'props': {'cols': 12},
                                 'content': [
                                     {
@@ -3473,7 +3649,8 @@ class CloudLinkMonitor(_PluginBase):
             "batch_settle": 120,
             "emby_reprobe": True,
             "emby_sync_group": True,
-            "group_map": ""
+            "group_map": "",
+            "notify_probe_interval": 180
         }
 
     def get_page(self) -> List[dict]:
