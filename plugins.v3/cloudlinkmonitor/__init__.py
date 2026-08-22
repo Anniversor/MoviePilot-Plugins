@@ -894,7 +894,7 @@ class CloudLinkMonitor(_PluginBase):
                     return old
                 if old.get("status") in ("failed", "no_media") and old.get("digest") == digest:
                     attempts = int(old.get("attempts") or 1)
-                    if now - (old.get("time") or 0) < min(6 * 3600, 600 * attempts):
+                    if now - (old.get("time") or 0) < (600 if attempts <= 1 else 1200 if attempts == 2 else 6 * 3600):
                         return None
             if self._batch_seen is None:
                 self._batch_seen = {}
