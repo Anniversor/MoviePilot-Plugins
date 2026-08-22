@@ -108,7 +108,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.3.0"
+    plugin_version = "3.3.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -173,6 +173,7 @@ class CloudLinkMonitor(_PluginBase):
     _order_override = None
     _group_notified = None
     _emby_sync_pending = None
+    _recheck_pending = None
     # 批次清单(持久化)与进程内缓存
     _manifests = None
     _batch_seen = None
@@ -264,6 +265,7 @@ class CloudLinkMonitor(_PluginBase):
         self._order_override = None
         self._group_notified = set()
         self._emby_sync_pending = set()
+        self._recheck_pending = set()
         self._batch_seen = {}
         self._recog_cache = {}
         self._tmdb_struct_cache = {}
@@ -485,7 +487,9 @@ class CloudLinkMonitor(_PluginBase):
                     if batch_root is not None:
                         mf = self.__get_manifest(batch_root)
                         if mf and mf.get("pending"):
-                            logger.info(f"批次 {batch_root.name} 尚未稳定(文件仍在变化),本轮跳过 {len(group)} 个文件")
+                            logger.info(f"批次 {batch_root.name} 尚未稳定(文件仍在变化),本轮跳过 {len(group)} 个文件,"
+                                        f"{mf.get('retry_in')} 秒后自动复查")
+                            self.__schedule_batch_recheck(batch_root, mon_path, int(mf.get("retry_in") or 60))
                             continue
                         group = self.__order_batch(mf, batch_root, group)
                     for file_path in group:
@@ -931,7 +935,9 @@ class CloudLinkMonitor(_PluginBase):
             settle = max(0, int(self._batch_settle or 0))
             newest = max(m[2] for m in media)
             if settle and (now - seen[1] < settle or now - newest < settle):
-                return {"pending": True}
+                # 返回剩余稳定时间,调用方据此安排复查(未来时间戳的文件按"刚出现"处理)
+                remaining = settle - min(now - seen[1], max(0.0, now - newest))
+                return {"pending": True, "retry_in": int(max(5, min(settle, remaining)) + 3)}
             mf = self.__build_manifest(batch_root, listing, digest)
             mf["attempts"] = (int(old.get("attempts") or 0) if old and old.get("digest") == digest else 0) + 1
             if self._order_override:
@@ -941,6 +947,52 @@ class CloudLinkMonitor(_PluginBase):
                 self._manifests[key] = mf
                 self.__save_manifests()
             return mf if mf.get("status") == "ok" else None
+
+    def __schedule_batch_recheck(self, batch_root: Path, mon_path: str, delay: int):
+        """批次未稳定时,在稳定窗口过后自动复查该批次(同一批次只挂一个复查),不必等下一次定时对账"""
+        key = str(batch_root)
+        if self._recheck_pending is None:
+            self._recheck_pending = set()
+        if key in self._recheck_pending:
+            return
+        self._recheck_pending.add(key)
+
+        def _run():
+            acquired = False
+            try:
+                if self._busy:
+                    acquired = self._busy.acquire(timeout=600)
+                    if not acquired:
+                        logger.warn(f"批次 {batch_root.name} 复查等待对账锁超时,留待下次对账")
+                        return
+                self._recheck_pending.discard(key)
+                if not batch_root.exists() or self._dirconf.get(mon_path) is None:
+                    return
+                if batch_root.is_file():
+                    files = [batch_root]
+                else:
+                    files = SystemUtils.list_files(batch_root, settings.RMT_MEDIAEXT) + \
+                        SystemUtils.list_files(batch_root, settings.RMT_SUBEXT)
+                if not files:
+                    return
+                mf = self.__get_manifest(batch_root)
+                if mf and mf.get("pending"):
+                    logger.info(f"批次 {batch_root.name} 复查时仍未稳定,{mf.get('retry_in')} 秒后再查")
+                    self.__schedule_batch_recheck(batch_root, mon_path, int(mf.get("retry_in") or 60))
+                    return
+                logger.info(f"批次 {batch_root.name} 已稳定,开始整理 {len(files)} 个文件")
+                for file_path in self.__order_batch(mf, batch_root, files) if not batch_root.is_file() else files:
+                    self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True)
+            except Exception as e:
+                logger.error(f"批次 {batch_root.name} 复查失败:{str(e)} - {traceback.format_exc()}")
+            finally:
+                self._recheck_pending.discard(key)
+                if acquired:
+                    self._busy.release()
+
+        timer = threading.Timer(max(5, int(delay)), _run)
+        timer.daemon = True
+        timer.start()
 
     def __save_manifests(self):
         now = time.time()
@@ -1384,6 +1436,11 @@ class CloudLinkMonitor(_PluginBase):
         for r in structure.get("ref") or []:
             if r["season"] == season and 1 <= episode <= r["count"]:
                 return self.__abs_to_target(structure, r["start"] + episode - 1)
+        # 发布按 TMDB 默认的"单季绝对集数"命名(如 7³ACG 的 S01E26–E50),而目标体系按剧集组分季:
+        # 第一季放不下的集号只可能是绝对集数,按绝对集数落到对应季
+        regular = sorted(structure.get("offsets") or {})
+        if regular and season == regular[0] and episode > self.__season_size(structure, season):
+            return self.__abs_to_target(structure, episode)
         return None
 
     def __plausible_targets(self, structure: dict, season: Optional[int], episode: Optional[int]) -> Optional[set]:
@@ -2043,7 +2100,9 @@ class CloudLinkMonitor(_PluginBase):
                 if manifest_root is not None and self._dirconf.get(mon_path) is not None:
                     manifest = self.__get_manifest(manifest_root)
                     if manifest and manifest.get("pending"):
-                        logger.debug(f"批次 {batch_root.name} 尚未稳定,本轮跳过:{file_path.name}")
+                        logger.debug(f"批次 {manifest_root.name} 尚未稳定,本轮跳过:{file_path.name},"
+                                     f"{manifest.get('retry_in')} 秒后自动复查")
+                        self.__schedule_batch_recheck(manifest_root, mon_path, int(manifest.get("retry_in") or 60))
                         return
                     if manifest:
                         entry = self.__manifest_entry(manifest, manifest_root, file_path)
