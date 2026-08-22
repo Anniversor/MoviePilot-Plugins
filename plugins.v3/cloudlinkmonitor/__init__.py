@@ -115,7 +115,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.3.3"
+    plugin_version = "3.3.4"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -1185,6 +1185,8 @@ class CloudLinkMonitor(_PluginBase):
             names = {_norm(primary.get("title"))} | {_norm(v.get("name")) for v in parsed.values()}
             names.discard("")
             tags = [x for x in tags if _norm(x) and not any(_norm(x) == n or _norm(x) in n or n in _norm(x) for n in names)]
+            # 联合发布 "[hyakuhuyu&LoliHouse]" 与种子名 "[百冬练习组&LoliHouse]" 只有一半相同:按 & / 、 , 拆成子标记一起匹配
+            tags = list(dict.fromkeys(tags + [p.strip() for x in tags for p in re.split(r"[&/、,，]", x) if len(p.strip()) >= 3]))
             if not tags:
                 head = re.split(r"[\s\-_\[]", batch_name.strip(), 1)[0]
                 tags = [head] if len(head) >= 3 else []
