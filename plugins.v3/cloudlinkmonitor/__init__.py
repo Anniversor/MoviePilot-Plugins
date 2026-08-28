@@ -64,6 +64,8 @@ EXPLICIT_SEASON_RE = re.compile(
     r"(?<![A-Za-z0-9])S\d{1,2}(?:E\d{1,4})?(?![A-Za-z0-9])|Season\s*\d{1,2}|\d{1,2}(?:st|nd|rd|th)\s*Season"
     r"|第\s*[0-9一二三四五六七八九十]+\s*[季期部]|(?<![A-Za-z0-9])(?:II|III|IV)(?![A-Za-z0-9])", re.IGNORECASE)
 EP_RANGE_RE = re.compile(r"E(\d{1,4})(?:\s*-\s*E?(\d{1,4}))?", re.IGNORECASE)
+# 全角括号/方括号归一化(「凡人修仙传（2020）」的年份要能解析出来)
+FULLWIDTH_TABLE = str.maketrans({"（": "(", "）": ")", "【": "[", "】": "]", "［": "[", "］": "]", "｛": "{", "｝": "}"})
 
 MANIFEST_PROMPT = (
     "你是媒体库整理助手。输入:一个发布目录名、其中全部视频文件的编号列表(含文件大小)、该作品在媒体库使用的"
@@ -115,7 +117,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.4.0"
+    plugin_version = "3.5.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -818,7 +820,8 @@ class CloudLinkMonitor(_PluginBase):
     @staticmethod
     def __clean_name(name: str) -> str:
         """剥掉 8 位十六进制 CRC 与「」『』内的集标题(MP 解析器会把 CRC 当集数、把集标题当剧名)"""
-        cleaned = CRC_RE.sub(" ", name or "")
+        cleaned = (name or "").translate(FULLWIDTH_TABLE)
+        cleaned = CRC_RE.sub(" ", cleaned)
         cleaned = QUOTE_RE.sub(" ", cleaned)
         cleaned = ORDINAL_SEASON_RE.sub(lambda m: f"S{int(m.group(1))}", cleaned)
         return re.sub(r"\s{2,}", " ", cleaned).strip()
@@ -1221,7 +1224,8 @@ class CloudLinkMonitor(_PluginBase):
                 if season is not None and not EXPLICIT_SEASON_RE.search(cleaned):
                     # 解析器凭空给出的季号(如 "[4th - 08]" -> S01E08)不可信,按未知处理,交给下载记录/目录名/LLM
                     season = None
-                parsed[rel] = {"name": meta.name or "", "season": season, "episode": meta.begin_episode,
+                parsed[rel] = {"name": meta.name or "", "year": meta.year, "season": season,
+                               "episode": meta.begin_episode,
                                "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
             batch_name = batch_root.stem if batch_root.is_file() else batch_root.name
             candidates = self.__series_candidates(batch_name, parsed)
@@ -1230,6 +1234,7 @@ class CloudLinkMonitor(_PluginBase):
                 mf["status"] = "no_media"
                 return mf
             primary = candidates[0]
+            primary = self.__refit_primary(batch_name, parsed, candidates) or primary
 
             def build_structure(series: dict):
                 if series["type"] != MediaType.TV.value:
@@ -1410,14 +1415,25 @@ class CloudLinkMonitor(_PluginBase):
             return getattr(mi, "episode_groups", None) or (getattr(mi, "tmdb_info", None) or {}).get(
                 "episode_groups", {}).get("results")
 
-        names = Counter(v["name"] for v in parsed.values() if v["name"] and not v["marker"])
-        for name, cnt in names.most_common(6):
-            mi = self.__recognize_title(name)
+        names = Counter((v["name"], v.get("year")) for v in parsed.values() if v["name"] and not v["marker"])
+        for (name, year), cnt in names.most_common(6):
+            mi = self.__recognize_title(f"{name} {year}" if year else name)
             if mi and getattr(mi, "tmdb_id", None):
                 add(mi.tmdb_id, mi.title, mi.year, mi.type.value, cnt, "文件名", groups=mi_groups(mi))
-        mi = self.__recognize_title(batch_name)
+        mi = self.__recognize_title(self.__clean_name(batch_name) or batch_name)
         if mi and getattr(mi, "tmdb_id", None):
             add(mi.tmdb_id, mi.title, mi.year, mi.type.value, 3, "目录名", groups=mi_groups(mi))
+        # TMDB 同名搜索的其余结果零票旁听:供结构拟合度换选与 LLM 换选(同名不同年/动画与真人版并存的场景)
+        try:
+            if names:
+                (top_name, top_year), _ = names.most_common(1)[0]
+                s_meta = MetaInfo(title=f"{top_name} {top_year}" if top_year else top_name)
+                for smi in (self.mediaChain.search_medias(meta=s_meta) or [])[:6]:
+                    if getattr(smi, "tmdb_id", None):
+                        s_type = smi.type.value if hasattr(smi.type, "value") else str(smi.type)
+                        add(smi.tmdb_id, smi.title, smi.year, s_type, 0, "同名搜索", groups=mi_groups(smi))
+        except Exception as e:
+            logger.debug(f"同名搜索失败:{str(e)}")
         try:
             from app.db.subscribe_oper import SubscribeOper
             for sub in (SubscribeOper().list() or []):
@@ -1448,6 +1464,62 @@ class CloudLinkMonitor(_PluginBase):
                 for c in result[:4]))
         return result
 
+    # ---- 结构拟合度:同名候选消歧 ----
+
+    def __structure_fit(self, series: dict, parsed: Dict[str, dict]) -> float:
+        """
+        文件名解析出的季集在该作品默认季集结构下有落点的比例(0~1)。电影/无集号文件不计入。
+        """
+        if series.get("type") != MediaType.TV.value:
+            return 0.0
+        cands = [v for v in parsed.values() if not v["marker"] and v.get("episode") is not None]
+        if not cands:
+            return 0.0
+        structure = self.__tmdb_structure(series, {"group_id": None})
+        if not structure.get("seasons"):
+            return 0.0
+        hit = 0
+        for v in cands:
+            targets = self.__plausible_targets(structure, v.get("season"), int(v["episode"]))
+            if targets:
+                hit += 1
+        return hit / len(cands)
+
+    def __refit_primary(self, batch_name: str, parsed: Dict[str, dict],
+                        candidates: List[dict]) -> Optional[dict]:
+        """
+        主候选的结构装不下大部分文件时,按拟合度在所有候选(含零票旁听)里重选:
+        拟合度需比主候选高出 0.2 以上才换,并列时优先年份与文件名一致的。选不出更好的维持原判。
+        """
+        primary = candidates[0]
+        if primary.get("type") != MediaType.TV.value or len(candidates) < 2:
+            return None
+        eps = [v for v in parsed.values() if not v["marker"] and v.get("episode") is not None]
+        if len(eps) < 3:
+            return None
+        base_fit = self.__structure_fit(primary, parsed)
+        if base_fit >= 0.8:
+            return None
+        years = Counter(v.get("year") for v in eps if v.get("year"))
+        file_year = years.most_common(1)[0][0] if years else None
+        best, best_key = None, None
+        for cand in candidates[1:5]:
+            if cand.get("type") != MediaType.TV.value:
+                continue
+            fit = self.__structure_fit(cand, parsed)
+            key = (fit, 1 if file_year and str(cand.get("year")) == str(file_year) else 0, cand.get("votes") or 0)
+            if best_key is None or key > best_key:
+                best, best_key = cand, key
+        if best and best_key[0] >= base_fit + 0.2:
+            logger.warn(f"批次 {batch_name}:候选 {primary['title']} ({primary['year']}) 结构拟合度仅 "
+                        f"{base_fit:.0%},换选 {best['title']} ({best['year']}) TMDB {best['tmdbid']}"
+                        f"(拟合度 {best_key[0]:.0%})")
+            return best
+        if base_fit < 0.5:
+            logger.warn(f"批次 {batch_name}:主候选 {primary['title']} ({primary['year']}) 结构拟合度仅 "
+                        f"{base_fit:.0%},且无更优候选,映射可能大量跳过")
+        return None
+
     # ---- 编号体系(剧集组)解析 ----
 
     def __group_map(self) -> Dict[str, str]:
@@ -1463,8 +1535,11 @@ class CloudLinkMonitor(_PluginBase):
         return result
 
     @staticmethod
-    def __pick_season_group(groups: list) -> Optional[dict]:
-        """在 TMDB 剧集组里挑"按季"类型(原播出/制作/电视 顺序,且 ≥2 季)的最完整一个;DVD/绝对/故事线/流媒体顺序不选"""
+    def __pick_season_group(groups: list, min_episodes: int = 0) -> Optional[dict]:
+        """
+        在 TMDB 剧集组里挑"按季"类型(原播出/制作/电视 顺序,且 ≥2 季)的最完整一个;DVD/绝对/故事线/流媒体顺序不选。
+        min_episodes:组的总集数必须达到该值(默认正规季集数)——社区维护的残缺篇章分组(如凡人修仙传各种 124–176 集的分组)不选。
+        """
         best, best_key = None, None
         for g in groups or []:
             if not isinstance(g, dict):
@@ -1476,6 +1551,8 @@ class CloudLinkMonitor(_PluginBase):
             except (TypeError, ValueError):
                 continue
             if gtype not in (1, 6, 7) or gcount < 2:
+                continue
+            if min_episodes and ecount < min_episodes:
                 continue
             name = str(g.get("name") or "").strip()
             # 名字就叫 Seasons/Season 的组最常见也最规范,其次名字含 season/季,再按集数多少
@@ -1541,8 +1618,8 @@ class CloudLinkMonitor(_PluginBase):
             release_season = max(release_season, int(MetaInfo(title=batch_name).begin_season or 0))
         except Exception:
             pass
-        if len(regular) == 1 and (self.__season_size(default_struct, regular[0]) >= 40 or release_season >= 2):
-            pick = self.__pick_season_group(groups)
+        if len(regular) == 1 and release_season >= 2:
+            pick = self.__pick_season_group(groups, min_episodes=self.__season_size(default_struct, regular[0]))
             if pick:
                 gid = str(pick.get("id"))
                 if self._series_groups is None:
