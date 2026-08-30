@@ -83,7 +83,7 @@ MANIFEST_PROMPT = (
     "3) 同一 (s,e) 不能分配给多个文件。\n"
     "4) 集号按文件名中的编号/标题与结构中集标题的语义对应来确定,不要只靠顺序猜。\n"
     "5) 体积明显小于正片的文件(几十 MB)通常是预告/特典/短篇,不是正片。\n"
-    "6) 若该批次实际属于备选作品列表中的另一部作品,在 series_tmdbid 中给出其 TMDB id;否则给出当前作品 id。\n"
+    "6) 若该批次实际属于备选作品列表中的另一部作品,在 series_tmdbid 中给出其 TMDB id,并按该作品自身的编号给出 s/e(单季作品季号为 1;不确定则省略 s/e);否则给出当前作品 id。\n"
     "只输出一个紧凑的 JSON 对象(不要换行缩进、不要解释):"
     "{\"series_tmdbid\": 数字, \"items\": [{\"i\": 文件编号, \"c\": \"main|special|extra|other\", \"s\": 季号, \"e\": 集号}, ...]}"
     " s/e 只在 main/special 且确定时给出。每个文件编号都必须且只能出现一次。"
@@ -117,7 +117,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -183,6 +183,7 @@ class CloudLinkMonitor(_PluginBase):
     _group_notified = None
     _emby_sync_pending = None
     _recheck_pending = None
+    _batch_retry_counts = None
     # 通知型目录(无目的目录)的云端探测与已通知集合
     _notify_probe_interval = 180
     _notify_fp = None
@@ -285,6 +286,7 @@ class CloudLinkMonitor(_PluginBase):
         self._group_notified = set()
         self._emby_sync_pending = set()
         self._recheck_pending = set()
+        self._batch_retry_counts = {}
         self._notify_fp = {}
         self._notify_last = 0
         self._notified = self.get_data("notified_files") or {}
@@ -977,6 +979,17 @@ class CloudLinkMonitor(_PluginBase):
                 remaining = settle - min(now - seen[1], max(0.0, now - newest))
                 return {"pending": True, "retry_in": int(max(5, min(settle, remaining)) + 3)}
             mf = self.__build_manifest(batch_root, listing, digest)
+            if mf.get("pending"):
+                # 瞬时问题(如 TMDB 结构拉取失败):按"未稳定"语义跳过并自动复查,不落到逐文件回退,不持久化;
+                # 复查间隔按次数翻倍(上限 6 小时),避免持续异常时空转或反复调用 LLM
+                if self._batch_retry_counts is None:
+                    self._batch_retry_counts = {}
+                n = self._batch_retry_counts.get(key, 0) + 1
+                self._batch_retry_counts[key] = n
+                mf["retry_in"] = min(int(mf.get("retry_in") or 900) * (2 ** min(n - 1, 4)), 6 * 3600)
+                return mf
+            if self._batch_retry_counts:
+                self._batch_retry_counts.pop(key, None)
             mf["attempts"] = (int(old.get("attempts") or 0) if old and old.get("digest") == digest else 0) + 1
             if self._order_override:
                 # preview API with test switches (ignore_emby/force_default): never persist or reuse
@@ -997,6 +1010,7 @@ class CloudLinkMonitor(_PluginBase):
 
         def _run():
             acquired = False
+            rescheduled = False
             try:
                 if self._busy:
                     acquired = self._busy.acquire(timeout=600)
@@ -1016,6 +1030,7 @@ class CloudLinkMonitor(_PluginBase):
                 mf = self.__get_manifest(batch_root)
                 if mf and mf.get("pending"):
                     logger.info(f"批次 {batch_root.name} 复查时仍未稳定,{mf.get('retry_in')} 秒后再查")
+                    rescheduled = True
                     self.__schedule_batch_recheck(batch_root, mon_path, int(mf.get("retry_in") or 60))
                     return
                 logger.info(f"批次 {batch_root.name} 已稳定,开始整理 {len(files)} 个文件")
@@ -1024,7 +1039,9 @@ class CloudLinkMonitor(_PluginBase):
             except Exception as e:
                 logger.error(f"批次 {batch_root.name} 复查失败:{str(e)} - {traceback.format_exc()}")
             finally:
-                self._recheck_pending.discard(key)
+                if not rescheduled:
+                    # 已重新排程时 key 属于新 timer,不能摘(否则去重失效、复查链累积)
+                    self._recheck_pending.discard(key)
                 if acquired:
                     self._busy.release()
 
@@ -1228,8 +1245,17 @@ class CloudLinkMonitor(_PluginBase):
                                "episode": meta.begin_episode,
                                "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
             batch_name = batch_root.stem if batch_root.is_file() else batch_root.name
+
+            def transient_retry(reason: str, retry_in: int = 900) -> dict:
+                logger.warn(f"批次 {batch_name}:{reason},{retry_in // 60} 分钟后自动复查(不回退逐文件识别)")
+                return {"pending": True, "retry_in": retry_in, "digest": digest, "time": time.time(),
+                        "status": "retry", "files": {}, "media": None, "how": "", "unknown": []}
+
             candidates = self.__series_candidates(batch_name, parsed)
             if not candidates:
+                if (self._batch_retry_counts or {}).get(str(batch_root), 0) < 2:
+                    # 一个候选都没有多半是识别服务瞬断:先按瞬时问题复查两轮,仍无候选才回退逐文件识别
+                    return transient_retry("无法识别所属作品(可能为识别服务瞬断)")
                 logger.warn(f"批次 {batch_name}:无法识别所属作品,回退逐文件识别")
                 mf["status"] = "no_media"
                 return mf
@@ -1242,13 +1268,30 @@ class CloudLinkMonitor(_PluginBase):
                 _order = self.__resolve_order(series, parsed, batch_name)
                 return _order, self.__tmdb_structure(series, _order)
 
+            def attach_binding(series: dict):
+                # 绑定必须在解析编号体系之前挂上:__resolve_order 会读 binding 里的剧集组
+                if series.get("direct"):
+                    # 出处已确定:只用直通记录本身,不再按标签匹配其他记录(防绑到同作品另一季的记录)
+                    b = self.__binding_from_direct(series)
+                else:
+                    b = self.__history_binding(batch_name, parsed, series)
+                if b:
+                    series["binding"] = b
+                    logger.info(f"批次 {batch_name}:绑定下载记录 S{b['season']:02d} "
+                                f"{b.get('episodes_text') or ''} <= {b['torrent_name'][:80]}")
+
+            attach_binding(primary)
+            if primary["type"] == MediaType.TV.value and not primary.get("direct")                     and not (set(primary.get("src") or []) - {"下载记录", "订阅"}):
+                # 候选只剩下载记录/订阅提示(文件名/目录名/同名搜索识别全部失败,多半是识别服务瞬断):
+                # 孤证不能用来确定性整理,挂起复查等识别恢复
+                return transient_retry("作品识别没有文件名/目录名证据,仅剩下载记录/订阅提示(识别服务可能异常)", 1800)
             order, structure = build_structure(primary)
-            binding = self.__history_binding(batch_name, parsed, primary)
-            if binding:
-                primary["binding"] = binding
-                logger.info(f"批次 {batch_name}:绑定下载记录 S{binding['season']:02d} "
-                            f"{binding.get('episodes_text') or ''} <= {binding['torrent_name'][:80]}")
+            if primary["type"] == MediaType.TV.value and not structure.get("seasons"):
+                return transient_retry(f"TMDB {primary['tmdbid']}《{primary['title']}》季集结构为空(获取失败或未收录)")
             files = self.__rule_mapping(batch_name, parsed, primary, structure)
+            if files is None and primary.get("direct") and primary.pop("bind_unresolved", False):
+                # 出处确定但记录判定的季集在结构里还找不到(TMDB 未更新):等它更新,不交 LLM 也不逐文件
+                return transient_retry(f"下载记录判定的季集在 TMDB {primary['tmdbid']} 结构中尚无落点(可能未更新)", 1800)
             how = "规则"
             if files is None:
                 if not self._llm_classify:
@@ -1262,16 +1305,36 @@ class CloudLinkMonitor(_PluginBase):
                     alt_id = int(result.get("series_tmdbid")) if result.get("series_tmdbid") is not None else None
                 except (TypeError, ValueError):
                     alt_id = None
+                retry = None
+                switch_ignored = False
+                if alt_id and alt_id != primary["tmdbid"] and primary.get("direct"):
+                    logger.warn(f"批次 {batch_name}:批次出处已由下载记录直通确定,忽略 LLM 的换选建议 TMDB {alt_id}")
+                    alt_id = primary["tmdbid"]
+                    switch_ignored = True
                 if alt_id and alt_id != primary["tmdbid"]:
                     alt = next((c for c in candidates if c["tmdbid"] == alt_id), None)
                     if alt:
                         logger.info(f"批次 {batch_name}:LLM 判定属于备选作品 {alt['title']} ({alt['year']}) TMDB {alt_id}")
                         primary = alt
+                        attach_binding(primary)
                         order, structure = build_structure(primary)
+                        if primary["type"] == MediaType.TV.value and not structure.get("seasons"):
+                            return transient_retry(f"备选作品 TMDB {primary['tmdbid']} 季集结构为空(获取失败或未收录)")
+                        # 换选后先在新作品的结构下重跑确定性规则映射,能唯一落点就不依赖 LLM 给的季集
+                        retry = self.__rule_mapping(batch_name, parsed, primary, structure)
                     else:
                         logger.warn(f"批次 {batch_name}:LLM 给出的作品 TMDB {alt_id} 不在候选内,忽略")
-                files = self.__validate_mapping(result.get("items") or [], rels, parsed, primary, structure)
-                how = "LLM"
+                if retry is not None:
+                    files, how = retry, "LLM换选+规则"
+                else:
+                    files = self.__validate_mapping(result.get("items") or [], rels, parsed, primary, structure)
+                    how = "LLM"
+                    if switch_ignored:
+                        # LLM 是按"另一部作品"的编号在给 s/e,对本作品全部不可信(多落点/特典场景换算校验拦不住)
+                        for _rel, _entry in list(files.items()):
+                            if _entry.get("c") in ("main", "special"):
+                                files[_rel] = {"c": "unknown", "how": "llm",
+                                               "note": "LLM 判定属其他作品,其季集不采信"}
             mf["files"] = files
             mf["media"] = {k: primary.get(k) for k in ("tmdbid", "title", "year", "type")}
             mf["media"]["episode_group"] = order.get("group_id")
@@ -1319,8 +1382,68 @@ class CloudLinkMonitor(_PluginBase):
                 mediainfo = self.mediaChain.recognize_media(meta=meta)
         except Exception as e:
             logger.debug(f"识别 {title} 失败:{str(e)}")
-        self._recog_cache[title] = mediainfo or False
+        if mediainfo:
+            self._recog_cache[title] = mediainfo
+        # 识别失败不缓存:失败可能是识别服务瞬断,缓存会把中断固化到插件重载为止
         return mediainfo
+
+    @staticmethod
+    def __binding_from_direct(series: dict) -> Optional[dict]:
+        """把候选上的直通下载记录转成绑定(需要有明确单一季号;电影/无季记录只用于作品选择)"""
+        d = series.get("direct")
+        if not d or d.get("season") is None:
+            return None
+        eps = sorted(d.get("episodes") or [])
+        return {"season": int(d["season"]), "episodes": set(eps), "group": d.get("group"),
+                "torrent_name": d.get("torrent_name") or "",
+                "episodes_text": (f"E{eps[0]:02d}" if len(eps) == 1 else f"E{eps[0]:02d}-E{eps[-1]:02d}") if eps else "整季"}
+
+    def __direct_binding(self, batch_name: str) -> Optional[dict]:
+        """
+        批次名(单文件为去扩展名的文件名)与近 14 天下载记录的种子名归一化后完全一致时,
+        文件的出处就是该次下载:作品/季/集/剧集组直接采用 MP 下载时已判定并通知过用户的结果。
+        115 离线下载的单文件名就是种子名;文件夹种子的内部目录名可能与站点标题不同,不匹配则自然回落到投票。
+        同名种子对应多个作品时不直通。
+        """
+        def norm(s):
+            s = str(s or "").translate(FULLWIDTH_TABLE).lower()
+            return re.sub(r"\s+", " ", s).strip()
+
+        key = norm(batch_name)
+        if len(key) < 10:
+            return None
+        try:
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+            hits = [his for his in (self.downloadhis.list_by_page(1, 200) or [])
+                    if str(getattr(his, "media_source", "") or "") == "themoviedb"
+                    and getattr(his, "media_id", None)
+                    and str(getattr(his, "date", "") or "") >= cutoff
+                    and norm(getattr(his, "torrent_name", "")) == key]
+            if not hits:
+                return None
+            if len({str(h.media_id) for h in hits}) != 1:
+                logger.warn(f"批次 {batch_name}:多条同名下载记录属于不同作品,不直通绑定")
+                return None
+            his = hits[0]
+            try:
+                tmdbid = int(his.media_id)
+            except (TypeError, ValueError):
+                return None
+            if not tmdbid:
+                return None
+            seasons = re.findall(r"S(\d{1,2})", str(his.seasons or ""), re.IGNORECASE)
+            eps = set()
+            for m in EP_RANGE_RE.finditer(str(his.episodes or "")):
+                a = int(m.group(1))
+                b = int(m.group(2)) if m.group(2) else a
+                eps.update(range(min(a, b), max(a, b) + 1))
+            return {"tmdbid": tmdbid, "title": his.title, "year": his.year, "type": str(his.type or ""),
+                    "season": int(seasons[0]) if len(set(seasons)) == 1 else None,
+                    "episodes": eps, "group": getattr(his, "episode_group", None) or None,
+                    "torrent_name": str(his.torrent_name or "")}
+        except Exception as e:
+            logger.debug(f"下载记录直通匹配失败:{str(e)}")
+            return None
 
     def __history_binding(self, batch_name: str, parsed: Dict[str, dict], primary: dict) -> Optional[dict]:
         """
@@ -1415,6 +1538,17 @@ class CloudLinkMonitor(_PluginBase):
             return getattr(mi, "episode_groups", None) or (getattr(mi, "tmdb_info", None) or {}).get(
                 "episode_groups", {}).get("results")
 
+        direct = self.__direct_binding(batch_name)
+        if direct:
+            # 用记录的标题+年份识别一次,给直通候选补上 TMDB 剧集组列表(合并季选组需要)
+            mi = self.__recognize_title(f"{direct['title']} {direct['year']}"
+                                        if direct.get("year") else str(direct.get("title") or ""))
+            d_groups = mi_groups(mi) if mi and getattr(mi, "tmdb_id", None) == direct["tmdbid"] else None
+            add(direct["tmdbid"], direct["title"], direct["year"], direct["type"], 100, "下载记录直通",
+                hint=f"下载记录直通 {direct['torrent_name']}", groups=d_groups, episode_group=direct.get("group"))
+            dc = votes.get(str(direct["tmdbid"]))
+            if dc:
+                dc["direct"] = direct
         names = Counter((v["name"], v.get("year")) for v in parsed.values() if v["name"] and not v["marker"])
         for (name, year), cnt in names.most_common(6):
             mi = self.__recognize_title(f"{name} {year}" if year else name)
@@ -1458,6 +1592,11 @@ class CloudLinkMonitor(_PluginBase):
         except Exception as e:
             logger.debug(f"读取下载记录失败:{str(e)}")
         result = sorted(votes.values(), key=lambda c: -c["votes"])
+        dcand = next((c for c in result if c.get("direct")), None)
+        if dcand is not None and result[0] is not dcand:
+            # 出处确定的候选不参与票数竞争:再多的同名误识别票也不能盖过下载记录本身
+            result.remove(dcand)
+            result.insert(0, dcand)
         if result:
             logger.info("批次候选作品:" + "; ".join(
                 f"{c['title']} ({c['year']}) TMDB {c['tmdbid']} 票数 {c['votes']} [{'/'.join(c['src'])}]"
@@ -1468,11 +1607,14 @@ class CloudLinkMonitor(_PluginBase):
 
     def __structure_fit(self, series: dict, parsed: Dict[str, dict]) -> float:
         """
-        文件名解析出的季集在该作品默认季集结构下有落点的比例(0~1)。电影/无集号文件不计入。
+        文件名解析出的集号在该作品默认季集结构下有落点的比例(0~1)。电影/无集号文件不计入;
+        显式季号文件也不计入:合并季默认结构下按季落点依赖候选的 ref(groups),不同候选来源的
+        groups 可得性不同,拟合度会失真(DBD 2nd Season 案例),此类消歧交给年份投票与 LLM。
         """
         if series.get("type") != MediaType.TV.value:
             return 0.0
-        cands = [v for v in parsed.values() if not v["marker"] and v.get("episode") is not None]
+        cands = [v for v in parsed.values()
+                 if not v["marker"] and v.get("episode") is not None and v.get("season") is None]
         if not cands:
             return 0.0
         structure = self.__tmdb_structure(series, {"group_id": None})
@@ -1489,13 +1631,22 @@ class CloudLinkMonitor(_PluginBase):
                         candidates: List[dict]) -> Optional[dict]:
         """
         主候选的结构装不下大部分文件时,按拟合度在所有候选(含零票旁听)里重选:
-        拟合度需比主候选高出 0.2 以上才换,并列时优先年份与文件名一致的。选不出更好的维持原判。
+        ≥3 个带集号文件时拟合度需比主候选高出 0.2 以上才换;1-2 个文件时证据少,仅当主候选完全装不下、
+        备选完全装得下且有佐证(年份一致或下载记录/订阅背书)才换。有直通绑定的批次出处明确,不换选。
         """
         primary = candidates[0]
+        if primary.get("direct"):
+            return None
         if primary.get("type") != MediaType.TV.value or len(candidates) < 2:
             return None
-        eps = [v for v in parsed.values() if not v["marker"] and v.get("episode") is not None]
-        if len(eps) < 3:
+        eps = [v for v in parsed.values()
+               if not v["marker"] and v.get("episode") is not None and v.get("season") is None]
+        if not eps:
+            # 全部文件带显式季号(或无集号):拟合度信号不适用,不做换选
+            return None
+        small = len(eps) < 3
+        if not self.__tmdb_structure(primary, {"group_id": None}).get("seasons"):
+            # 主候选结构为空(获取失败/未收录):无法区分"装不下"与"拉不到",不做换选
             return None
         base_fit = self.__structure_fit(primary, parsed)
         if base_fit >= 0.8:
@@ -1510,7 +1661,15 @@ class CloudLinkMonitor(_PluginBase):
             key = (fit, 1 if file_year and str(cand.get("year")) == str(file_year) else 0, cand.get("votes") or 0)
             if best_key is None or key > best_key:
                 best, best_key = cand, key
-        if best and best_key[0] >= base_fit + 0.2:
+        if best and small:
+            # 佐证必须与本批文件相关:年份一致,或备选的下载记录经"标签+集号覆盖"匹配上本批;泛泛的"最近下过"不算
+            corroborated = (file_year and str(best.get("year")) == str(file_year)) or \
+                bool(self.__history_binding(batch_name, parsed, best))
+            if base_fit <= 0 and best_key[0] >= 1.0 and corroborated:
+                logger.warn(f"批次 {batch_name}:主候选 {primary['title']} ({primary['year']}) 完全装不下该批文件,"
+                            f"换选有佐证的 {best['title']} ({best['year']}) TMDB {best['tmdbid']}(拟合度 100%)")
+                return best
+        elif best and best_key[0] >= base_fit + 0.2:
             logger.warn(f"批次 {batch_name}:候选 {primary['title']} ({primary['year']}) 结构拟合度仅 "
                         f"{base_fit:.0%},换选 {best['title']} ({best['year']}) TMDB {best['tmdbid']}"
                         f"(拟合度 {best_key[0]:.0%})")
@@ -1618,6 +1777,10 @@ class CloudLinkMonitor(_PluginBase):
             release_season = max(release_season, int(MetaInfo(title=batch_name).begin_season or 0))
         except Exception:
             pass
+        try:
+            release_season = max(release_season, int((series.get("binding") or {}).get("season") or 0))
+        except (TypeError, ValueError):
+            pass
         if len(regular) == 1 and release_season >= 2:
             pick = self.__pick_season_group(groups, min_episodes=self.__season_size(default_struct, regular[0]))
             if pick:
@@ -1722,7 +1885,9 @@ class CloudLinkMonitor(_PluginBase):
                     logger.debug(f"获取按季参考剧集组失败:{str(e)}")
         struct = {"seasons": seasons, "offsets": offsets, "order": order, "merged": merged,
                   "ref": ref, "ref_name": ref_name}
-        self._tmdb_struct_cache[cache_key] = (time.time(), dict(struct))
+        if seasons:
+            # 空结构不缓存:获取失败时缓存会把"拉不到"固化成"装不下"(结构中毒 1 小时)
+            self._tmdb_struct_cache[cache_key] = (time.time(), dict(struct))
         return struct
 
     @staticmethod
@@ -1800,37 +1965,74 @@ class CloudLinkMonitor(_PluginBase):
         except Exception:
             batch_season = None
         binding = primary.get("binding") or {}
+        # 记录集号在它自己的编号空间里(默认序/订阅剧集组):与目标编号体系的组不同时集号不可直用,季号仍可参考
+        bind_eps_ok = str(binding.get("group") or "") == str((structure.get("order") or {}).get("group_id") or "")
         if binding.get("season") is not None:
-            # 下载记录(订阅匹配时判定的季)优先于目录名;与文件名显式季号冲突时不猜,交给 LLM
+            # 下载记录(订阅匹配时判定的季)优先于目录名;显式季号不同时先看换算是否收敛(绝对集数写成 S01 的包)
             for v in cands.values():
                 if v["season"] is not None and int(v["season"]) != int(binding["season"]):
-                    logger.warn(f"批次 {batch_name}:文件名季号 S{v['season']} 与下载记录 S{binding['season']} 冲突,交给 LLM 判断")
-                    return None
+                    t = self.__season_ep_to_target(structure, int(v["season"]), int(v["episode"])) \
+                        if v.get("episode") is not None else None
+                    if not t or t[0] != int(binding["season"]) or \
+                            (bind_eps_ok and binding.get("episodes") and t[1] not in binding["episodes"]):
+                        logger.warn(f"批次 {batch_name}:文件名季号 S{v['season']} 与下载记录 "
+                                    f"S{binding['season']} 冲突,交给 LLM 判断")
+                        return None
             batch_season = int(binding["season"])
         regular = sorted(structure.get("offsets") or {})
+        b_eps = sorted(binding.get("episodes") or []) if bind_eps_ok else []
+        bind_target = None
+        if len(cands) == 1 and len(b_eps) == 1 and batch_season is not None:
+            bind_target = self.__season_ep_to_target(structure, int(batch_season), b_eps[0])
+            if bind_target is None:
+                # 记录判定的集号在目标结构无落点(TMDB 未更新/编号差异):不猜,不静默退化为文件名换算
+                logger.warn(f"批次 {batch_name}:下载记录判定 S{int(batch_season):02d}E{b_eps[0]:02d} "
+                            f"在目标结构无落点,规则映射放弃")
+                primary["bind_unresolved"] = True
+                return None
+        via_binding = set()
         mapping: Dict[str, Tuple[int, int]] = {}
         for rel, v in cands.items():
-            if v["episode"] is None:
+            from_binding = False
+            if v["episode"] is not None:
+                ep = int(v["episode"])
+            elif bind_target:
+                # 单文件批次文件名无集号:用下载记录的集号(出处数据,非猜测)
+                ep = b_eps[0]
+                from_binding = True
+            else:
                 return None
-            ep = int(v["episode"])
             if v["season"] is not None:
                 target = self.__season_ep_to_target(structure, int(v["season"]), ep)
             else:
                 options = self.__plausible_targets(structure, None, ep) or set()
                 target = None
                 if batch_season is not None:
-                    # 目录名给出季号:优先该季直接对应,其次按季换算(合并季目标);集号超出该季范围则按绝对集数处理
+                    # 季号证据(下载记录/目录名):优先该季直接对应,其次按季换算(合并季目标)
                     if (batch_season, ep) in options:
                         target = (batch_season, ep)
                     else:
                         target = self.__season_ep_to_target(structure, int(batch_season), ep)
                 if target is None:
-                    if len(options) == 1:
+                    # 唯一落点兜底不得违背已知的季号证据(如绑定 S02 却唯一落到 S01 绝对位):宁可交给 LLM
+                    if len(options) == 1 and (batch_season is None or next(iter(options))[0] == int(batch_season)):
                         target = next(iter(options))
-                    elif len(regular) == 1 and (regular[0], ep) in options:
+                    elif batch_season is None and len(regular) == 1 and (regular[0], ep) in options:
                         target = (regular[0], ep)
+            if bind_target and target and target != bind_target:
+                # 文件名换算与下载记录判定不一致(订阅集数偏移识别词/TMDB 编号差异):以出处记录为准
+                logger.warn(f"批次 {batch_name}:{Path(rel).name} 文件名换算落点 S{target[0]:02d}E{target[1]:02d} "
+                            f"与下载记录判定 S{bind_target[0]:02d}E{bind_target[1]:02d} 不一致,以下载记录为准")
+                target = bind_target
+                from_binding = True
+            if target is None and bind_target:
+                # 文件名集号(发布组原始编号)在目标结构无落点:以下载记录判定的季集为准
+                target = bind_target
+                from_binding = True
             if not target:
                 return None
+            if from_binding:
+                via_binding.add(rel)
             mapping[rel] = target
         if len(set(mapping.values())) != len(mapping):
             return None
@@ -1840,7 +2042,9 @@ class CloudLinkMonitor(_PluginBase):
             return None
         for rel, (s, e) in mapping.items():
             note = None
-            if parsed[rel]["episode"] != e or (parsed[rel]["season"] is not None and parsed[rel]["season"] != s):
+            if rel in via_binding:
+                note = f"由下载记录 S{s:02d}E{e:02d} 确定"
+            elif parsed[rel]["episode"] != e or (parsed[rel]["season"] is not None and parsed[rel]["season"] != s):
                 note = f"由文件名 S{parsed[rel]['season'] or '?'}E{parsed[rel]['episode']} 换算"
             files[rel] = {"c": "main", "s": int(s), "e": int(e), "how": "rule"}
             if note:
