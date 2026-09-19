@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import inspect
 import json
+import os
 import re
 import shutil
 import socket
@@ -48,12 +49,42 @@ lock = threading.Lock()
 SP_DIR_RE = re.compile(
     r"(?:^|[\s_\-.\[\(（【])(bonus(?:es)?|extras?|specials?|sps?|nc(?:op|ed)?|pv|cm|menus?|previews?|trailers?|"
     r"scans?|cds?|bk|booklet|gallery|fonts?|samples?|others?)(?:$|[\s_\-.\]\)）】])"
-    r"|特典|番外|映像|特報|预告|扫图|画集|原声|音乐", re.IGNORECASE)
+    r"|特典|番外|映像|特報|预告|扫图|画集|原声|音乐"
+    # 花絮/彩蛋紧跟在"含/附/带/加/+/及/和/与/、"后面(某剧.S01.全40集.含花絮.2160p、第1季(含花絮)、全12期+花絮)
+    # 说的是正片目录附带了花絮,不是花絮目录
+    r"|(?<![含附带加+＋&及和与、絮蛋])(?<![含附带加+＋&及和与、]\s)(?:花絮|彩蛋)", re.IGNORECASE)
+# 容易撞上作品名的附加目录名(Interview with the Vampire、幕后之王、The Interview):只认整个目录名就是它
+# (Plex/Emby 附加内容目录约定:Featurettes、Behind The Scenes、Deleted Scenes、Interviews);可用 +/&/、/和 连写(特辑+花絮)
+_SP_DIR_WORDS = (r"featurettes?|interviews?|behind[\s_.-]?the[\s_.-]?scenes|deleted[\s_.-]?scenes|"
+                 r"幕后(?:花絮|特辑)?|特辑|(?:附加|追加)?(?:花絮|彩蛋)|"
+                 r"ng|pv|sps?|mv|cm|nc(?:op|ed)|extras?|bonus(?:es)?|specials?|making(?:[\s_.-]?of)?|"
+                 r"访谈|采访|专访|发布会|路演|首映礼?|物料|预告片?|番外|特典")
+SP_DIR_NAME_RE = re.compile(
+    r"[\[(（【]?\s*(?:" + _SP_DIR_WORDS + r")(?:\s*[+＋&、和与及]\s*(?:" + _SP_DIR_WORDS + r"))*"
+    r"\s*\d*\s*[\])）】]?", re.IGNORECASE)
 # 文件名特典标记(无条件按特典处理;SP/OVA/OAD/番外 这类有内容的特别篇不在此列,由批次清单按 TMDB 第 0 季映射)
 SP_FILE_RE = re.compile(
     r"(?:^|[\s_\-.\[\(（【])(NC(?:OP|ED)\d*|MENU\d*|PV\d*|CM\d*|(?:WEB\s*|THEATER\s*)?PREVIEW\s*\d*|TEASER\d*|"
     r"TRAILER\d*|COMMENTARY|DOCUMENTARY\d*|SAMPLE|INTERVIEW|MAKING|DIGEST|LOGO|TV\s*SPOT|CREDITLESS|PROMO|"
-    r"映像特典|特典映像|予告編?|次回予告|预告|預告|宣传|特報|特报)(?:$|[\s_\-.\]\)）】\(（#])", re.IGNORECASE)
+    r"映像特典|特典映像|予告編?|次回予告|预告片?|預告片?|宣传|特報|特报)(?:$|[\s_\-.\]\)）】\(（#])", re.IGNORECASE)
+# 文件名里明确是特典的词:LLM 判为特典/杂项时采信(即使文件名带集号,如 "S01E02 Featurette"、"第5集 花絮")
+EXTRA_HINT_RE = re.compile(r"花絮|彩蛋|预告片|預告片|Featurettes?|Deleted[\s_.-]?Scenes?|Behind[\s_.-]?the[\s_.-]?Scenes"
+                           r"|(?<![A-Za-z])NC(?:OP|ED)\d*(?![A-Za-z])|Creditless", re.IGNORECASE)
+# 自定义识别词里声明的媒体类型(type=tv/movie/movies)、季号(s=N)与作品 id(词里写的 tmdbid=/doubanid=… 或插入的 [tmdbid=…])
+WORD_TYPE_RE = re.compile(r"[{\[;]\s*type\s*=\s*(tv|movies?|电视剧|电影)\b", re.IGNORECASE)
+WORD_SEASON_RE = re.compile(r"[{\[;]\s*s\s*=\s*\d")
+WORD_ID_RE = re.compile(r"(?:tmdb|douban|bangumi|anilist)(?:id)?\s*[=\-]\s*\d|media_id\s*=", re.IGNORECASE)
+# 文件/目录名里自带的 Emby/Plex 式 id 标签([tmdbid=…]、{tmdb-…}、[imdbid-tt…]):不是用户声明、不带类型,按标题识别前剥掉
+ID_TAG_RE = re.compile(r"[\[{(]\s*(?:tmdb|tvdb|imdb|douban|bangumi|anilist)(?:id)?\s*[=\-][^\]})]*[\]})]",
+                       re.IGNORECASE)
+
+
+def _extra_dir(part) -> bool:
+    """子目录名是特典/附加目录"""
+    part = str(part).strip()
+    return bool(SP_DIR_RE.search(part) or SP_DIR_NAME_RE.fullmatch(part))
+
+
 # 8 位十六进制 CRC(括号内)与「」『』集标题:MP 解析器会把 (08377E86) 当成 E86、把「レム」当成剧名
 CRC_RE = re.compile(r"[\(\[（【][0-9A-Fa-f]{8}[\)\]）】]")
 QUOTE_RE = re.compile(r"「[^」]*」|『[^』]*』")
@@ -66,6 +97,24 @@ EXPLICIT_SEASON_RE = re.compile(
 EP_RANGE_RE = re.compile(r"E(\d{1,4})(?:\s*-\s*E?(\d{1,4}))?", re.IGNORECASE)
 # 全角括号/方括号归一化(「凡人修仙传（2020）」的年份要能解析出来)
 FULLWIDTH_TABLE = str.maketrans({"（": "(", "）": ")", "【": "[", "】": "]", "［": "[", "］": "]", "｛": "{", "｝": "}"})
+# 剧名末尾的部数/序号:闯关东Ⅰ、闯关东1、闯关东II、庆余年第二部、Show Part 2(TMDB 标题通常不带)。
+# 空格后的英文罗马数字不去:MetaInfo 会把 "Rocky II" 规范成 "Rocky Ii",剩下能匹配的只有 Malcolm X 这类本名
+SEQ_SUFFIX_RE = re.compile(
+    r"(?:\s*(?P<roman>[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ])"
+    r"|(?<=[\u4e00-\u9fff])\s*(?:(?P<cjk_digit>[1-9１-９])|(?P<cjk_roman>IX|IV|VI{0,3}|I{1,3}|X))"
+    r"|\s+(?P<digit>[1-9])"
+    r"|\s*第\s*(?P<part_cn>[一二三四五六七八九十0-9]+)\s*部"
+    r"|\s+(?i:part)\.?\s*(?P<part_no>[0-9]{1,2}))\s*$")
+ROMAN_VALUES = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
+CN_NUMERALS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+# 来自本批文件自身的有效证据(可以定案);同名搜索/去序号识别是零票旁听,下载记录/订阅只是提示
+STRONG_SRCS = {"文件名", "目录名", "文件名(去序号)", "目录名(去序号)", "下载记录直通", "识别词"}
+# V3 旧整理兼容命令(chain.transfer)同步执行失败、任务留给持久化整理队列在后台接着做时的返回信息
+QUEUE_HANDOFF_MESSAGES = ("整理失败，请稍后重试", "整理结果确认失败，后台将自动重试")
+# 交给整理队列后等它结算的最长时间(队列失败重试间隔 30 秒起,多次重试后才判失败)
+HANDOFF_WAIT = 1800
+# 只说明"最近下过/订阅了"、与本批文件名无关的来源:这类候选不能当主候选,也不能被换选或 LLM 选中
+HINT_SRCS = {"下载记录", "订阅"}
 
 MANIFEST_PROMPT = (
     "你是媒体库整理助手。输入:一个发布目录名、其中全部视频文件的编号列表(含文件大小)、该作品在媒体库使用的"
@@ -117,7 +166,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.6.0"
+    plugin_version = "3.6.1"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -179,11 +228,16 @@ class CloudLinkMonitor(_PluginBase):
     _batch_list_cache = None
     # 作品编号体系(剧集组)持久化映射与进程内状态
     _series_groups = None
-    _order_override = None
+    # 预览 API 的测试开关/只读模式只作用于发起预览的线程,不影响同时在跑的对账/复查
+    _override_tls = threading.local()
     _group_notified = None
     _emby_sync_pending = None
     _recheck_pending = None
-    _batch_retry_counts = None
+    _recheck_timers = None
+    # 交给 MP 整理队列在后台接手的整理:{源路径: 上下文};结算后补做刮削/通知/strm
+    _handoffs = None
+    _handoff_timer = None
+    _words_sig = None
     # 通知型目录(无目的目录)的云端探测与已通知集合
     _notify_probe_interval = 180
     _notify_fp = None
@@ -194,6 +248,8 @@ class CloudLinkMonitor(_PluginBase):
     _manifests = None
     _batch_seen = None
     _recog_cache = None
+    # LLM 季集映射答案(输入完全相同就沿用,挂起批次复查时不重复调用)
+    _llm_cache = None
     _tmdb_struct_cache = None
     _emby_cache = None
     _manifest_lock = None
@@ -213,6 +269,14 @@ class CloudLinkMonitor(_PluginBase):
     _medias = {}
     # 退出事件
     _event = threading.Event()
+
+    @property
+    def _order_override(self) -> Optional[dict]:
+        return getattr(self._override_tls, "value", None)
+
+    @_order_override.setter
+    def _order_override(self, value: Optional[dict]):
+        self._override_tls.value = value
 
     def init_plugin(self, config: dict = None):
         self.transferhis = TransferHistoryOper()
@@ -278,7 +342,8 @@ class CloudLinkMonitor(_PluginBase):
         # 重置失败重试计数与快速探测指纹
         self._retry_counts = {}
         self._fast_fp = None
-        self._busy = threading.Lock()
+        # 锁对象跨重载保持不变:上一轮配置排下、正在运行的复查/对账还持有它们
+        self._busy = self._busy or threading.Lock()
         self._batch_list_cache = {}
         self._manifests = self.get_data("batch_manifest") or {}
         self._series_groups = self.get_data("series_groups") or {}
@@ -286,7 +351,9 @@ class CloudLinkMonitor(_PluginBase):
         self._group_notified = set()
         self._emby_sync_pending = set()
         self._recheck_pending = set()
-        self._batch_retry_counts = {}
+        # 不重置:紧接着的 stop_service 要取消上一轮配置排下的复查定时器;取消前先记下它们对应的批次,配置加载后重新挂上
+        self._recheck_timers = self._recheck_timers or {}
+        rearm = [ctx for ctx in (getattr(t, "clm_ctx", None) for t in list(self._recheck_timers.values())) if ctx]
         self._notify_fp = {}
         self._notify_last = 0
         self._notified = self.get_data("notified_files") or {}
@@ -295,7 +362,7 @@ class CloudLinkMonitor(_PluginBase):
         self._recog_cache = {}
         self._tmdb_struct_cache = {}
         self._emby_cache = {}
-        self._manifest_lock = threading.RLock()
+        self._manifest_lock = self._manifest_lock or threading.RLock()
 
         # 停止现有任务
         self.stop_service()
@@ -390,6 +457,9 @@ class CloudLinkMonitor(_PluginBase):
                             logger.error(f"{mon_path} 启动目云盘实时监控失败：{err_msg}")
                         self.systemmessage.put(f"{mon_path} 启动云盘实时监控失败：{err_msg}")
 
+            if self._enabled:
+                self.__rearm_rechecks(rearm)
+
             # 运行一次定时服务
             if self._onlyonce:
                 logger.info("云盘实时监控服务启动，立即运行一次")
@@ -471,18 +541,27 @@ class CloudLinkMonitor(_PluginBase):
         立即运行一次，全量同步目录中所有文件
         """
         logger.info("开始全量同步云盘实时监控目录 ...")
-        # 遍历所有监控目录
-        for mon_path in self._dirconf.keys():
-            logger.info(f"开始处理监控目录 {mon_path} ...")
-            media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
-            sub_files = SystemUtils.list_files(Path(mon_path), settings.RMT_SUBEXT)
-            logger.info(f"监控目录 {mon_path} 共发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
-            # 遍历目录下所有文件（先媒体后字幕，保证字幕改名与视频一致时目标目录已就绪）
-            for file_path in media_files + sub_files:
-                logger.info(f"开始处理文件 {file_path} ...")
-                self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True,
-                                   force_notify=True)
-            self.__save_notified()
+        # 手动运行:挂起中的批次(认不出作品/TMDB 瞬时故障)不等退避到期,立即重试一次
+        self.__release_retry_batches()
+        try:
+            # 遍历所有监控目录
+            for mon_path in list(self._dirconf.keys()):
+                try:
+                    logger.info(f"开始处理监控目录 {mon_path} ...")
+                    media_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
+                    sub_files = SystemUtils.list_files(Path(mon_path), settings.RMT_SUBEXT)
+                    logger.info(f"监控目录 {mon_path} 共发现 {len(media_files)} 个媒体文件、{len(sub_files)} 个字幕文件")
+                    # 遍历目录下所有文件（先媒体后字幕，保证字幕改名与视频一致时目标目录已就绪）
+                    for file_path in media_files + sub_files:
+                        logger.info(f"开始处理文件 {file_path} ...")
+                        self.__handle_file(event_path=str(file_path), mon_path=mon_path, from_reconcile=True,
+                                           force_notify=True)
+                    self.__save_notified()
+                except Exception as e:
+                    logger.error(f"全量同步监控目录 {mon_path} 出错:{str(e)} - {traceback.format_exc()}")
+        finally:
+            # 放行的挂起批次没被扫到(扫描中途出错)时,重新挂上复查,不能就此没有定时器
+            self.__rearm_rechecks([])
         logger.info("全量同步云盘实时监控目录完成！")
 
     def sync_reconcile(self):
@@ -490,7 +569,8 @@ class CloudLinkMonitor(_PluginBase):
         定时对账：强制刷新云端列表与挂载缓存后，扫描监控目录中未处理的媒体与字幕文件。
         仅处理配置了目的目录的监控目录；失败记录会有限次重试。
         """
-        if self._busy and not self._busy.acquire(blocking=False):
+        busy = self._busy
+        if busy and not busy.acquire(blocking=False):
             logger.info("上一轮对账仍在进行，跳过本轮")
             return
         try:
@@ -520,8 +600,9 @@ class CloudLinkMonitor(_PluginBase):
                     if batch_root is not None:
                         mf = self.__get_manifest(batch_root)
                         if mf and mf.get("pending"):
-                            logger.info(f"批次 {batch_root.name} 尚未稳定(文件仍在变化),本轮跳过 {len(group)} 个文件,"
-                                        f"{mf.get('retry_in')} 秒后自动复查")
+                            log = logger.debug if mf.get("cached") else logger.info
+                            log(f"批次 {batch_root.name} 暂缓整理({mf.get('reason') or '文件仍在变化'}),"
+                                f"本轮跳过 {len(group)} 个文件,{mf.get('retry_in')} 秒后自动复查")
                             self.__schedule_batch_recheck(batch_root, mon_path, int(mf.get("retry_in") or 60))
                             continue
                         group = self.__order_batch(mf, batch_root, group)
@@ -539,8 +620,8 @@ class CloudLinkMonitor(_PluginBase):
                     logger.error(f"清理整理残留失败：{str(e)}")
             logger.info("云盘目录定时对账完成")
         finally:
-            if self._busy:
-                self._busy.release()
+            if busy:
+                busy.release()
 
     def fast_probe(self):
         """
@@ -858,7 +939,7 @@ class CloudLinkMonitor(_PluginBase):
             rel = None
         sub_dirs = list(rel.parts[1:-1]) if rel and len(rel.parts) > 2 else []
         for part in sub_dirs:
-            if SP_DIR_RE.search(str(part)):
+            if _extra_dir(part):
                 return f"特典/附加目录({part})"
         stem = self.__clean_name(file_path.stem)
         if not re.search(r"S\d{1,2}E\d{1,3}", stem, re.IGNORECASE) and SP_FILE_RE.search(stem):
@@ -939,10 +1020,19 @@ class CloudLinkMonitor(_PluginBase):
         self._batch_list_cache[key] = (now, listing)
         return listing
 
+    def __listed(self, batch_root: Path, file_path: Path) -> bool:
+        """媒体文件在批次列举(可能是 60 秒内的缓存)里"""
+        try:
+            rel = str(Path(file_path).relative_to(batch_root)).replace("\\", "/")
+        except ValueError:
+            return True
+        return any(m[0] == rel for m in self.__batch_listing(batch_root)["media"])
+
     def __get_manifest(self, batch_root: Path) -> Optional[dict]:
         """
-        取批次清单:None=无法建立(回退逐文件识别);{"pending": True}=批次未稳定(文件仍在变化),本轮跳过。
-        清单按批次目录持久化;文件被搬走不重算,出现新文件才重建;建立失败按次数退避重试(10 分钟起,最长 6 小时)。
+        取批次清单:None=无法建立(回退逐文件识别);{"pending": True, "reason", "retry_in"}=暂缓整理,本轮跳过并复查
+        (文件仍在变化 / 认不出作品 / TMDB 瞬时故障)。清单按批次目录持久化;文件被搬走不重算,出现新文件才重建;
+        建立失败按次数退避重试(10 分钟起,最长 6 小时);挂起状态也落盘,退避未到期时只读状态不重算。
         """
         key = str(batch_root)
         listing = self.__batch_listing(batch_root)
@@ -957,65 +1047,170 @@ class CloudLinkMonitor(_PluginBase):
         with self._manifest_lock:
             if self._manifests is None:
                 self._manifests = {}
-            old = self._manifests.get(key)
-            if old:
-                if old.get("status") == "ok" and (old.get("digest") == digest
-                                                  or set(rels) <= set((old.get("files") or {}).keys())):
+            # 带测试开关/只读的预览:不复用、不改动已有清单(既不读也不写)
+            old = None if self._order_override else self._manifests.get(key)
+            # 预览 API 强制重建:不沿用已有清单与退避;已有清单仍是"重建失败时继续暂缓"的依据
+            force = bool(getattr(self._override_tls, "rebuild", False))
+            if old and not force:
+                kept = self.__batch_rels(batch_root, rels)
+                old_files = old.get("files") or {}
+                # 只要本批会被整理的文件都在清单里(没有新文件)就沿用:不看原始 digest,
+                # 否则过滤词放开后,建清单时被过滤掉的文件会没有条目而落到逐文件识别
+                if old.get("status") == "ok" and set(kept) <= set(old_files.keys()):
+                    if old.get("digest") != digest and kept and all(
+                            (old_files.get(r) or {}).get("c") in ("extra", "other")
+                            or (old_files.get(r) or {}).get("llm_c") for r in kept):
+                        # 正片已搬走、只剩特典/杂项/LLM 判为特典但带集号的文件:保持清单常新,不让 7 天清理后
+                        # 只凭残留文件重建(残留的特典会被当成正片映射)
+                        if now - float(old.get("time") or 0) > 86400:
+                            old["time"] = now
+                            self.__save_manifests()
                     return old
                 if old.get("status") in ("failed", "no_media") and old.get("digest") == digest:
                     attempts = int(old.get("attempts") or 1)
                     if now - (old.get("time") or 0) < (600 if attempts <= 1 else 1200 if attempts == 2 else 6 * 3600):
                         return None
+            retry_old = old if (old and old.get("status") == "retry" and old.get("digest") == digest) else None
+            if retry_old and not self._order_override and not force \
+                    and now < float(retry_old.get("next_retry") or 0):
+                # 挂起中的批次退避未到期:只读状态,不重算(不重复识别/调 TMDB/刷日志)
+                return {"pending": True, "cached": True, "reason": retry_old.get("reason"),
+                        "retry_in": int(float(retry_old["next_retry"]) - now) + 1}
             if self._batch_seen is None:
                 self._batch_seen = {}
+            if retry_old and key not in self._batch_seen:
+                # 挂起中的批次文件集合没变(同一 digest):稳定窗口从上次建立时算起,重启/重载后手动运行不必再等一轮
+                self._batch_seen[key] = (digest, float(retry_old.get("time") or now))
             seen = self._batch_seen.get(key)
             if not seen or seen[0] != digest:
                 seen = (digest, now)
-                self._batch_seen[key] = seen
-            settle = max(0, int(self._batch_settle or 0))
+                if not self._order_override:
+                    # 预览不改动实时批次的稳定窗口起点
+                    self._batch_seen[key] = seen
+            # 预览 API 不等稳定窗口(只作用于预览线程,不改共享配置)
+            settle = 0 if getattr(self._override_tls, "no_settle", False) else max(0, int(self._batch_settle or 0))
             newest = max(m[2] for m in media)
             if settle and (now - seen[1] < settle or now - newest < settle):
                 # 返回剩余稳定时间,调用方据此安排复查(未来时间戳的文件按"刚出现"处理)
                 remaining = settle - min(now - seen[1], max(0.0, now - newest))
-                return {"pending": True, "retry_in": int(max(5, min(settle, remaining)) + 3)}
+                return {"pending": True, "reason": "文件仍在变化", "retry_in": int(max(5, min(settle, remaining)) + 3)}
             mf = self.__build_manifest(batch_root, listing, digest)
+            if old and old.get("status") in ("ok", "retry") and not mf.get("pending") and mf.get("status") == "failed":
+                # 已有清单(定案或挂起中)的批次重建失败(LLM 无结果/出错、建立清单异常):继续暂缓,不回退逐文件识别
+                # (挂起的、待人工的文件恰恰是不能逐文件猜的);沿用挂起原因与类型,连续轮数、退避与通知照常累计
+                prev = old if old.get("status") == "retry" else {}
+                logger.warn(f"批次 {batch_root.stem if batch_root.is_file() else batch_root.name} 重建清单失败"
+                            f"(LLM 无结果/出错),保持暂缓,不回退逐文件识别")
+                mf = {"pending": True, "retry_in": 1800, "tv": prev.get("tv", True),
+                      "kind": prev.get("kind") or "transient",
+                      "reason": prev.get("reason") or "重建批次清单失败(LLM 无结果或出错)"}
             if mf.get("pending"):
-                # 瞬时问题(如 TMDB 结构拉取失败):按"未稳定"语义跳过并自动复查,不落到逐文件回退,不持久化;
-                # 复查间隔按次数翻倍(上限 6 小时),避免持续异常时空转或反复调用 LLM
-                if self._batch_retry_counts is None:
-                    self._batch_retry_counts = {}
-                n = self._batch_retry_counts.get(key, 0) + 1
-                self._batch_retry_counts[key] = n
-                mf["retry_in"] = min(int(mf.get("retry_in") or 900) * (2 ** min(n - 1, 4)), 6 * 3600)
+                # 暂缓整理(认不出作品/TMDB 瞬时故障):跳过并复查,不回退逐文件识别;
+                # 状态落盘(重启不丢、对账不重算),复查间隔按同类原因的连续次数翻倍,上限 6 小时
+                kind = mf.get("kind") or "transient"
+                same_kind = bool(retry_old) and (retry_old.get("kind") or "transient") == kind
+                n = (int(retry_old.get("rounds") or 0) if same_kind else 0) + 1
+                retry_in = min(int(mf.get("retry_in") or 900) * (2 ** min(n - 1, 4)), 6 * 3600)
+                mf["retry_in"] = retry_in
+                name = batch_root.stem if batch_root.is_file() else batch_root.name
+                logger.warn(f"批次 {name} 暂缓整理:{mf.get('reason')}(第 {n} 次),{retry_in // 60} 分钟后自动复查")
+                if self._order_override:
+                    return mf
+                notified = bool(same_kind and retry_old.get("notified"))
+                # 需要人处理的原因(认不出作品/分不清同名作品/识别词问题)连续 3 次、其他原因(TMDB 结构拉不到/下载记录的季集
+                # 还没收录)连续 5 次才通知,每种情况只通知一次;通知关着时不记"已通知",打开后下一轮还会补发
+                threshold = 3 if kind in ("no_evidence", "ambiguous", "asserted_unresolved") else 5
+                if not notified and self._notify and n >= threshold:
+                    word_type = "tv" if mf.get("tv", True) else "movie"
+                    if kind == "no_evidence":
+                        title = f"「{name}」无法确认所属作品,已暂停整理"
+                        text = (f"原因:{mf.get('reason')}\n"
+                                f"处理:在 MoviePilot「设定 → 词表 → 自定义识别词」添加映射"
+                                f"(如「文件里的剧名 => {{[tmdbid=TMDB 上的 id;type={word_type}]}}」,"
+                                f"剧集写 type=tv、电影写 type=movie),再在插件里点「立即运行一次」。\n"
+                                f"若只是 TMDB 网络故障,恢复后会自动继续(插件最长每 6 小时重试一次)")
+                    elif kind == "asserted_unresolved":
+                        title = f"「{name}」的自定义识别词没有生效,已暂停整理"
+                        text = (f"原因:{mf.get('reason')}\n"
+                                f"请检查识别词写法(「文件里的剧名 => {{[tmdbid=TMDB 上的 id;type={word_type}]}}」),"
+                                f"改好后在插件里点「立即运行一次」;若只是 TMDB 暂时不可用,恢复后会自动继续")
+                    else:
+                        title = f"「{name}」连续 {n} 次暂缓整理"
+                        text = (f"原因:{mf.get('reason')}\n"
+                                f"TMDB 网络故障或数据更新后会自动继续(插件最长每 6 小时重试一次);"
+                                f"长期如此请检查 TMDB 上该作品的季集信息")
+                    try:
+                        if kind == "ambiguous":
+                            text += (f"\n处理:在「自定义识别词」添加「文件里的剧名 => {{[tmdbid=正确的 id;type={word_type}]}}」,"
+                                     f"再点「立即运行一次」")
+                        self.post_message(mtype=NotificationType.Manual, title=title, text=text)
+                        notified = True
+                    except Exception as e:
+                        # 通知失败不能拖垮对账(本轮状态照常落盘,下一轮再补发)
+                        logger.warn(f"批次 {name} 暂缓通知发送失败:{str(e)}")
+                self._manifests[key] = {"digest": digest, "time": now, "status": "retry", "files": {},
+                                        "media": None, "how": "", "unknown": [], "rounds": n,
+                                        "next_retry": now + retry_in, "reason": mf.get("reason"),
+                                        "kind": kind, "notified": notified, "tv": mf.get("tv", True)}
+                self.__save_manifests()
                 return mf
-            if self._batch_retry_counts:
-                self._batch_retry_counts.pop(key, None)
             mf["attempts"] = (int(old.get("attempts") or 0) if old and old.get("digest") == digest else 0) + 1
             if self._order_override:
-                # preview API with test switches (ignore_emby/force_default): never persist or reuse
-                self._manifests.pop(key, None)
+                # 预览 API 的测试开关/只读预览:不落盘、不复用、不动已有清单
+                pass
             else:
                 self._manifests[key] = mf
                 self.__save_manifests()
             return mf if mf.get("status") == "ok" else None
+
+    def __release_retry_batches(self):
+        """手动全量运行:挂起中的批次不等退避到期,下一次取清单时立即重算"""
+        if self._manifest_lock is None:
+            self._manifest_lock = threading.RLock()
+        with self._manifest_lock:
+            released = 0
+            for key, entry in (self._manifests or {}).items():
+                if isinstance(entry, dict) and entry.get("status") == "retry":
+                    entry["next_retry"] = 0
+                    # 手动运行后仍挂起的批次再通知一次(可能刚加了识别词但没生效)
+                    entry["notified"] = False
+                    released += 1
+                    # 已排队的长间隔复查作废,之后按这次重算的结果重新排
+                    timer = (self._recheck_timers or {}).pop(key, None)
+                    if timer:
+                        timer.cancel()
+                    if self._recheck_pending:
+                        self._recheck_pending.discard(key)
+            if released:
+                logger.info(f"手动运行:{released} 个暂缓中的批次立即重试")
 
     def __schedule_batch_recheck(self, batch_root: Path, mon_path: str, delay: int):
         """批次未稳定时,在稳定窗口过后自动复查该批次(同一批次只挂一个复查),不必等下一次定时对账"""
         key = str(batch_root)
         if self._recheck_pending is None:
             self._recheck_pending = set()
+        due = time.time() + max(5, int(delay))
         if key in self._recheck_pending:
-            return
+            prev = (self._recheck_timers or {}).get(key)
+            # 已排的复查比这次要求的晚得多(挂起中的长退避,批次里又来了新文件):换成更早的,否则去重
+            if prev is None or prev is threading.current_thread() or getattr(prev, "clm_due", 0) <= due + 5:
+                return
         self._recheck_pending.add(key)
+        busy = self._busy
 
         def _run():
             acquired = False
             rescheduled = False
             try:
-                if self._busy:
-                    acquired = self._busy.acquire(timeout=600)
+                if busy:
+                    acquired = busy.acquire(timeout=600)
                     if not acquired:
-                        logger.warn(f"批次 {batch_root.name} 复查等待对账锁超时,留待下次对账")
+                        if (self._recheck_timers or {}).get(key) is threading.current_thread():
+                            # 对账/别的复查一直占着锁:过会儿再查,不能就此没有定时器
+                            self._recheck_pending.discard(key)
+                            rescheduled = True
+                            logger.warn(f"批次 {batch_root.name} 复查等待对账锁超时,5 分钟后再查")
+                            self.__schedule_batch_recheck(batch_root, mon_path, 300)
                         return
                 self._recheck_pending.discard(key)
                 if not batch_root.exists() or self._dirconf.get(mon_path) is None:
@@ -1029,7 +1224,8 @@ class CloudLinkMonitor(_PluginBase):
                     return
                 mf = self.__get_manifest(batch_root)
                 if mf and mf.get("pending"):
-                    logger.info(f"批次 {batch_root.name} 复查时仍未稳定,{mf.get('retry_in')} 秒后再查")
+                    logger.info(f"批次 {batch_root.name} 复查时仍暂缓({mf.get('reason') or '文件仍在变化'}),"
+                                f"{mf.get('retry_in')} 秒后再查")
                     rescheduled = True
                     self.__schedule_batch_recheck(batch_root, mon_path, int(mf.get("retry_in") or 60))
                     return
@@ -1039,15 +1235,89 @@ class CloudLinkMonitor(_PluginBase):
             except Exception as e:
                 logger.error(f"批次 {batch_root.name} 复查失败:{str(e)} - {traceback.format_exc()}")
             finally:
-                if not rescheduled:
-                    # 已重新排程时 key 属于新 timer,不能摘(否则去重失效、复查链累积)
+                # 运行期间有新文件又排了新的复查时,去重键归新 timer 所有,不能摘(否则会被再次覆盖成无人引用的孤儿)
+                owner = (self._recheck_timers or {}).get(key)
+                if not rescheduled and (owner is None or owner is threading.current_thread()):
                     self._recheck_pending.discard(key)
+                    if owner is not None:
+                        self._recheck_timers.pop(key, None)
                 if acquired:
-                    self._busy.release()
+                    busy.release()
 
         timer = threading.Timer(max(5, int(delay)), _run)
         timer.daemon = True
+        timer.clm_ctx = (batch_root, mon_path)
+        timer.clm_due = due
+        if self._recheck_timers is None:
+            self._recheck_timers = {}
+        prev = self._recheck_timers.get(key)
+        if prev is not None and prev is not threading.current_thread():
+            prev.cancel()
+        self._recheck_timers[key] = timer
         timer.start()
+
+    def __rearm_rechecks(self, contexts: list):
+        """
+        重新挂上复查:持久化的挂起批次(重启/重载后内存里的定时器都没了,没配定时对账时会一直搁着),
+        以及同一实例重载前已排队的复查(stop_service 刚取消的)。到点后由清单状态决定整理还是继续等。
+        """
+        todo = {}
+        for batch_root, mon_path in contexts or []:
+            todo[str(batch_root)] = (mon_path, 60)
+        now = time.time()
+        due_count = 0
+        for key, entry in list((self._manifests or {}).items()):
+            if key in todo or not isinstance(entry, dict) or entry.get("status") != "retry":
+                continue
+            mon_path = self.__monitor_of_batch(key)
+            if not mon_path:
+                continue
+            wait = int(float(entry.get("next_retry") or 0) - now)
+            if wait < 60:
+                # 已到期的错开排,避免重启后一齐抢对账锁
+                wait = 60 + 15 * due_count
+                due_count += 1
+            todo[key] = (mon_path, wait)
+        rearmed = 0
+        for key, (mon_path, wait) in todo.items():
+            if self._dirconf.get(mon_path) is None:
+                continue
+            self.__schedule_batch_recheck(Path(key), mon_path, wait)
+            rearmed += 1
+        if rearmed:
+            logger.info(f"已重新挂上 {rearmed} 个批次的复查(挂起中/等待稳定)")
+
+    def __monitor_of_batch(self, key: str) -> Optional[str]:
+        """批次(监控目录下的第一级条目)所属的整理型监控目录;不是第一级条目或不在任何整理型监控目录下时为 None"""
+        try:
+            parent = Path(os.path.normpath(key)).parent
+        except Exception:
+            return None
+        for mon_path, target in (self._dirconf or {}).items():
+            if target is not None and parent == Path(os.path.normpath(mon_path)):
+                return mon_path
+        return None
+
+    def __cancel_rechecks(self):
+        """停用/重载插件时取消排队中的批次复查(最长 6 小时后才触发,不能让旧配置的定时器事后再整理)"""
+        for timer in list((self._recheck_timers or {}).values()):
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._recheck_timers = {}
+        if self._recheck_pending:
+            self._recheck_pending.clear()
+        if self._handoff_timer:
+            try:
+                self._handoff_timer.cancel()
+            except Exception:
+                pass
+            self._handoff_timer = None
+        if self._handoffs:
+            logger.warn(f"插件停止时还有 {len(self._handoffs)} 个交给 MP 整理队列的文件未结算,"
+                        f"其 strm 由 Strm 助手的全量对账补上")
+            self._handoffs = {}
 
     # region 通知型监控目录:最小 QPS 的变动探测与对账
 
@@ -1219,48 +1489,134 @@ class CloudLinkMonitor(_PluginBase):
 
     def __build_manifest(self, batch_root: Path, listing: dict, digest: str) -> dict:
         """候选作品投票 -> 编号体系(剧集组)解析 -> 季集结构 -> 规则映射(干净批次免 LLM)/LLM 映射 -> 确定性校验"""
-        media = listing["media"]
+        # __handle_file 在读清单之前就会丢弃的文件(回收站/隐藏、过滤关键字、整理屏蔽词)不属于批次内容:
+        # 不投票、不参与映射与规整度判断,也不挡"纯特典批次"判定
+        keep = set(self.__batch_rels(batch_root, [m[0] for m in listing["media"]]))
+        media = [m for m in listing["media"] if m[0] in keep]
         rels = [m[0] for m in media]
+        dropped = len(listing["media"]) - len(media)
         mf = {"digest": digest, "time": time.time(), "status": "failed", "files": {}, "media": None,
               "how": "", "unknown": []}
+        # 自定义识别词变了:按标题缓存的识别结果作废(否则改了词后还拿旧结果)
+        try:
+            words_sig = hashlib.md5(json.dumps(self.systemconfig.get(SystemConfigKey.CustomIdentifiers) or [],
+                                               ensure_ascii=False).encode("utf-8")).hexdigest()
+        except Exception:
+            words_sig = None
+        if words_sig != self._words_sig:
+            self._recog_cache = {}
+            self._words_sig = words_sig
         try:
             parsed: Dict[str, dict] = {}
             for rel, size, _ in media:
                 p = Path(rel)
                 cleaned = self.__clean_name(p.stem) or p.stem
                 meta = MetaInfo(title=cleaned)
+                # 自定义识别词直接指定了作品 id(「错误剧名 => {[tmdbid=…;type=tv]}」):剩下的"剧名"只是替换后的残渣
+                # (如只剩年份 2012),不能拿去识别;改按 id 计票。清洗后的名字套不上词时,再用原始文件名试一次(MP 自己
+                # 逐文件识别用的是原始文件名,按原文写的词也要认)
+                ident = self.__word_identity(meta)
+                if not ident["source"] and p.stem != cleaned:
+                    raw = self.__word_identity(MetaInfo(title=p.stem))
+                    if raw["source"] or (raw["season"] and not ident["season"]):
+                        ident = raw
+                asserted_id = ident["tmdbid"]
+                asserted_season = ident["season"]
                 marker = None
                 for part in p.parts[:-1]:
-                    if SP_DIR_RE.search(str(part)):
+                    if _extra_dir(part):
                         marker = f"目录 {part}"
                         break
                 if not marker and not re.search(r"S\d{1,2}E\d{1,3}", cleaned, re.IGNORECASE) \
                         and SP_FILE_RE.search(cleaned):
                     marker = "文件名标记"
                 season = meta.begin_season
-                if season is not None and not EXPLICIT_SEASON_RE.search(cleaned):
-                    # 解析器凭空给出的季号(如 "[4th - 08]" -> S01E08)不可信,按未知处理,交给下载记录/目录名/LLM
+                if season is not None and not EXPLICIT_SEASON_RE.search(cleaned) and not asserted_season:
+                    # 解析器凭空给出的季号(如 "[4th - 08]" -> S01E08)不可信,按未知处理,交给下载记录/目录名/LLM;
+                    # 识别词里写明的 s= 是用户声明,保留
                     season = None
-                parsed[rel] = {"name": meta.name or "", "year": meta.year, "season": season,
-                               "episode": meta.begin_episode,
+                if asserted_season and ident.get("season_value") is not None:
+                    season = ident["season_value"]
+                parsed[rel] = {"name": "" if ident["source"] else (meta.name or ""), "year": meta.year, "season": season,
+                               "episode": meta.begin_episode, "tv": meta.type == MediaType.TV,
+                               "mt": ident["type"].value if ident["type"] else None,
+                               "tmdbid": asserted_id, "id_source": ident["source"],
+                               "season_declared": bool(asserted_season and ident.get("season_value") is not None),
                                "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
             batch_name = batch_root.stem if batch_root.is_file() else batch_root.name
 
-            def transient_retry(reason: str, retry_in: int = 900) -> dict:
-                logger.warn(f"批次 {batch_name}:{reason},{retry_in // 60} 分钟后自动复查(不回退逐文件识别)")
-                return {"pending": True, "retry_in": retry_in, "digest": digest, "time": time.time(),
-                        "status": "retry", "files": {}, "media": None, "how": "", "unknown": []}
+            plain = [v for v in parsed.values() if not v["marker"]]
+            batch_tv = bool(plain) and 2 * sum(1 for v in plain if v.get("tv")) > len(plain)
+
+            def transient_retry(reason: str, retry_in: int = 900, kind: str = "transient") -> dict:
+                # 日志、退避与通知由 __get_manifest 按实际复查间隔统一处理;tv 用于通知里给出 type=tv/movie 的写法
+                return {"pending": True, "retry_in": retry_in, "reason": reason, "kind": kind, "tv": batch_tv}
+
+            if all(v["marker"] for v in parsed.values()):
+                # 全是特典/附加(NCOP/PV/CM、扫图/特典目录等)或会被过滤的文件:规则映射对它们一律跳过,
+                # 与属于哪部作品无关,不必识别作品(认不出也不该挂起、通知)
+                mf["files"] = {rel: {"c": "extra", "how": "rule", "note": v["marker"]} for rel, v in parsed.items()}
+                mf["how"] = "规则"
+                mf["status"] = "ok"
+                logger.info(f"批次清单[规则] {batch_name}:没有可整理的正片"
+                            f"({len(parsed)} 个特典/附加" + (f",{dropped} 个会被过滤" if dropped else "") + "),跳过")
+                return mf
 
             candidates = self.__series_candidates(batch_name, parsed)
-            if not candidates:
-                if (self._batch_retry_counts or {}).get(str(batch_root), 0) < 2:
-                    # 一个候选都没有多半是识别服务瞬断:先按瞬时问题复查两轮,仍无候选才回退逐文件识别
-                    return transient_retry("无法识别所属作品(可能为识别服务瞬断)")
-                logger.warn(f"批次 {batch_name}:无法识别所属作品,回退逐文件识别")
-                mf["status"] = "no_media"
-                return mf
+            # 识别词问题:没写 type=(TMDB 电影和剧集的 id 各自编号,不能猜)、用了非 TMDB 的 id、或 id 查不到
+            untyped = sorted({v["tmdbid"] for v in plain if v.get("tmdbid") and not v.get("mt")})
+            other_src = sorted({str(v.get("id_source")) for v in plain
+                                if v.get("id_source") and v.get("id_source") != MediaSource.TMDB.value})
+            unresolved = sorted({v["tmdbid"] for v in plain if v.get("tmdbid") and v.get("mt") and not v.get("asserted_tmdb")})
+            if untyped:
+                return transient_retry(f"自定义识别词指定了 TMDB {untyped} 但没写 type=movie/tv"
+                                       f"(TMDB 电影与剧集的 id 各自编号,不能猜),请补上", 1800, kind="asserted_unresolved")
+            if other_src:
+                return transient_retry(f"自定义识别词用的是 {'/'.join(other_src)} 的 id,批次清单只认 TMDB,请改用 tmdbid",
+                                       1800, kind="asserted_unresolved")
+            if unresolved:
+                return transient_retry(f"自定义识别词指定的 TMDB {unresolved} 查询失败(id/type 可能写错,或 TMDB 暂时不可用)",
+                                       1800, kind="asserted_unresolved")
+            first_strong = next((c for c in candidates if set(c.get("src") or []) & STRONG_SRCS), None)
+            if first_strong is None:
+                # 本批文件名/目录名/直通记录都认不出作品(剩下的只有零票旁听或近期下载/订阅的其他作品):
+                # 不猜、不回退逐文件识别(逐文件同样认不出,只会刷失败并耗尽重试),挂起复查;
+                # 识别服务瞬断会自愈,真认不出会通知人工加识别词
+                why = "文件名和目录名在 TMDB 上都匹配不到作品"
+                if candidates:
+                    why += ",候选只有近期下载/订阅的其他作品或零票搜索结果,不作依据"
+                return transient_retry(why, 1800, kind="no_evidence")
+            if candidates[0] is not first_strong:
+                # 提示类候选(下载记录/订阅)不能靠票数当主候选:主候选必须有本批自身证据
+                candidates.remove(first_strong)
+                candidates.insert(0, first_strong)
             primary = candidates[0]
             primary = self.__refit_primary(batch_name, parsed, candidates) or primary
+            twin = primary.pop("ambiguous", None)
+            if twin:
+                return transient_retry(
+                    f"同名同年作品 TMDB {twin['tmdbid']}《{twin['title']}》({twin['year']}) 比 TMDB {primary['tmdbid']}"
+                    f"《{primary['title']}》({primary['year']}) 更装得下本批集号(TMDB 集数未更新或另有同名作品),分不清,不猜",
+                    1800, kind="ambiguous")
+            year_counts = Counter(v.get("year") for v in plain if v.get("year"))
+            file_year = year_counts.most_common(1)[0][0] if year_counts else None
+            # 本批自带年份且与主候选一致:零票旁听作品不能推翻(LLM 换选同样适用)
+            year_locked = bool(file_year) and str(primary.get("year")) == str(file_year)
+            if primary.get("asserted") and plain:
+                # 识别词指定的作品类型与文件对不上(剧集 id 配无集号的文件,或电影 id 配带集号的文件):多半写错了 type。
+                # 剧集词里写明了季号(如特别篇 s=0)的无集号文件是用户有意为之,不算矛盾(映射时 LLM 不得改季)
+                has_eps = sum(1 for v in plain if v.get("episode") is not None)
+                undeclared = [v for v in plain if v.get("episode") is None and not v.get("season_declared")]
+                if primary["type"] == MediaType.TV.value and has_eps == 0 and undeclared:
+                    return transient_retry(
+                        f"自定义识别词指定的 TMDB {primary['tmdbid']}《{primary['title']}》是剧集,但本批文件都不带集号:"
+                        f"若这是电影,请把识别词改成 type=movie;若是该剧的特别篇/OVA,请给这些文件单独写识别词并写明季集"
+                        f"(如「文件里的标题 => {{[tmdbid={primary['tmdbid']};type=tv;s=0;e=集号]}}」)",
+                        1800, kind="asserted_unresolved")
+                if primary["type"] == MediaType.MOVIE.value and 2 * has_eps > len(plain):
+                    return transient_retry(
+                        f"自定义识别词指定的 TMDB {primary['tmdbid']}《{primary['title']}》是电影,但本批文件大多带集号:"
+                        f"若这是剧集,请把识别词改成 type=tv", 1800, kind="asserted_unresolved")
 
             def build_structure(series: dict):
                 if series["type"] != MediaType.TV.value:
@@ -1281,21 +1637,19 @@ class CloudLinkMonitor(_PluginBase):
                                 f"{b.get('episodes_text') or ''} <= {b['torrent_name'][:80]}")
 
             attach_binding(primary)
-            if primary["type"] == MediaType.TV.value and not primary.get("direct")                     and not (set(primary.get("src") or []) - {"下载记录", "订阅"}):
-                # 候选只剩下载记录/订阅提示(文件名/目录名/同名搜索识别全部失败,多半是识别服务瞬断):
-                # 孤证不能用来确定性整理,挂起复查等识别恢复
-                return transient_retry("作品识别没有文件名/目录名证据,仅剩下载记录/订阅提示(识别服务可能异常)", 1800)
             order, structure = build_structure(primary)
             if primary["type"] == MediaType.TV.value and not structure.get("seasons"):
                 return transient_retry(f"TMDB {primary['tmdbid']}《{primary['title']}》季集结构为空(获取失败或未收录)")
             files = self.__rule_mapping(batch_name, parsed, primary, structure)
             if files is None and primary.get("direct") and primary.pop("bind_unresolved", False):
                 # 出处确定但记录判定的季集在结构里还找不到(TMDB 未更新):等它更新,不交 LLM 也不逐文件
-                return transient_retry(f"下载记录判定的季集在 TMDB {primary['tmdbid']} 结构中尚无落点(可能未更新)", 1800)
+                return transient_retry(f"下载记录判定的季集在 TMDB {primary['tmdbid']} 结构中尚无落点(可能未更新)", 1800,
+                                       kind="bind_unresolved")
             how = "规则"
             if files is None:
-                if not self._llm_classify:
-                    logger.warn(f"批次 {batch_name}:命名不规整且未启用 LLM 批次清单,回退逐文件识别")
+                if not self._llm_classify or not (getattr(settings, "LLM_API_KEY", None)
+                                                  and getattr(settings, "LLM_MODEL", None)):
+                    logger.warn(f"批次 {batch_name}:命名不规整且未启用 LLM 批次清单(或系统未配置 LLM),回退逐文件识别")
                     mf["status"] = "no_media"
                     return mf
                 result = self.__llm_mapping(batch_name, rels, parsed, primary, candidates, structure)
@@ -1307,13 +1661,29 @@ class CloudLinkMonitor(_PluginBase):
                     alt_id = None
                 retry = None
                 switch_ignored = False
-                if alt_id and alt_id != primary["tmdbid"] and primary.get("direct"):
-                    logger.warn(f"批次 {batch_name}:批次出处已由下载记录直通确定,忽略 LLM 的换选建议 TMDB {alt_id}")
-                    alt_id = primary["tmdbid"]
-                    switch_ignored = True
                 if alt_id and alt_id != primary["tmdbid"]:
                     alt = next((c for c in candidates if c["tmdbid"] == alt_id), None)
-                    if alt:
+                    veto = None
+                    if primary.get("direct") or primary.get("asserted"):
+                        veto = f"批次出处已由{'下载记录直通' if primary.get('direct') else '自定义识别词'}确定"
+                    elif alt is None:
+                        veto = "该作品不在候选内"
+                    elif self.__hint_only(alt):
+                        veto = "该作品只来自近期下载/订阅提示"
+                    elif not self.__has_strong(alt) and file_year and str(alt.get("year")) != str(file_year):
+                        veto = f"本批年份是 {file_year},零票旁听的 {alt.get('year')} 年作品不采信"
+                    elif year_locked and not self.__has_strong(alt):
+                        veto = f"本批年份 {file_year} 与当前作品一致,零票旁听的作品不能推翻"
+                    elif batch_tv and alt.get("type") == MediaType.MOVIE.value:
+                        veto = "本批文件带集号,不换成电影"
+                    if veto:
+                        # 不换选;LLM 的季集是按那部作品编的,一并不采信。整批挂起复查(TMDB 更新/加识别词后能自愈),
+                        # 不存成"全部待人工"的定案清单(那样加了识别词、TMDB 更新都不会再重算)
+                        alt_name = f"《{alt['title']}》({alt['year']})" if alt else ""
+                        return transient_retry(f"LLM 判定属于 TMDB {alt_id}{alt_name},但{veto};"
+                                               f"当前作品《{primary['title']}》({primary['year']})的规则映射也落不下,不猜",
+                                               1800, kind="ambiguous")
+                    else:
                         logger.info(f"批次 {batch_name}:LLM 判定属于备选作品 {alt['title']} ({alt['year']}) TMDB {alt_id}")
                         primary = alt
                         attach_binding(primary)
@@ -1322,8 +1692,6 @@ class CloudLinkMonitor(_PluginBase):
                             return transient_retry(f"备选作品 TMDB {primary['tmdbid']} 季集结构为空(获取失败或未收录)")
                         # 换选后先在新作品的结构下重跑确定性规则映射,能唯一落点就不依赖 LLM 给的季集
                         retry = self.__rule_mapping(batch_name, parsed, primary, structure)
-                    else:
-                        logger.warn(f"批次 {batch_name}:LLM 给出的作品 TMDB {alt_id} 不在候选内,忽略")
                 if retry is not None:
                     files, how = retry, "LLM换选+规则"
                 else:
@@ -1335,6 +1703,11 @@ class CloudLinkMonitor(_PluginBase):
                             if _entry.get("c") in ("main", "special"):
                                 files[_rel] = {"c": "unknown", "how": "llm",
                                                "note": "LLM 判定属其他作品,其季集不采信"}
+            for _rel, _v in parsed.items():
+                # 文件自己的识别词指定了别的作品:不能按本批作品整理(一批里混了两部作品/直通记录与识别词冲突)
+                if _v.get("asserted_tmdb") and _v["asserted_tmdb"] != primary["tmdbid"] and not _v["marker"]:
+                    files[_rel] = {"c": "unknown", "how": "rule",
+                                   "note": f"识别词指定 TMDB {_v['asserted_tmdb']},与本批作品 TMDB {primary['tmdbid']} 不符"}
             mf["files"] = files
             mf["media"] = {k: primary.get(k) for k in ("tmdbid", "title", "year", "type")}
             mf["media"]["episode_group"] = order.get("group_id")
@@ -1360,7 +1733,7 @@ class CloudLinkMonitor(_PluginBase):
             if unknown:
                 detail = "; ".join(f"{Path(r).name}({files[r].get('note') or '?'})" for r in unknown[:20])
                 logger.warn(f"批次 {batch_name} 有 {len(unknown)} 个文件无法确定季集,已跳过待人工处理:{detail}")
-                if self._notify:
+                if self._notify and not self._order_override:
                     self.post_message(mtype=NotificationType.Manual,
                                       title=f"{primary['title']} 批次有 {len(unknown)} 个文件无法确定季集,已跳过",
                                       text="\n".join(Path(r).name for r in unknown[:15]))
@@ -1369,21 +1742,132 @@ class CloudLinkMonitor(_PluginBase):
             logger.error(f"建立批次清单失败 {batch_root}:{str(e)} - {traceback.format_exc()}")
             return mf
 
-    def __recognize_title(self, title: str):
-        """按标题原生识别(不触发辅助识别),进程内缓存"""
+    @staticmethod
+    def __strip_sequence(name: str) -> Tuple[str, Optional[int]]:
+        """
+        去掉剧名末尾的部数/序号(Ⅰ/Ⅱ、中文后的 1/2/II、空格后的 1-9、第X部、Part N),返回 (剧名, 序号);
+        没有可去的返回 ("", None);序号认不出时为 None
+        """
+        raw = (name or "").strip()
+        m = SEQ_SUFFIX_RE.search(raw)
+        if not m:
+            return "", None
+        base = raw[:m.start()].strip(" -_.·:：")
+        if len(base) < 2:
+            return "", None
+        g = m.groupdict()
+        num = None
+        if g.get("roman"):
+            num = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ".index(g["roman"]) + 1
+        elif g.get("cjk_digit") or g.get("digit") or g.get("part_no"):
+            num = int(g.get("cjk_digit") or g.get("digit") or g.get("part_no"))
+        elif g.get("cjk_roman"):
+            num = ROMAN_VALUES.get(g["cjk_roman"])
+        elif g.get("part_cn"):
+            num = int(g["part_cn"]) if g["part_cn"].isdigit() else CN_NUMERALS.get(g["part_cn"])
+        return base, num
+
+    @staticmethod
+    def __word_identity(meta) -> dict:
+        """
+        自定义识别词给文件指定的作品:{"source": 数据源(没有则 None), "tmdbid": TMDB id, "type": 词里声明的类型,
+        "season": 词里是否写了 s=, "season_value": 该季号}。类型只认词里明写的 type=,不用解析器猜的(TMDB 电影与剧集 id 各自编号)
+        """
+        ident = {"source": None, "tmdbid": None, "type": None, "season": False, "season_value": None}
+        words = [str(w) for w in (getattr(meta, "apply_words", None) or [])]
+        # 只写季号的词(「剧名2 => 剧名 {[s=2]}」)同样是用户对季的声明
+        if any(WORD_SEASON_RE.search(w) for w in words):
+            ident["season"] = True
+            ident["season_value"] = getattr(meta, "begin_season", None)
+        src = getattr(meta, "media_source", None)
+        src = str(getattr(src, "value", src) or "")
+        mid = getattr(meta, "media_id", None)
+        if not src or not mid:
+            return ident
+        if not any(WORD_ID_RE.search(w) for w in words):
+            # id 来自文件/目录名自带的 Emby/Plex 式标签,不是识别词:没有声明类型,按标题识别(MP 已从剧名里剥掉标签)
+            return ident
+        ident["source"] = src
+        if src == MediaSource.TMDB.value:
+            try:
+                ident["tmdbid"] = int(mid)
+            except (TypeError, ValueError):
+                ident["tmdbid"] = None
+        for w in words:
+            m = WORD_TYPE_RE.search(w)
+            if m:
+                ident["type"] = MediaType.MOVIE if m.group(1).lower() in ("movie", "movies", "电影") else MediaType.TV
+                break
+        return ident
+
+    @staticmethod
+    def __has_strong(c: dict) -> bool:
+        """候选有来自本批自身的证据(文件名/目录名/直通记录/识别词)"""
+        return bool(set(c.get("src") or []) & STRONG_SRCS)
+
+    def __batch_rels(self, batch_root: Path, rels: List[str]) -> List[str]:
+        """批次内会被整理的文件(去掉 __handle_file 读清单前就丢弃的:回收站/隐藏、过滤关键字、整理屏蔽词)"""
+        patterns = self.__exclude_patterns()
+        words = [w for w in (self.systemconfig.get(SystemConfigKey.TransferExcludeWords) or []) if w]
+        kept = []
+        for rel in rels:
+            full = str(batch_root) if batch_root.is_file() else f"{str(batch_root).rstrip('/')}/{rel}"
+            if any(x in full for x in ("/@Recycle/", "/#recycle/", "/.", "/@eaDir")) \
+                    or self.__match_any(patterns, full):
+                continue
+            hit = False
+            for w in words:
+                try:
+                    if re.search(r"%s" % w, full, re.IGNORECASE):
+                        hit = True
+                        break
+                except re.error:
+                    continue
+            if not hit:
+                kept.append(rel)
+        return kept
+
+    def __recognize_id(self, tmdbid: int, mtype: Optional[MediaType] = None):
+        """按 TMDB id 识别(自定义识别词指定的 id),进程内缓存;失败不缓存"""
         if self._recog_cache is None:
             self._recog_cache = {}
-        if title in self._recog_cache:
-            return self._recog_cache[title] or None
+        ckey = f"tmdb:{tmdbid}\x00{mtype.value if mtype else ''}"
+        if ckey in self._recog_cache:
+            return self._recog_cache[ckey]
+        mediainfo = None
+        try:
+            try:
+                mediainfo = self.mediaChain.recognize_media(mtype=mtype, media_source=MediaSource.TMDB,
+                                                            media_id=str(tmdbid))
+            except TypeError:
+                mediainfo = self.mediaChain.recognize_media(mtype=mtype, tmdbid=int(tmdbid))
+        except Exception as e:
+            logger.debug(f"按 TMDB id {tmdbid} 识别失败:{str(e)}")
+        if mediainfo:
+            self._recog_cache[ckey] = mediainfo
+        return mediainfo
+
+    @staticmethod
+    def __hint_only(c: dict) -> bool:
+        """候选只来自近期下载记录/订阅提示(与本批文件名无关,也不是出处确定的直通记录)"""
+        return not c.get("direct") and not (set(c.get("src") or []) - HINT_SRCS)
+
+    def __recognize_title(self, title: str, mtype: Optional[MediaType] = None):
+        """按标题原生识别(不触发辅助识别),进程内缓存;mtype 限定类型(带集号的文件按剧集识别,不认成同名电影)"""
+        if self._recog_cache is None:
+            self._recog_cache = {}
+        ckey = f"{title}\x00{mtype.value if mtype else ''}"
+        if ckey in self._recog_cache:
+            return self._recog_cache[ckey] or None
         mediainfo = None
         try:
             meta = MetaInfo(title=title)
-            if meta.name:
-                mediainfo = self.mediaChain.recognize_media(meta=meta)
+            if meta.name or getattr(meta, "media_id", None):
+                mediainfo = self.mediaChain.recognize_media(meta=meta, mtype=mtype)
         except Exception as e:
             logger.debug(f"识别 {title} 失败:{str(e)}")
         if mediainfo:
-            self._recog_cache[title] = mediainfo
+            self._recog_cache[ckey] = mediainfo
         # 识别失败不缓存:失败可能是识别服务瞬断,缓存会把中断固化到插件重载为止
         return mediainfo
 
@@ -1541,22 +2025,91 @@ class CloudLinkMonitor(_PluginBase):
         direct = self.__direct_binding(batch_name)
         if direct:
             # 用记录的标题+年份识别一次,给直通候选补上 TMDB 剧集组列表(合并季选组需要)
+            try:
+                d_type = MediaType(direct.get("type")) if direct.get("type") else None
+            except ValueError:
+                d_type = None
             mi = self.__recognize_title(f"{direct['title']} {direct['year']}"
-                                        if direct.get("year") else str(direct.get("title") or ""))
+                                        if direct.get("year") else str(direct.get("title") or ""),
+                                        d_type if d_type in (MediaType.TV, MediaType.MOVIE) else None)
             d_groups = mi_groups(mi) if mi and getattr(mi, "tmdb_id", None) == direct["tmdbid"] else None
             add(direct["tmdbid"], direct["title"], direct["year"], direct["type"], 100, "下载记录直通",
                 hint=f"下载记录直通 {direct['torrent_name']}", groups=d_groups, episode_group=direct.get("group"))
             dc = votes.get(str(direct["tmdbid"]))
             if dc:
                 dc["direct"] = direct
+        # 自定义识别词直接指定了 TMDB id(且写明了 type):用户的明确声明,按文件数计票,和直通记录一样不参与换选。
+        # 每个文件记下它被指定的作品(asserted_tmdb),映射后不属于本批作品的文件一律不整理
+        id_votes = Counter((v["tmdbid"], v["mt"]) for v in parsed.values()
+                           if v.get("tmdbid") and v.get("mt") and not v["marker"])
+        for (tid, mt), cnt in id_votes.most_common():
+            imi = self.__recognize_id(tid, MediaType(mt))
+            if not imi or not getattr(imi, "tmdb_id", None):
+                continue
+            for v in parsed.values():
+                if v.get("tmdbid") == tid and v.get("mt") == mt:
+                    v["asserted_tmdb"] = imi.tmdb_id
+            add(imi.tmdb_id, imi.title, imi.year, imi.type.value, cnt, "识别词", groups=mi_groups(imi))
+            if votes.get(str(imi.tmdb_id)):
+                votes[str(imi.tmdb_id)]["asserted"] = True
         names = Counter((v["name"], v.get("year")) for v in parsed.values() if v["name"] and not v["marker"])
+        years = Counter(v.get("year") for v in parsed.values() if v.get("year") and not v["marker"])
+        file_year = years.most_common(1)[0][0] if years else None
+        # 文件多数带集号(MetaInfo 判为剧集)时按剧集识别:单拿"剧名 年份"去识别会丢掉剧集上下文,可能认成同名电影
+        tv_names = Counter((v["name"], v.get("year")) for v in parsed.values()
+                           if v["name"] and not v["marker"] and v.get("tv"))
+        plain = [v for v in parsed.values() if not v["marker"]]
+        batch_type = MediaType.TV if plain and 2 * sum(1 for v in plain if v.get("tv")) > len(plain) else None
+
+        def recognize_stripped(name: str, year, weight: int, src: str, mtype: Optional[MediaType]):
+            """
+            发布方给剧名加了部数/序号(闯关东Ⅰ、闯关东1、第一部)而 TMDB 标题没有:去掉末尾序号再识别。
+            只有"第一部"且年份一致才计票:第二部及以后去掉序号会落到前作(或同年的另一部分),无年份时同名
+            作品无法区分,都只作零票旁听,不能单独定案。
+            """
+            base, num = self.__strip_sequence(name)
+            if not base or num != 1:
+                # 第二部及以后(或序号认不出)去掉序号会落到前作/另一部分:连零票旁听都不能加,否则可能被换选进前作
+                return
+            smi = self.__recognize_title(f"{base} {year}" if year else base, mtype)
+            if not smi or not getattr(smi, "tmdb_id", None):
+                return
+            if num == 1 and year and str(smi.year) == str(year):
+                add(smi.tmdb_id, smi.title, smi.year, smi.type.value, weight, f"{src}(去序号)", groups=mi_groups(smi))
+            else:
+                add(smi.tmdb_id, smi.title, smi.year, smi.type.value, 0, "去序号识别", groups=mi_groups(smi))
+
         for (name, year), cnt in names.most_common(6):
-            mi = self.__recognize_title(f"{name} {year}" if year else name)
+            n_type = MediaType.TV if 2 * tv_names.get((name, year), 0) > cnt else None
+            mi = self.__recognize_title(f"{name} {year}" if year else name, n_type)
             if mi and getattr(mi, "tmdb_id", None):
                 add(mi.tmdb_id, mi.title, mi.year, mi.type.value, cnt, "文件名", groups=mi_groups(mi))
-        mi = self.__recognize_title(self.__clean_name(batch_name) or batch_name)
+            else:
+                recognize_stripped(name, year, cnt, "文件名", n_type)
+        batch_clean = self.__clean_name(batch_name) or batch_name
+        try:
+            dident = self.__word_identity(MetaInfo(title=batch_clean))
+        except Exception:
+            dident = {"source": None}
+        mi = None
+        dtitle = ""
+        if dident.get("source"):
+            # 目录名套上了指定 id 的识别词:只认 TMDB 且写明 type 的,按声明的类型查(不用本批文件猜的类型)
+            if dident.get("tmdbid") and dident.get("type"):
+                mi = self.__recognize_id(dident["tmdbid"], dident["type"])
+        else:
+            # 目录名自带的 id 标签不是用户声明(也没有类型):剥掉后按标题识别,不让本批文件猜的类型决定去哪个库查 id
+            dtitle = re.sub(r"\s{2,}", " ", ID_TAG_RE.sub(" ", batch_clean)).strip()
+            mi = self.__recognize_title(dtitle, batch_type) if dtitle else None
         if mi and getattr(mi, "tmdb_id", None):
             add(mi.tmdb_id, mi.title, mi.year, mi.type.value, 3, "目录名", groups=mi_groups(mi))
+        elif dtitle:
+            # 目录名套上了识别词时,剩下的名字只是残渣,不拿去去序号识别
+            try:
+                dmeta = MetaInfo(title=dtitle)
+                recognize_stripped(dmeta.name or "", dmeta.year or file_year, 3, "目录名", batch_type)
+            except Exception as e:
+                logger.debug(f"目录名去序号识别失败:{str(e)}")
         # TMDB 同名搜索的其余结果零票旁听:供结构拟合度换选与 LLM 换选(同名不同年/动画与真人版并存的场景)
         try:
             if names:
@@ -1592,6 +2145,11 @@ class CloudLinkMonitor(_PluginBase):
         except Exception as e:
             logger.debug(f"读取下载记录失败:{str(e)}")
         result = sorted(votes.values(), key=lambda c: -c["votes"])
+        acand = next((c for c in result if c.get("asserted")), None)
+        if acand is not None and result[0] is not acand:
+            # 用户识别词指定的作品不参与票数竞争(直通记录仍排在它前面)
+            result.remove(acand)
+            result.insert(0, acand)
         dcand = next((c for c in result if c.get("direct")), None)
         if dcand is not None and result[0] is not dcand:
             # 出处确定的候选不参与票数竞争:再多的同名误识别票也不能盖过下载记录本身
@@ -1635,7 +2193,7 @@ class CloudLinkMonitor(_PluginBase):
         备选完全装得下且有佐证(年份一致或下载记录/订阅背书)才换。有直通绑定的批次出处明确,不换选。
         """
         primary = candidates[0]
-        if primary.get("direct"):
+        if primary.get("direct") or primary.get("asserted"):
             return None
         if primary.get("type") != MediaType.TV.value or len(candidates) < 2:
             return None
@@ -1651,11 +2209,20 @@ class CloudLinkMonitor(_PluginBase):
         base_fit = self.__structure_fit(primary, parsed)
         if base_fit >= 0.8:
             return None
-        years = Counter(v.get("year") for v in eps if v.get("year"))
+        # 年份取本批全部正片文件(不止无显式季号的):年份只写在 SxxExx 文件上时也要锁定
+        years = Counter(v.get("year") for v in parsed.values() if v.get("year") and not v["marker"])
         file_year = years.most_common(1)[0][0] if years else None
+        # 本批年份与主候选一致:主候选有本批自己的年份佐证,零票旁听不能只凭结构拟合度把它换掉——
+        # 年份不同的不考虑;同名同年的(同年两部同名作品,或主候选的集数 TMDB 还没更新全)分不清,整批挂起
+        year_locked = bool(file_year) and str(primary.get("year")) == str(file_year)
         best, best_key = None, None
-        for cand in candidates[1:5]:
+        # 只在与本批名字相关的候选里换选(同名搜索旁听与其他强证据);只有下载记录/订阅提示的候选
+        # 与本批无关,结构再合身也不选(长篇连载几乎装得下任何集号)
+        alts = [c for c in candidates[1:] if not self.__hint_only(c)][:4]
+        for cand in alts:
             if cand.get("type") != MediaType.TV.value:
+                continue
+            if year_locked and not self.__has_strong(cand) and str(cand.get("year")) != str(file_year):
                 continue
             fit = self.__structure_fit(cand, parsed)
             key = (fit, 1 if file_year and str(cand.get("year")) == str(file_year) else 0, cand.get("votes") or 0)
@@ -1666,10 +2233,16 @@ class CloudLinkMonitor(_PluginBase):
             corroborated = (file_year and str(best.get("year")) == str(file_year)) or \
                 bool(self.__history_binding(batch_name, parsed, best))
             if base_fit <= 0 and best_key[0] >= 1.0 and corroborated:
+                if year_locked and not self.__has_strong(best):
+                    primary["ambiguous"] = best
+                    return None
                 logger.warn(f"批次 {batch_name}:主候选 {primary['title']} ({primary['year']}) 完全装不下该批文件,"
                             f"换选有佐证的 {best['title']} ({best['year']}) TMDB {best['tmdbid']}(拟合度 100%)")
                 return best
         elif best and best_key[0] >= base_fit + 0.2:
+            if year_locked and not self.__has_strong(best):
+                primary["ambiguous"] = best
+                return None
             logger.warn(f"批次 {batch_name}:候选 {primary['title']} ({primary['year']}) 结构拟合度仅 "
                         f"{base_fit:.0%},换选 {best['title']} ({best['year']}) TMDB {best['tmdbid']}"
                         f"(拟合度 {best_key[0]:.0%})")
@@ -1783,6 +2356,9 @@ class CloudLinkMonitor(_PluginBase):
             pass
         if len(regular) == 1 and release_season >= 2:
             pick = self.__pick_season_group(groups, min_episodes=self.__season_size(default_struct, regular[0]))
+            if pick and self._order_override:
+                # 预览(测试开关/只读):只返回选择结果,不记录、不通知
+                return {"group_id": str(pick.get("id")), "name": pick.get("name"), "source": "自动(合并季)", "auto": True}
             if pick:
                 gid = str(pick.get("id"))
                 if self._series_groups is None:
@@ -1959,8 +2535,10 @@ class CloudLinkMonitor(_PluginBase):
         if len({v["pattern"] for v in cands.values()}) > 1 or len({v["name"] for v in cands.values()}) > 1:
             return None
         try:
-            batch_season = MetaInfo(title=self.__clean_name(batch_name) or batch_name).begin_season
-            if batch_season is not None and not EXPLICIT_SEASON_RE.search(self.__clean_name(batch_name) or batch_name):
+            bmeta = MetaInfo(title=self.__clean_name(batch_name) or batch_name)
+            batch_season = bmeta.begin_season
+            if batch_season is not None and not EXPLICIT_SEASON_RE.search(self.__clean_name(batch_name) or batch_name) \
+                    and not self.__word_identity(bmeta)["season"]:
                 batch_season = None
         except Exception:
             batch_season = None
@@ -2083,8 +2661,24 @@ class CloudLinkMonitor(_PluginBase):
                       candidates: List[dict], structure: dict) -> Optional[dict]:
         """一批一次:编号文件列表 + 目标编号体系季集结构 -> LLM 按编号输出分类与季集(输出极小,不会截断)"""
         listing = "\n".join(f"{i + 1}. {self.__fmt_size(parsed[r]['size'])} {r}" for i, r in enumerate(rels))
-        alts = [c for c in candidates if c["tmdbid"] != primary["tmdbid"]][:5]
-        alt_text = "; ".join(f"TMDB {c['tmdbid']} {c['title']} ({c['year']}) {c['type']}" for c in alts) or "无"
+        alts = [c for c in candidates if c["tmdbid"] != primary["tmdbid"] and not self.__hint_only(c)][:5]
+        def alt_desc(c: dict) -> str:
+            # 同名作品(动画/真人版、不同年份)只看标题分不清:附上各季集数
+            desc = f"TMDB {c['tmdbid']} {c['title']} ({c['year']}) {c['type']}"
+            if c.get("type") != MediaType.TV.value:
+                return desc
+            try:
+                st = self.__tmdb_structure(c, {"group_id": None})
+                sns = [sn for sn in sorted(st.get("seasons") or {}) if sn > 0]
+                if not sns:
+                    return desc
+                sizes = ", ".join(f"S{sn}={self.__season_size(st, sn)}集" for sn in sns[:8]) + (" …" if len(sns) > 8 else "")
+                return f"{desc} [{sizes}]"
+            except Exception as e:
+                logger.debug(f"备选作品 {c.get('tmdbid')} 结构获取失败:{str(e)}")
+                return desc
+
+        alt_text = "; ".join(alt_desc(c) for c in alts) or "无"
         hint = f"\n提示: {primary['hint']}" if primary.get("hint") else ""
         if primary.get("binding"):
             b = primary["binding"]
@@ -2093,6 +2687,17 @@ class CloudLinkMonitor(_PluginBase):
         user_msg = (f"发布目录名: {batch_name}\n当前作品: TMDB {primary['tmdbid']} {primary['title']} "
                     f"({primary['year']}) 类型:{primary['type']}{hint}\n文件列表(编号. 大小 文件名):\n{listing}\n\n"
                     f"季集结构:\n{self.__structure_text(structure)}\n\n备选作品(可能相关): {alt_text}")
+        # 输入(文件、候选、TMDB 结构、模型)完全相同就沿用上次的答案:挂起批次复查时不重复调用、结果也不随机翻转;
+        # 任何输入变化(TMDB 更新、换了候选/识别词、新文件)都会重新调用。预览 API 强制重建时重新调用
+        ckey = hashlib.md5("\x00".join([str(getattr(settings, "LLM_PROVIDER", "") or ""),
+                                        str(getattr(settings, "LLM_MODEL", "") or ""),
+                                        MANIFEST_PROMPT, user_msg]).encode("utf-8")).hexdigest()
+        if self._llm_cache is None:
+            self._llm_cache = {}
+        hit = self._llm_cache.get(ckey)
+        if hit and time.time() - hit[0] < 7 * 86400 and not getattr(self._override_tls, "rebuild", False):
+            logger.info(f"批次 {batch_name}:输入与上次相同,沿用上次的 LLM 季集映射(不重复调用)")
+            return json.loads(hit[1])
         logger.info(f"批次 {batch_name}:调用 LLM 建立季集映射({len(rels)} 个文件)...")
         t0 = time.time()
         text = self.__llm_invoke(MANIFEST_PROMPT, user_msg, timeout=300)
@@ -2103,6 +2708,13 @@ class CloudLinkMonitor(_PluginBase):
             logger.warn(f"LLM 批次清单返回非预期 JSON:{text[:200]}")
             return None
         logger.info(f"LLM 季集映射完成,耗时 {time.time() - t0:.1f}s,{len(data.get('items'))} 条")
+        try:
+            self._llm_cache[ckey] = (time.time(), json.dumps(data, ensure_ascii=False))
+            if len(self._llm_cache) > 200:
+                for k in sorted(self._llm_cache, key=lambda k: self._llm_cache[k][0])[:len(self._llm_cache) - 200]:
+                    self._llm_cache.pop(k, None)
+        except Exception as e:
+            logger.debug(f"缓存 LLM 答案失败:{str(e)}")
         return data
 
     def __llm_invoke(self, system_prompt: str, user_msg: str, timeout: int = 180) -> Optional[str]:
@@ -2228,6 +2840,12 @@ class CloudLinkMonitor(_PluginBase):
             if cls not in ("main", "special", "extra", "other"):
                 cls = "unknown"
             entry: Dict[str, Any] = {"c": cls, "how": "llm"}
+            if cls in ("extra", "other") and v.get("episode") is not None \
+                    and not EXTRA_HINT_RE.search(Path(rel).stem):
+                # 文件名解析出了集号、规则也没认出特典标记,LLM 却判成特典/杂项:不能悄悄跳过(不通知、还可能被当残留清走),
+                # 交人工确认(unknown 会通知);llm_c 记下 LLM 的原判,正片搬走后不让残留文件重建清单时被当正片映射
+                entry = {"c": "unknown", "how": "llm", "llm_c": cls,
+                         "note": f"LLM 判为{'特典' if cls == 'extra' else '杂项'},但文件名带集号 E{v['episode']},不采信"}
             if cls in ("main", "special") and is_tv:
                 try:
                     s, e = int(it.get("s")), int(it.get("e"))
@@ -2238,6 +2856,11 @@ class CloudLinkMonitor(_PluginBase):
                     entry = {"c": "unknown", "how": "llm", "note": f"LLM 未给出有效季集({it.get('s')}/{it.get('e')})"}
                 elif not 1 <= e <= self.__season_size(structure, s):
                     entry = {"c": "unknown", "how": "llm", "note": f"S{s}E{e} 超出范围"}
+                elif v.get("episode") is None and v.get("season_declared") and v.get("season") is not None \
+                        and s != int(v["season"]):
+                    # 无集号时没有换算约束:识别词写明的季号就是约束
+                    entry = {"c": "unknown", "how": "llm",
+                             "note": f"识别词写明第 {v['season']} 季,LLM 给的是 S{s}E{e}"}
                 elif plausible is not None and not plausible:
                     entry = {"c": "unknown", "how": "llm",
                              "note": f"文件名 S{v['season'] or '?'}E{v['episode']} 无法换算到目标编号体系"}
@@ -2508,6 +3131,9 @@ class CloudLinkMonitor(_PluginBase):
                         suffix = f.suffix.lower()
                         if suffix not in media_exts and suffix not in sub_exts:
                             continue
+                        if any(x in str(f) for x in ("/@Recycle/", "/#recycle/", "/.", "/@eaDir")):
+                            # 回收站/隐藏文件永远不会被整理(与 __handle_file 一致),不挡残留清理
+                            continue
                         his = self.transferhis.get_by_src(str(f))
                         if his:
                             if his.status:
@@ -2572,6 +3198,11 @@ class CloudLinkMonitor(_PluginBase):
                 return
             # 全程加锁
             with lock:
+                if self._handoffs and (event_path in self._handoffs or str(file_path) in self._handoffs):
+                    # 已交给 MP 整理队列、还没结算:不重复整理(否则会重复调用整理、推迟结算等待期限,结算后还可能重复补做
+                    # 后续步骤);也不占对账重试次数
+                    logger.debug(f"{file_path.name} 已交给 MP 整理队列,等待结算,本轮跳过")
+                    return
                 transfer_history = self.transferhis.get_by_src(event_path)
                 if transfer_history:
                     # 成功记录直接跳过；失败记录仅在对账时有限次重试
@@ -2615,7 +3246,7 @@ class CloudLinkMonitor(_PluginBase):
 
                 # 只处理媒体文件与字幕文件
                 is_subtitle = file_path.suffix.lower() in [str(ext).lower() for ext in settings.RMT_SUBEXT]
-                if file_path.suffix not in settings.RMT_MEDIAEXT and not is_subtitle:
+                if file_path.suffix.lower() not in [str(e).lower() for e in settings.RMT_MEDIAEXT] and not is_subtitle:
                     logger.debug(f"{event_path} 不是媒体或字幕文件")
                     return
 
@@ -2629,9 +3260,20 @@ class CloudLinkMonitor(_PluginBase):
                 manifest_root = batch_root if batch_root is not None else (None if is_subtitle else file_path)
                 if manifest_root is not None and self._dirconf.get(mon_path) is not None:
                     manifest = self.__get_manifest(manifest_root)
+                    if not is_subtitle and not (manifest and manifest.get("pending")) and manifest_root.is_dir() \
+                            and not self.__listed(manifest_root, file_path):
+                        # 批次列举里还没有这个媒体文件(60 秒列举缓存之后才出现,或上次列举失败):丢掉缓存重取清单,
+                        # 按新文件走稳定窗口/重建,不拿缺它条目的旧清单去走逐文件识别
+                        if self._batch_list_cache:
+                            self._batch_list_cache.pop(str(manifest_root), None)
+                        first = manifest
+                        manifest = self.__get_manifest(manifest_root)
+                        if manifest is None and first and first.get("status") == "ok":
+                            # 重新列举失败:沿用刚才的清单,不因此落到逐文件识别
+                            manifest = first
                     if manifest and manifest.get("pending"):
-                        logger.debug(f"批次 {manifest_root.name} 尚未稳定,本轮跳过:{file_path.name},"
-                                     f"{manifest.get('retry_in')} 秒后自动复查")
+                        logger.debug(f"批次 {manifest_root.name} 暂缓整理({manifest.get('reason') or '文件仍在变化'}),"
+                                     f"本轮跳过:{file_path.name},{manifest.get('retry_in')} 秒后自动复查")
                         self.__schedule_batch_recheck(manifest_root, mon_path, int(manifest.get("retry_in") or 60))
                         return
                     if manifest:
@@ -2726,7 +3368,11 @@ class CloudLinkMonitor(_PluginBase):
                 # 查找这个文件项
                 file_item = self.storagechain.get_file_item(storage="local", path=file_path)
                 if not file_item:
-                    logger.warn(f"{event_path.name} 未找到对应的文件")
+                    logger.warn(f"{file_path.name} 未找到对应的文件")
+                    return
+                if self._handoffs and str(file_item.path) in self._handoffs:
+                    # 蓝光原盘按整盘目录交给整理队列
+                    logger.debug(f"{file_path.name} 已交给 MP 整理队列,等待结算,本轮跳过")
                     return
 
                 # 转移前校验源文件真实可读：挂载读空窗期(缓存陈旧)执行move，rename失败
@@ -2848,6 +3494,11 @@ class CloudLinkMonitor(_PluginBase):
                     logger.error(f"未配置监控目录 {mon_path} 的目的目录")
                     return
 
+                # 转移前记下该源的整理记录现状:交给整理队列时据此判断队列是否结算了"这一次"
+                try:
+                    prev_row = self.__history_sig(self.transferhis.get_by_src(file_item.path, file_item.storage))
+                except Exception:
+                    prev_row = None
                 # 转移文件
                 transferinfo: TransferInfo = self.chain.transfer(fileitem=file_item,
                                                                  meta=file_meta,
@@ -2857,6 +3508,15 @@ class CloudLinkMonitor(_PluginBase):
 
                 if not transferinfo:
                     logger.error("文件转移模块运行失败")
+                    return
+
+                if not transferinfo.success and str(transferinfo.message or "").strip() in QUEUE_HANDOFF_MESSAGES:
+                    # 同步调用失败、任务留在 MP 持久化整理队列里由后台接着做(闯关东 E44:报失败 13 秒后队列入库成功):
+                    # 不报失败、不写失败记录(队列结算会写),记下来等结算后补做刮削/通知/strm;不在全局锁里干等
+                    self.__defer_handoff(file_item, prev_row, dict(
+                        file_path=file_path, mon_path=mon_path, file_meta=file_meta, mediainfo=mediainfo,
+                        transfer_type=transfer_type, is_subtitle=is_subtitle, pre_item=pre_item, entry=entry,
+                        manifest=manifest))
                     return
 
                 if not transferinfo.success:
@@ -2891,126 +3551,279 @@ class CloudLinkMonitor(_PluginBase):
                         transferinfo=transferinfo
                     )
 
-                # V3 会把无集数的特典/附加文件判为"跳过正片集数整理":
-                # success=True 但无 target_item/target_diritem,
-                # 后续刮削/通知/软连接/strm 均无目标可用,记录历史后直接结束
-                if not transferinfo.target_item:
-                    logger.info(f"{file_path.name} 按特典/附加文件处理,无目标文件项,"
-                                f"跳过刮削与通知")
-                    return
-
-                # 刮削（字幕文件无需刮削）
-                if self._scrape and not is_subtitle:
-                    self.scrapingchain.scrape_metadata(fileitem=transferinfo.target_diritem,
-                                                       meta=file_meta,
-                                                       mediainfo=mediainfo)
-                """
-                {
-                    "title_year season": {
-                        "files": [
-                            {
-                                "path":,
-                                "mediainfo":,
-                                "file_meta":,
-                                "transferinfo":
-                            }
-                        ],
-                        "time": "2023-08-24 23:23:23.332"
-                    }
-                }
-                """
-                if self._notify and not is_subtitle:
-                    # 发送消息汇总
-                    media_list = self._medias.get(mediainfo.title_year + " " + file_meta.season) or {}
-                    if media_list:
-                        media_files = media_list.get("files") or []
-                        if media_files:
-                            file_exists = False
-                            for file in media_files:
-                                if str(file_path) == file.get("path"):
-                                    file_exists = True
-                                    break
-                            if not file_exists:
-                                media_files.append({
-                                    "path": str(file_path),
-                                    "mediainfo": mediainfo,
-                                    "file_meta": file_meta,
-                                    "transferinfo": transferinfo
-                                })
-                        else:
-                            media_files = [
-                                {
-                                    "path": str(file_path),
-                                    "mediainfo": mediainfo,
-                                    "file_meta": file_meta,
-                                    "transferinfo": transferinfo
-                                }
-                            ]
-                        media_list = {
-                            "files": media_files,
-                            "time": datetime.datetime.now()
-                        }
-                    else:
-                        media_list = {
-                            "files": [
-                                {
-                                    "path": str(file_path),
-                                    "mediainfo": mediainfo,
-                                    "file_meta": file_meta,
-                                    "transferinfo": transferinfo
-                                }
-                            ],
-                            "time": datetime.datetime.now()
-                        }
-                    self._medias[mediainfo.title_year + " " + file_meta.season] = media_list
-
-                if self._refresh and not is_subtitle:
-                    # 广播事件
-                    self.eventmanager.send_event(EventType.TransferComplete, {
-                        'meta': file_meta,
-                        'mediainfo': mediainfo,
-                        'transferinfo': transferinfo
-                    })
-
-                if self._softlink and not is_subtitle:
-                    # 通知实时软连接生成
-                    self.eventmanager.send_event(EventType.PluginAction, {
-                        'file_path': str(transferinfo.target_item.path),
-                        'action': 'softlink_file'
-                    })
-
-                if self._strm:
-                    # 通知前强刷目标目录(OpenList->rclone 双层,按目录60秒去重),
-                    # 消除读空窗,strm助手的就绪门控可首查即过
-                    self.__refresh_target_dir(str(Path(transferinfo.target_item.path).parent))
-                    # 通知Strm助手生成（媒体文件生成strm，字幕文件由助手复制到strm目录）
-                    self.eventmanager.send_event(EventType.PluginAction, {
-                        'file_path': str(transferinfo.target_item.path),
-                        'action': 'cloudstrm_file'
-                    })
-
-                if pre_item:
-                    self.__emby_reprobe_later(pre_item, file_path.name)
-                if entry and manifest.get("sync_emby") and not is_subtitle:
-                    media = manifest.get("media") or {}
-                    self.__emby_sync_group(media.get("tmdbid"), media.get("episode_group"), media.get("title") or "")
-
-                # 移动模式删除空目录（必须确认媒体/字幕/音轨文件都已清空，防止误删未整理的字幕）
-                if transfer_type == "move":
-                    for file_dir in file_path.parents:
-                        if len(str(file_dir)) <= len(str(Path(mon_path))):
-                            # 重要，删除到监控目录为止
-                            break
-                        files = SystemUtils.list_files(
-                            file_dir,
-                            settings.RMT_MEDIAEXT + settings.RMT_SUBEXT
-                            + getattr(settings, "RMT_AUDIOEXT", []) + settings.DOWNLOAD_TMPEXT)
-                        if not files:
-                            logger.warn(f"移动模式，删除空目录：{file_dir}")
-                            shutil.rmtree(file_dir, ignore_errors=True)
+                self.__after_transfer(file_path=file_path, mon_path=mon_path, file_meta=file_meta,
+                                      mediainfo=mediainfo, transferinfo=transferinfo, transfer_type=transfer_type,
+                                      is_subtitle=is_subtitle, pre_item=pre_item, entry=entry, manifest=manifest)
 
         except Exception as e:
             logger.error("目录监控发生错误：%s - %s" % (str(e), traceback.format_exc()))
+
+    @staticmethod
+    def __history_sig(his) -> Optional[tuple]:
+        """整理记录的指纹(同一源路径的记录会被结算原地更新,只看 id 不够)"""
+        if not his:
+            return None
+        return getattr(his, "id", None), bool(getattr(his, "status", False)), str(getattr(his, "date", "") or ""), \
+            str(getattr(his, "dest", "") or "")
+
+    def __defer_handoff(self, file_item, prev_row, ctx: dict):
+        """记下交给 MP 整理队列的整理,由 __resolve_handoffs 在锁外等它结算"""
+        if self._handoffs is None:
+            self._handoffs = {}
+        key = str(file_item.path)
+        old = self._handoffs.get(key)
+        # 同一源重复交接时保留最早的等待期限,不能靠重复交接无限推迟"超时报失败"
+        self._handoffs[key] = {"storage": file_item.storage or "local", "prev": prev_row,
+                               "deadline": old["deadline"] if old else time.time() + HANDOFF_WAIT, "ctx": ctx,
+                               "file_item": file_item}
+        logger.info(f"{ctx['file_path'].name} 同步整理调用未完成,MP 整理队列在后台接手;"
+                    f"结算后补做刮削/通知/strm(最长等 {HANDOFF_WAIT // 60} 分钟)")
+        self.__arm_handoff_timer()
+
+    def __arm_handoff_timer(self):
+        if self._handoff_timer and self._handoff_timer.is_alive():
+            return
+
+        def _run():
+            try:
+                self.__resolve_handoffs()
+            except Exception as e:
+                logger.error(f"处理整理队列接手的文件出错:{str(e)} - {traceback.format_exc()}")
+            finally:
+                self._handoff_timer = None
+                if self._handoffs:
+                    self.__arm_handoff_timer()
+
+        timer = threading.Timer(30, _run)
+        timer.daemon = True
+        self._handoff_timer = timer
+        timer.start()
+
+    def __resolve_handoffs(self):
+        """
+        交给整理队列的文件:整理记录出现新的成功结算 -> 按成功补做后续步骤(与同步成功完全相同);
+        新的失败结算或超时 -> 报失败(用队列给的原因)。记录按源路径查(蓝光按整盘目录),只认转移之后的新结算
+        """
+        for key, h in list((self._handoffs or {}).items()):
+            ctx = h["ctx"]
+            name = ctx["file_path"].name
+            try:
+                his = self.transferhis.get_by_src(key, h["storage"])
+            except Exception as e:
+                logger.debug(f"查询整理记录失败 {key}:{str(e)}")
+                continue
+            sig = self.__history_sig(his)
+            settled = sig is not None and sig != h["prev"]
+            if settled and his.status:
+                if self._handoffs.pop(key, None) is None:
+                    continue
+                if not his.dest:
+                    # V3 把无集数的特典/附加文件判为"跳过正片集数整理":成功但没有目标文件,与同步整理一样不做后续步骤
+                    logger.info(f"{name} 已由 MP 整理队列按特典/附加文件处理,无目标文件,跳过刮削与通知")
+                    continue
+                transferinfo = self.__handoff_transferinfo(his, h["file_item"], ctx["transfer_type"])
+                if not transferinfo:
+                    logger.warn(f"{name} 已由 MP 整理队列整理成功({his.dest}),但读不到目标文件,"
+                                f"strm 由 Strm 助手的全量对账补上")
+                    continue
+                if str(getattr(his, "media_id", "") or "") and ctx.get("mediainfo") is not None \
+                        and str(his.media_id) != str(getattr(ctx["mediainfo"], "tmdb_id", "")):
+                    logger.warn(f"{name} 由整理队列入库的作品(TMDB {his.media_id})与本次整理的"
+                                f"(TMDB {ctx['mediainfo'].tmdb_id})不同,以实际入库位置补做后续步骤:{his.dest}")
+                logger.info(f"{name} 已由 MP 整理队列接手整理成功:{his.dest},补做后续步骤")
+                with lock:
+                    self.__after_transfer(transferinfo=transferinfo, **ctx)
+            elif settled and not his.status:
+                if self._handoffs.pop(key, None) is None:
+                    continue
+                self.__handoff_failed(ctx, getattr(his, "errmsg", None) or "MP 整理队列整理失败")
+            elif time.time() > h["deadline"]:
+                with lock:
+                    # 等锁期间队列可能刚好结算:重读一次,结算了就交给下一轮按结算处理(不能拿失败记录盖掉成功结算)
+                    try:
+                        latest = self.transferhis.get_by_src(key, h["storage"])
+                    except Exception as e:
+                        logger.debug(f"查询整理记录失败 {key}:{str(e)}")
+                        continue
+                    latest_sig = self.__history_sig(latest)
+                    if latest_sig is not None and latest_sig != h["prev"]:
+                        continue
+                    if self._handoffs.pop(key, None) is None:
+                        continue
+                    if self._history:
+                        # 与同步整理失败一致记失败:对账按失败有限次重试、残留清理保守不动;
+                        # 队列之后若结算成功,会原地改写这条记录
+                        try:
+                            self.transferhis.add_fail(fileitem=h["file_item"], mode=ctx["transfer_type"],
+                                                      meta=ctx["file_meta"], mediainfo=ctx["mediainfo"])
+                        except Exception as e:
+                            logger.warn(f"{name} 写入整理失败记录出错:{str(e)}")
+                self.__handoff_failed(ctx, f"MP 整理队列 {HANDOFF_WAIT // 60} 分钟内没有结算"
+                                           f"(若之后整理成功,strm 由 Strm 助手的全量对账补上)")
+
+    def __handoff_failed(self, ctx: dict, reason: str):
+        name = ctx["file_path"].name
+        logger.warn(f"{name} 入库失败:{reason}")
+        mediainfo, file_meta = ctx.get("mediainfo"), ctx.get("file_meta")
+        if self._notify and mediainfo is not None and file_meta is not None:
+            try:
+                self.post_message(mtype=NotificationType.Manual,
+                                  title=f"{mediainfo.title_year}{file_meta.season_episode} 入库失败！",
+                                  text=f"原因:{reason}", image=mediainfo.get_message_image())
+            except Exception as e:
+                logger.warn(f"发送入库失败通知出错:{str(e)}")
+
+    def __handoff_transferinfo(self, his, file_item, transfer_type: str) -> Optional[TransferInfo]:
+        """按整理队列的成功记录重建整理结果(目标文件/目录项与同步整理返回的一致)"""
+        dest_storage = getattr(his, "dest_storage", None) or "local"
+        target_item = None
+        try:
+            target_item = self.storagechain.get_file_item(storage=dest_storage, path=Path(his.dest))
+        except Exception as e:
+            logger.debug(f"读取整理目标文件失败 {his.dest}:{str(e)}")
+        raw = getattr(his, "dest_fileitem", None)
+        if not target_item and raw:
+            try:
+                target_item = schemas.FileItem(**(raw if isinstance(raw, dict) else json.loads(raw)))
+            except Exception as e:
+                logger.debug(f"解析整理记录目标文件失败 {his.dest}:{str(e)}")
+        if not target_item:
+            return None
+        parent = Path(target_item.path).parent
+        target_diritem = None
+        try:
+            target_diritem = self.storagechain.get_file_item(storage=target_item.storage or dest_storage, path=parent)
+        except Exception as e:
+            logger.debug(f"读取整理目标目录失败 {parent}:{str(e)}")
+        if not target_diritem:
+            target_diritem = schemas.FileItem(storage=target_item.storage or dest_storage, type="dir",
+                                              path=str(parent).rstrip("/") + "/", name=parent.name)
+        return TransferInfo(success=True, fileitem=file_item, target_item=target_item,
+                            target_diritem=target_diritem, transfer_type=transfer_type,
+                            file_list=[str(file_item.path)], file_list_new=[target_item.path],
+                            total_size=target_item.size or 0, file_count=1)
+
+
+    def __after_transfer(self, file_path: Path, mon_path: str, file_meta, mediainfo, transferinfo: TransferInfo,
+                         transfer_type: str, is_subtitle: bool, pre_item, entry, manifest):
+        """整理成功后的后续步骤:刮削、入库消息汇总、事件、软连接/strm、Emby 重探/剧集组同步、移动模式清空目录"""
+        # V3 会把无集数的特典/附加文件判为"跳过正片集数整理":
+        # success=True 但无 target_item/target_diritem,
+        # 后续刮削/通知/软连接/strm 均无目标可用,记录历史后直接结束
+        if not transferinfo.target_item:
+            logger.info(f"{file_path.name} 按特典/附加文件处理,无目标文件项,"
+                        f"跳过刮削与通知")
+            return
+
+        # 刮削（字幕文件无需刮削）
+        if self._scrape and not is_subtitle:
+            self.scrapingchain.scrape_metadata(fileitem=transferinfo.target_diritem,
+                                               meta=file_meta,
+                                               mediainfo=mediainfo)
+        """
+        {
+            "title_year season": {
+                "files": [
+                    {
+                        "path":,
+                        "mediainfo":,
+                        "file_meta":,
+                        "transferinfo":
+                    }
+                ],
+                "time": "2023-08-24 23:23:23.332"
+            }
+        }
+        """
+        if self._notify and not is_subtitle:
+            # 发送消息汇总
+            media_list = self._medias.get(mediainfo.title_year + " " + file_meta.season) or {}
+            if media_list:
+                media_files = media_list.get("files") or []
+                if media_files:
+                    file_exists = False
+                    for file in media_files:
+                        if str(file_path) == file.get("path"):
+                            file_exists = True
+                            break
+                    if not file_exists:
+                        media_files.append({
+                            "path": str(file_path),
+                            "mediainfo": mediainfo,
+                            "file_meta": file_meta,
+                            "transferinfo": transferinfo
+                        })
+                else:
+                    media_files = [
+                        {
+                            "path": str(file_path),
+                            "mediainfo": mediainfo,
+                            "file_meta": file_meta,
+                            "transferinfo": transferinfo
+                        }
+                    ]
+                media_list = {
+                    "files": media_files,
+                    "time": datetime.datetime.now()
+                }
+            else:
+                media_list = {
+                    "files": [
+                        {
+                            "path": str(file_path),
+                            "mediainfo": mediainfo,
+                            "file_meta": file_meta,
+                            "transferinfo": transferinfo
+                        }
+                    ],
+                    "time": datetime.datetime.now()
+                }
+            self._medias[mediainfo.title_year + " " + file_meta.season] = media_list
+
+        if self._refresh and not is_subtitle:
+            # 广播事件
+            self.eventmanager.send_event(EventType.TransferComplete, {
+                'meta': file_meta,
+                'mediainfo': mediainfo,
+                'transferinfo': transferinfo
+            })
+
+        if self._softlink and not is_subtitle:
+            # 通知实时软连接生成
+            self.eventmanager.send_event(EventType.PluginAction, {
+                'file_path': str(transferinfo.target_item.path),
+                'action': 'softlink_file'
+            })
+
+        if self._strm:
+            # 通知前强刷目标目录(OpenList->rclone 双层,按目录60秒去重),
+            # 消除读空窗,strm助手的就绪门控可首查即过
+            self.__refresh_target_dir(str(Path(transferinfo.target_item.path).parent))
+            # 通知Strm助手生成（媒体文件生成strm，字幕文件由助手复制到strm目录）
+            self.eventmanager.send_event(EventType.PluginAction, {
+                'file_path': str(transferinfo.target_item.path),
+                'action': 'cloudstrm_file'
+            })
+
+        if pre_item:
+            self.__emby_reprobe_later(pre_item, file_path.name)
+        if entry and manifest.get("sync_emby") and not is_subtitle:
+            media = manifest.get("media") or {}
+            self.__emby_sync_group(media.get("tmdbid"), media.get("episode_group"), media.get("title") or "")
+
+        # 移动模式删除空目录（必须确认媒体/字幕/音轨文件都已清空，防止误删未整理的字幕）
+        if transfer_type == "move":
+            for file_dir in file_path.parents:
+                if len(str(file_dir)) <= len(str(Path(mon_path))):
+                    # 重要，删除到监控目录为止
+                    break
+                files = SystemUtils.list_files(
+                    file_dir,
+                    settings.RMT_MEDIAEXT + settings.RMT_SUBEXT
+                    + getattr(settings, "RMT_AUDIOEXT", []) + settings.DOWNLOAD_TMPEXT)
+                if not files:
+                    logger.warn(f"移动模式，删除空目录：{file_dir}")
+                    shutil.rmtree(file_dir, ignore_errors=True)
 
     def send_msg(self):
         """
@@ -3115,25 +3928,28 @@ class CloudLinkMonitor(_PluginBase):
         """
         API:批次清单预览(不整理文件);ignore_emby/force_default 用于模拟"Emby 无此剧"/"按默认顺序"的场景
         """
-        batch_root = Path(path)
+        batch_root = Path(os.path.normpath(path))
         if not batch_root.exists():
             return schemas.Response(success=False, message=f"路径不存在:{path}")
         self._order_override = {"ignore_emby": bool(ignore_emby), "force_default": bool(force_default)} \
             if (ignore_emby or force_default) else None
         key = str(batch_root)
-        if rebuild:
-            if self._manifests:
-                self._manifests.pop(key, None)
-            if self._batch_seen:
-                self._batch_seen.pop(key, None)
-            if self._batch_list_cache:
-                self._batch_list_cache.pop(key, None)
-        saved = self._batch_settle
-        self._batch_settle = 0
+        if not self._order_override and not self.__monitor_of_batch(key):
+            # 不是整理型监控目录下的第一级条目(如测试批次、子目录):只读预览,不落盘、不发通知
+            self._order_override = {"preview_only": True}
+        if rebuild and not self._order_override and self._batch_seen:
+            self._batch_seen.pop(key, None)
+        if rebuild and self._batch_list_cache:
+            self._batch_list_cache.pop(key, None)
+        self._override_tls.no_settle = True
+        # 强制重建:不沿用已有清单/退避/上次的 LLM 答案;已有清单不删,挂起中的批次保留连续次数与通知状态,
+        # 重建失败时继续暂缓(不回退逐文件识别)
+        self._override_tls.rebuild = bool(rebuild)
         try:
             mf = self.__get_manifest(batch_root)
         finally:
-            self._batch_settle = saved
+            self._override_tls.no_settle = False
+            self._override_tls.rebuild = False
             self._order_override = None
         data = mf if mf else (self._manifests or {}).get(key)
         return schemas.Response(success=bool(mf), message="" if mf else "清单未建立(见插件日志)", data=data)
@@ -3949,6 +4765,7 @@ class CloudLinkMonitor(_PluginBase):
                 except Exception as e:
                     print(str(e))
         self._observer = []
+        self.__cancel_rechecks()
         if self._scheduler:
             self._scheduler.remove_all_jobs()
             if self._scheduler.running:
