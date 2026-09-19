@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 import traceback
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -45,28 +46,127 @@ from app.utils.system import SystemUtils
 
 lock = threading.Lock()
 
-# 特典/附加子目录名(任意一级子目录命中即整体跳过;不作用于种子根目录)
+# 特典/附加子目录名(任意一级子目录命中即整体跳过;不作用于种子根目录)。前后分隔符用零宽断言,finditer 能拿到每一处命中
 SP_DIR_RE = re.compile(
-    r"(?:^|[\s_\-.\[\(（【])(bonus(?:es)?|extras?|specials?|sps?|nc(?:op|ed)?|pv|cm|menus?|previews?|trailers?|"
-    r"scans?|cds?|bk|booklet|gallery|fonts?|samples?|others?)(?:$|[\s_\-.\]\)）】])"
+    r"(?<![^\s_\-.\[\(（【])(?:bonus(?:es)?|extras?|specials?|sps?|nc(?:op|ed)?|pv|cm|menus?|previews?|trailers?|"
+    r"scans?|cds?|bk|booklet|gallery|fonts?|samples?|others?)(?![^\s_\-.\]\)）】])"
     r"|特典|番外|映像|特報|预告|扫图|画集|原声|音乐"
     # 花絮/彩蛋紧跟在"含/附/带/加/+/及/和/与/、"后面(某剧.S01.全40集.含花絮.2160p、第1季(含花絮)、全12期+花絮)
     # 说的是正片目录附带了花絮,不是花絮目录
     r"|(?<![含附带加+＋&及和与、絮蛋])(?<![含附带加+＋&及和与、]\s)(?:花絮|彩蛋)", re.IGNORECASE)
+# 上面的目录词里也会出现在作品名里的(Trailer Park Boys、Extras、Bonus Family、The Others、Night Gallery、The Menu、
+# 音乐之声、映像研):只有这类词、都在子目录名的片名区里、片名区里还有别的词或后接年份/季号时是"软标记",
+# 定下作品后按其标题核对;裸标签目录(Extras、Bonus Disc、Sample、Extras Vol 1)与其余目录词一律是特典目录
+SOFT_DIR_WORDS = {"bonus", "bonuses", "extra", "extras", "special", "specials", "other", "others", "menu", "menus",
+                  "preview", "previews", "trailer", "trailers", "sample", "samples", "gallery", "音乐", "映像"}
 # 容易撞上作品名的附加目录名(Interview with the Vampire、幕后之王、The Interview):只认整个目录名就是它
 # (Plex/Emby 附加内容目录约定:Featurettes、Behind The Scenes、Deleted Scenes、Interviews);可用 +/&/、/和 连写(特辑+花絮)
 _SP_DIR_WORDS = (r"featurettes?|interviews?|behind[\s_.-]?the[\s_.-]?scenes|deleted[\s_.-]?scenes|"
                  r"幕后(?:花絮|特辑)?|特辑|(?:附加|追加)?(?:花絮|彩蛋)|"
                  r"ng|pv|sps?|mv|cm|nc(?:op|ed)|extras?|bonus(?:es)?|specials?|making(?:[\s_.-]?of)?|"
-                 r"访谈|采访|专访|发布会|路演|首映礼?|物料|预告片?|番外|特典")
+                 r"supplements?|(?:special|bonus)[\s_.-]?features?|extended[\s_.-]?scenes|alternat(?:e|ive)[\s_.-]?endings?|"
+                 r"press[\s_.-]?kits?|epk|片花|(?:主创|导演|演员)?(?:访谈|采访|专访)|"
+                 r"发布会|路演|首映礼?|物料|预告片?|番外|特典")
 SP_DIR_NAME_RE = re.compile(
     r"[\[(（【]?\s*(?:" + _SP_DIR_WORDS + r")(?:\s*[+＋&、和与及]\s*(?:" + _SP_DIR_WORDS + r"))*"
     r"\s*\d*\s*[\])）】]?", re.IGNORECASE)
-# 文件名特典标记(无条件按特典处理;SP/OVA/OAD/番外 这类有内容的特别篇不在此列,由批次清单按 TMDB 第 0 季映射)
+# 文件名特典标记(SP/OVA/OAD/番外 这类有内容的特别篇不在此列,由批次清单按 TMDB 第 0 季映射)。
+# 前后分隔符用零宽断言(不吞字符),finditer 才能拿到每一处命中(相邻两个标记共用一个分隔符);
+# PREVIEW 后只收 1-3 位编号(Preview 01 仍是特典),不吞空格和年份(Preview (1989) 的命中只是 Preview)
 SP_FILE_RE = re.compile(
-    r"(?:^|[\s_\-.\[\(（【])(NC(?:OP|ED)\d*|MENU\d*|PV\d*|CM\d*|(?:WEB\s*|THEATER\s*)?PREVIEW\s*\d*|TEASER\d*|"
-    r"TRAILER\d*|COMMENTARY|DOCUMENTARY\d*|SAMPLE|INTERVIEW|MAKING|DIGEST|LOGO|TV\s*SPOT|CREDITLESS|PROMO|"
-    r"映像特典|特典映像|予告編?|次回予告|预告片?|預告片?|宣传|特報|特报)(?:$|[\s_\-.\]\)）】\(（#])", re.IGNORECASE)
+    r"(?<![^\s_\-.\[\(（【])(?:NC(?:OP|ED)\d*|MENU\d*|PV\d*|CM\d*|(?:WEB\s*|THEATER\s*)?PREVIEW(?:\s*\d{1,3}(?!\d)|\d+)?|"
+    r"TEASER\d*|TRAILER\d*|COMMENTARY|DOCUMENTARY\d*|SAMPLE|INTERVIEW|MAKING|DIGEST|LOGO|TV\s*SPOT|CREDITLESS|PROMO|"
+    r"映像特典|特典映像|予告編?|次回予告|预告片?|預告片?|宣传|特報|特报)(?![^\s_\-.\]\)）】\(（#])", re.IGNORECASE)
+# 也是普通英文单词、会出现在片名里的特典词(The Menu、The Interview、Interview with the Vampire、Trailer Park Boys、
+# Making Waves、Sample People):只有这类词、且都在文件名开头的片名区里时是"软标记",要按作品在 TMDB 上的标题核对;
+# NCOP/PV/CM/Menu01/TV Spot/Creditless/予告 等特典专用词(或带编号)一律是特典
+SOFT_MARKER_WORDS = {"menu", "preview", "teaser", "trailer", "commentary", "documentary", "sample", "interview",
+                     "making", "digest", "logo", "promo"}
+# 特典标签(比 SP_FILE_RE 词更全、分隔更宽),只用来核对软标记文件:片名解释不了的这类词一处都不能有
+# (The.Menu.2022.TV.Spot、The.Menu.2022.Featurette、The Menu (2022)-deleted 不能因为 Menu 属于片名就被当成正片)
+EXTRA_LABEL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:trailers?|teasers?|previews?|samples?|promos?|tv[\s_.\-]*spots?|clips?|featurettes?|"
+    r"behind[\s_.\-]*the[\s_.\-]*scenes|deleted[\s_.\-]*scenes?|bloopers?|gag[\s_.\-]*reels?|outtakes?|"
+    r"making[\s_.\-]*of|interviews?|commentar(?:y|ies)|documentar(?:y|ies)|extras?|bonus(?:es)?|"
+    r"(?:special|bonus)[\s_.\-]*features?|supplements?|extended[\s_.\-]*scenes?|alternat(?:e|ive)[\s_.\-]*endings?|"
+    r"sneak[\s_.\-]*peeks?|press[\s_.\-]*kits?|epk|"
+    r"nc(?:op|ed)|creditless)(?![A-Za-z0-9])"
+    # Plex/Emby/Jellyfin 本地附加内容的文件名后缀(Movie (2022)-deleted.mkv)
+    r"|(?<=-)(?:deleted|scenes?|shorts?|others?|behindthescenes)$"
+    r"|幕后(?:花絮|特辑|制作)?|花絮|彩蛋|特辑|特典|映像|预告片?|預告片?|予告|宣传片?|特[报報]"
+    r"|片花|(?:主创|导演|演员)?(?:访谈|采访|专访)|发布会|路演|首映礼|删减(?:片段|镜头|场景)|NG镜头|特别收录", re.IGNORECASE)
+# 电影批次目录名里才算特典标签的词(剧集的 Specials 是第 0 季,不是特典)
+MOVIE_LABEL_RE = re.compile(r"(?<![A-Za-z0-9])specials(?![A-Za-z0-9])", re.IGNORECASE)
+# 片名区到此为止的词元:年份、季集号、集数(纯数字)、分辨率/来源/编码等技术信息
+ZONE_END_RE = re.compile(r"\d{1,4}|s\d{1,2}(?:e\d{1,4})?|e\d{1,4}|ep\d{1,4}|\d{3,4}[pi]|[248]k|uhd|hdr(?:10)?|"
+                         r"bluray|blu|bdrip|brrip|bdremux|remux|webrip|webdl|web|hdtv|dvdrip|dvd|hdrip|"
+                         r"x26[45]|h26[45]|hevc|avc|10bit|8bit|ma10p|hi10p", re.IGNORECASE)
+YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
+# 名字开头的发布标签:第一个括号组([Grp]、[4K]、【高清影视之家发布 www.BBQDDQ.com】),其后的技术/站点括号组([1080P]),
+# 以及不带括号的站点前缀(阳光电影www.ygdy8.com.)
+_CJK_CHARS = chr(0x4E00) + "-" + chr(0x9FFF)
+LEAD_GROUP_RE = re.compile(r"\s*[\[【(（][^\]】)）]*[\]】)）]")
+LEAD_TECH_RE = re.compile(r"\d{3,4}[pi]|(?<![0-9a-z])[248]k(?![0-9a-z])|uhd|hdr|web-?dl|blu-?ray|www\.|"
+                          r"\.(?:com|net|org|cc|co|tv|me|la|cn)(?![0-9a-z])", re.IGNORECASE)
+SITE_PREFIX_RE = re.compile(r"\s*[" + _CJK_CHARS + r"]{0,8}\s*www\.[0-9a-z\-]+(?:\.[0-9a-z\-]+)*"
+                            r"\.(?:com|net|org|cc|cn|tv|me|la|xyz|top|co|vip)(?![0-9a-z])[\s._\-]*", re.IGNORECASE)
+# 中文名与英文名之间的发布标签(菜单[简繁英字幕].The.Menu、菜单.国英双语.The.Menu、夜访吸血鬼 第一季[全7集][中文字幕].Interview…):
+# 片名区可以跨过它们接上下一段标题。只收字幕/音轨/季集数/版本/年份/技术信息,不收任何特典词(花絮、访谈、预告…)。
+# 按单个词逐个匹配(简繁英字幕 = 简+繁+英+字幕),每个位置只有一种拆法,不会回溯爆炸
+_NUM_CN = r"[0-9一二三四五六七八九十百零〇两]+"
+_GAP_WORD = (r"第\s*" + _NUM_CN + r"(?:\s*[-~至]\s*" + _NUM_CN + r")?\s*[季部集话話期]"
+             r"|全\s*" + _NUM_CN + r"\s*[季部集话話期]|" + _NUM_CN + r"\s*[集话話]全"
+             r"|[简繁中英日韩国粤台港双多]|字幕|双字|中字|英字|双语|音轨|配音|国配|中文|英文|国语|粤语|英语|日语|韩语|简体|繁体"
+             r"|特效(?=[简繁中英双]|字幕|中字)|内[封嵌]|外挂"
+             r"|加长|未删减|导演剪辑|修复|院线|国际|完整|收藏|典藏|重制|高码率?|杜比视界|杜比|蓝光|原盘|高清|超清|标清|版本?|\d{2,3}帧率?"
+             r"|(?:19|20)\d{2}|\d{3,4}[pi]|[248]k|uhd|hdr(?:10\+?)?|dv|sdr|imax|3d|blu-?ray|bd(?:rip)?|web-?dl|webrip"
+             r"|hdtv|remux|x26[45]|h\.?26[45]|hevc|avc|10bit|\d{2,3}fps")
+TITLE_GAP_RE = re.compile(r"(?:[\s._\-+&/|、,，·\[\]【】()（）]|" + _GAP_WORD + r")*", re.IGNORECASE)
+# 电影文件名片名(和紧跟的年份)之后、技术信息之前只该有发布用词(版本/剪辑/语言/配音/音视频规格);出现别的词
+# (The Interview (2014) - Line-O-Rama、The.Menu.2022.Recipe.for.Disaster.1080p)是以片名开头命名的特典
+RESIDUE_RE = re.compile(
+    r"(?:[\s._\-+&/|、,，·()（）'’]|" + _GAP_WORD +
+    r"|extended|uncut|unrated|uncensored|censored|remaster(?:ed)?|restored|proper|repack|rerip|real|internal|limited"
+    r"|hybrid|dc|se|directors?|cut|final|theatrical|imax|criterion|collection|collectors?|edition|anniversary|special"
+    r"|ultimate|definitive|version|open|matte|\d{1,3}(?:st|nd|rd|th)|dual|multi|audio|dubbed|dub|subbed|subs?|org"
+    r"|chinese|english|mandarin|cantonese|japanese|korean|french|german|spanish|italian|russian|hindi|tamil|telugu"
+    r"|eng|chs|cht|chi|jpn|kor|fre|ger|spa|ita|rus|complete|full|dovi|hlg|atmos|truehd|dts|ma|ddp?\d?|eac3|ac3"
+    r"|aac\d?|flac|lpcm|opus|\d+ch|amzn|nf|dsnp|hmax|atvp|itunes|web|bd\d{3,4}[pi]|hd\d{3,4}[pi]?|xvid|divx|8bit"
+    r"|dl|hd|sd|fhd|hq|h?sbs|h?ou|ws|fs|ntsc|pal|readnfo|nfofix|dirfix|syncfix|subfix|retail|vostfr|vf[fqi2]?|truefrench"
+    r"|subfrench|castellano|latino|esp|nordic|swedish|danish|dutch|polish|portuguese|thai|turkish|arabic|hebrew|czech"
+    r"|hungarian|greek|finnish|norwegian|ukrainian|persian|vietnamese|indonesian)*",
+    re.IGNORECASE)
+# 子目录名里除特典词外只有这些词(光盘/容器/连接词/编号)时仍是特典目录名(Bonus Disc、Extras Vol 1、Extras and Trailers)
+DIR_VOCAB = {"disc", "disk", "dvd", "bd", "cd", "content", "contents", "material", "materials", "stuff", "misc", "art",
+             "artwork", "images", "pictures", "photos", "clips", "videos", "files", "footage", "official", "theatrical",
+             "tv", "spots", "movie", "film", "more", "vol", "volume", "part", "and", "or", "extra", "extras", "bonus",
+             "bonuses", "special", "specials", "trailer", "trailers", "teaser", "teasers", "sample", "samples",
+             "preview", "previews", "menu", "menus", "other", "others", "gallery", "featurette", "featurettes",
+             "sneak", "peek", "peeks", "deleted", "scene", "scenes", "making", "interview", "interviews", "promo",
+             "promos", "promotional", "commercial", "commercials", "ads", "posters", "stills", "scans", "booklet",
+             "bdmv", "iso", "ncop", "nced", "pv", "cm", "sp", "sps", "creditless", "opening", "ending",
+             "和", "与", "及"}
+# 片名区后面紧跟的集号/季号(剧集的 "[Grp] Trailer Park Boys - 01"、"Trailer.Park.Boys.S01"、"某剧 第01集")
+EPISODE_AFTER_RE = re.compile(r"^[\s._\-\[\]()（）【】]*(?:(?:19|20)\d{2}[\s._\-\[\]()（）【】]*)?"
+                              r"(?:s\d{1,2}(?:e\d{1,4})?|e\d{1,4}|ep\.?\s*\d{1,4}|第\s*" + _NUM_CN + r"\s*[集话話季]"
+                              r"|\d{1,3}(?:v\d)?)(?![0-9a-z])", re.IGNORECASE)
+# 批次目录名里特典标签前后的"附带"语境(+ Extras、& Featurettes、with Bonus、含花絮、附赠花絮、附幕后花絮、Trailer Included):
+# 说的是正片之外附带了特典,不是整批只有特典。"附带"语境后面(或 Included 前面)连着列出的标签(含花絮特辑、
+# + Extras (Trailers, Featurettes)、[Trailers & Extras Included])整串都算附带
+INCLUDED_BEFORE_RE = re.compile(r"(?:[+＋&、]|(?<![A-Za-z])(?:and|with|w/|incl\.?|including|includes|plus)"
+                                r"|[含附带加及和与赠送])[\s._\-\[(（【]*$", re.IGNORECASE)
+INCLUDED_AFTER_RE = re.compile(r"^[\s._\-\])）】]*(?:included|incl\b|inside)", re.IGNORECASE)
+LABEL_RUN_GAP_RE = re.compile(r"[\s._\-,，/、;；+＋&()（）\[\]【】]*(?:(?<![A-Za-z])(?:and|or)(?![A-Za-z])|[及和与或])?"
+                              r"[\s._\-,，/、;；+＋&()（）\[\]【】]*", re.IGNORECASE)
+# 片名区里不算"具体片名词"的虚词(The Interview、Making Of 这类名字只由特典词和虚词组成,不能自证是片名)
+TITLE_STOPWORDS = {"the", "a", "an", "of", "and", "with", "in", "on", "at", "to", "for", "from", "by", "or",
+                   "le", "la", "les", "el", "los", "las", "der", "die", "das", "il", "lo", "o", "os",
+                   "de", "du", "des", "del", "da", "di"}
+# 片名比对用的词元:拉丁字母/数字串(撇号并入词内,比较时去掉)或连续的中日韩文字
+TITLE_TOKEN_RE = re.compile(r"[0-9A-Za-z\u00C0-\u024F'\u2019]+|[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]+")
+# 批次清单的特典判定规则版本:此前的全标记批次清单没识别作品就整批按特典(会把 The Menu 这类电影当特典),遇到即按新规则重建。
+# 特典词/特典目录的判定规则每改一次就加 1
+MARKER_REV = 4
 # 文件名里明确是特典的词:LLM 判为特典/杂项时采信(即使文件名带集号,如 "S01E02 Featurette"、"第5集 花絮")
 EXTRA_HINT_RE = re.compile(r"花絮|彩蛋|预告片|預告片|Featurettes?|Deleted[\s_.-]?Scenes?|Behind[\s_.-]?the[\s_.-]?Scenes"
                            r"|(?<![A-Za-z])NC(?:OP|ED)\d*(?![A-Za-z])|Creditless", re.IGNORECASE)
@@ -79,10 +179,50 @@ ID_TAG_RE = re.compile(r"[\[{(]\s*(?:tmdb|tvdb|imdb|douban|bangumi|anilist)(?:id
                        re.IGNORECASE)
 
 
-def _extra_dir(part) -> bool:
-    """子目录名是特典/附加目录"""
-    part = str(part).strip()
-    return bool(SP_DIR_RE.search(part) or SP_DIR_NAME_RE.fullmatch(part))
+def _lead_end(norm: str) -> int:
+    """名字开头发布标签([Grp]、[4K]、【…www.BBQDDQ.com】、阳光电影www.ygdy8.com.)结束的位置;没有时 0"""
+    m = LEAD_GROUP_RE.match(norm)
+    pos = m.end() if m else 0
+    while True:
+        m = LEAD_GROUP_RE.match(norm, pos)
+        if m and LEAD_TECH_RE.search(m.group(0)):
+            pos = m.end()
+            continue
+        m = SITE_PREFIX_RE.match(norm, pos)
+        if m and m.end() > pos:
+            pos = m.end()
+            continue
+        return pos
+
+
+def _name_zone(norm: str) -> Tuple[int, int, bool, List[Tuple[str, int, int]]]:
+    """
+    名字的片名区:(开头标签结束处, 片名区结束处, 是否遇到了年份/季集号/集数/技术信息, 词元)。片名区从开头标签之后算起,
+    到第一个年份/季集号/集数/技术信息词元为止;中文名.年份.英文名(菜单.2022.The.Menu.1080p)年份后面那段英文名也在片名区里
+    """
+    tokens = _title_tokens(norm)
+    lead = _lead_end(norm)
+    body = [t for t in tokens if t[1] >= lead]
+    for i, (word, start, _) in enumerate(body):
+        if not ZONE_END_RE.fullmatch(word):
+            continue
+        head = body[:i]
+        if head and all(not re.match(r"[0-9a-z]", t[0]) for t in head) and YEAR_TOKEN_RE.fullmatch(word):
+            nxt = next((t for t in body[i + 1:] if ZONE_END_RE.fullmatch(t[0])), None)
+            return lead, (nxt[1] if nxt else len(norm)), True, tokens
+        return lead, start, True, tokens
+    return lead, len(norm), False, tokens
+
+
+def _title_tokens(text) -> List[Tuple[str, int, int]]:
+    """片名比对用的词元 (词, 起, 止):小写,去掉重音与撇号(Schindler's = Schindlers、menú = menu)"""
+    tokens = []
+    for m in TITLE_TOKEN_RE.finditer(text or ""):
+        word = "".join(ch for ch in unicodedata.normalize("NFKD", m.group(0)) if not unicodedata.combining(ch))
+        word = word.replace("'", "").replace("\u2019", "").lower()
+        if word:
+            tokens.append((word, m.start(), m.end()))
+    return tokens
 
 
 # 8 位十六进制 CRC(括号内)与「」『』集标题:MP 解析器会把 (08377E86) 当成 E86、把「レム」当成剧名
@@ -166,7 +306,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.6.1"
+    plugin_version = "3.6.2"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -248,6 +388,8 @@ class CloudLinkMonitor(_PluginBase):
     _manifests = None
     _batch_seen = None
     _recog_cache = None
+    # 逐文件特典判定里认不出作品的文件名备忘(一小时内不重复识别;识别词变更/手动运行时清空)
+    _verdict_memo = None
     # LLM 季集映射答案(输入完全相同就沿用,挂起批次复查时不重复调用)
     _llm_cache = None
     _tmdb_struct_cache = None
@@ -360,6 +502,7 @@ class CloudLinkMonitor(_PluginBase):
         self._notified_dirty = False
         self._batch_seen = {}
         self._recog_cache = {}
+        self._verdict_memo = {}
         self._tmdb_struct_cache = {}
         self._emby_cache = {}
         self._manifest_lock = self._manifest_lock or threading.RLock()
@@ -541,8 +684,9 @@ class CloudLinkMonitor(_PluginBase):
         立即运行一次，全量同步目录中所有文件
         """
         logger.info("开始全量同步云盘实时监控目录 ...")
-        # 手动运行:挂起中的批次(认不出作品/TMDB 瞬时故障)不等退避到期,立即重试一次
+        # 手动运行:挂起中的批次(认不出作品/TMDB 瞬时故障)不等退避到期,立即重试一次;逐文件判定也不沿用"认不出"备忘
         self.__release_retry_batches()
+        self._verdict_memo = {}
         try:
             # 遍历所有监控目录
             for mon_path in list(self._dirconf.keys()):
@@ -927,24 +1071,604 @@ class CloudLinkMonitor(_PluginBase):
             size /= 1024
         return f"{size:.2f}TB"
 
-    def __extra_verdict(self, file_path: Path, mon_path: str) -> Optional[str]:
+    def __sync_words_sig(self) -> Optional[str]:
+        """自定义识别词的指纹;识别词变了时,按标题缓存的识别结果与逐文件判定备忘作废(否则改了词后还拿旧结果)"""
+        try:
+            sig = hashlib.md5(json.dumps(self.systemconfig.get(SystemConfigKey.CustomIdentifiers) or [],
+                                         ensure_ascii=False).encode("utf-8")).hexdigest()
+        except Exception:
+            sig = None
+        if sig != self._words_sig:
+            self._recog_cache = {}
+            self._verdict_memo = {}
+            self._words_sig = sig
+        return sig
+
+    def __lexical_extra(self, file_path: Path, mon_path: str) -> Optional[str]:
         """
-        启发式特典判定(无批次清单时的回退,也用于残留清理):① 子目录名(不含种子根目录)
-        ② 清洗后文件名标记(带显式 SxxExx 的视为正片,避免剧集标题误伤);None 表示按正片处理
+        残留清理在没有当前批次清单时用:只认确定是特典的——特典目录(硬标记)或文件名硬标记。
+        软标记(特典词可能是片名的一部分:The Menu.mkv、Trailer.Park.Boys.S01/)不算特典,宁可留着,不把正片当残留清走
         """
         file_path = Path(file_path)
         try:
             rel = file_path.relative_to(Path(mon_path))
         except ValueError:
             rel = None
-        sub_dirs = list(rel.parts[1:-1]) if rel and len(rel.parts) > 2 else []
-        for part in sub_dirs:
-            if _extra_dir(part):
+        for part in (list(rel.parts[1:-1]) if rel and len(rel.parts) > 2 else []):
+            if self.__dir_marker(part)[0] == "hard":
                 return f"特典/附加目录({part})"
-        stem = self.__clean_name(file_path.stem)
-        if not re.search(r"S\d{1,2}E\d{1,3}", stem, re.IGNORECASE) and SP_FILE_RE.search(stem):
+        if self.__marker_info(self.__clean_name(file_path.stem))[0] == "hard":
             return "特典/附加文件(文件名标记)"
         return None
+
+    def __extra_verdict(self, file_path: Path, mon_path: str) -> Optional[str]:
+        """
+        启发式特典判定(无批次清单时逐文件整理的回退、通知型目录):① 子目录名(不含种子根目录)② 清洗后文件名标记
+        (带显式 SxxExx 的视为正片,避免剧集标题误伤)。特典词可能是片名一部分的"软标记"(The.Menu.2022、
+        Trailer.Park.Boys.S01/)按作品标题核对:先看批次目录名识别出的作品(目录名是独立旁证),再看文件名自己识别出的作品;
+        特典词都在名字开头的片名区里、且有旁证(目录名/识别词/单文件或目录名就是该片名时的年份与集号)才按正片处理(返回 None)。
+        目录名是另一部作品、或特典词不属于识别出的作品的片名:特典;认不出作品、属于片名但没有旁证、年份不符、
+        目录名带特典标签、电影片名后跟着发布用词以外的内容:本轮不整理(返回原因,下一轮再核对;残留清理不按这里的结论清走)
+        """
+        file_path = Path(file_path)
+        try:
+            rel = file_path.relative_to(Path(mon_path))
+        except ValueError:
+            rel = None
+        items = []
+        for part in (list(rel.parts[1:-1]) if rel and len(rel.parts) > 2 else []):
+            dkind, dsoft = self.__dir_marker(part)
+            if dkind == "hard":
+                return f"特典/附加目录({part})"
+            if dkind == "soft":
+                items.append(dsoft)
+        stem = self.__clean_name(file_path.stem)
+        kind, soft = self.__marker_info(stem)
+        if kind == "hard":
+            return "特典/附加文件(文件名标记)"
+        if kind == "soft":
+            items.append(soft)
+        if not items:
+            return None
+        extra = "特典/附加文件(文件名标记)"
+        unverified = "特典/附加文件(带特典词,无法核对是否属于片名,暂不整理)"
+        batch_name = rel.parts[0] if rel and len(rel.parts) > 1 else None
+        sig = self.__sync_words_sig()
+        if self._verdict_memo is None:
+            self._verdict_memo = {}
+        mkey = f"{batch_name or ''}|{stem}|{sig}"
+        now = time.time()
+        memo = self._verdict_memo.get(mkey)
+        if memo and now - memo[0] < 3600:
+            # 一小时内核对过、当时有识别没查到(通知型目录每轮对账都会再判):不重复识别,沿用上次的结论
+            return memo[1]
+        try:
+            meta = MetaInfo(title=stem)
+        except Exception:
+            meta = None
+        sxe = bool(re.search(r"S\d{1,2}E\d{1,3}", unicodedata.normalize("NFKC", stem), re.IGNORECASE))
+        file_year = next((it["year"] for it in items if it.get("year")), None) or getattr(meta, "year", None)
+        works = []
+        missed = False
+        if batch_name:
+            fmi = self.__folder_work(batch_name, file_year)
+            if fmi and getattr(fmi, "tmdb_id", None):
+                works.append((fmi, True, False))
+            else:
+                missed = True
+        declared = bool(meta is not None and getattr(meta, "media_id", None)
+                        and any(WORD_ID_RE.search(str(w)) for w in (getattr(meta, "apply_words", None) or [])))
+        own = self.__recognize_title(stem, MediaType.TV if getattr(meta, "type", None) == MediaType.TV else None)
+        if own and getattr(own, "tmdb_id", None):
+            if not any(str(w[0].tmdb_id) == str(own.tmdb_id) for w in works):
+                works.append((own, False, declared))
+        else:
+            missed = True
+
+        def done(verdict: str) -> str:
+            if missed:
+                self._verdict_memo = {k: m for k, m in self._verdict_memo.items() if now - m[0] < 3600}
+                self._verdict_memo[mkey] = (now, verdict)
+            return verdict
+
+        if not works:
+            return done(unverified)
+        bnorm = unicodedata.normalize("NFKC", self.__clean_name(batch_name) or batch_name) if batch_name else ""
+        folder_miss = elsewhere = False
+        loose = None
+        for mi, independent, decl in works:
+            variants, singles = self.__title_sets(mi)
+            spans = [self.__title_region(it["norm"], variants, singles) for it in items]
+            tv = getattr(mi, "type", None) == MediaType.TV
+            work_year = getattr(mi, "year", None)
+            labels = self.__batch_name_labels(batch_name, variants, singles, movie=not tv) if batch_name else []
+            titled = bool(batch_name and self.__title_region(bnorm, variants, singles))
+            corroborated = independent or decl or sxe or any(
+                self.__soft_corroborated(it, sp, work_year, False, tv and titled, not batch_name or titled)
+                for it, sp in zip(items, spans))
+            if not all(self.__hits_in_region(it["hits"], sp) for it, sp in zip(items, spans)):
+                if decl:
+                    # 识别词指定了作品,特典词却不在该作品开头的片名里
+                    id_spans = self.__word_spans(meta, unicodedata.normalize("NFKC", stem))
+                    return done(unverified if self.__id_hold(items, spans, id_spans, self.__hits_in_region) else extra)
+                if independent:
+                    folder_miss = True
+                if not labels and corroborated and self.__title_elsewhere(items, variants, singles):
+                    elsewhere = True
+                continue
+            if not decl and not tv and any(it.get("year") and not self.__year_close(it["year"], work_year)
+                                           for it in items):
+                # 名字里的年份与作品对不上(同名作品/目录名写错):分不清,不猜
+                return done(unverified)
+            if corroborated:
+                if labels or folder_miss:
+                    # 批次目录名带特典标签,或目录名是另一部作品(文件名自己识别出的作品不能推翻它)
+                    return done(unverified)
+                if not tv and any(not it.get("dir") and not self.__residue_ok(it, sp) for it, sp in zip(items, spans)):
+                    # 电影片名后跟着发布用词以外的内容(The Interview (2014) - Line-O-Rama):可能是以片名开头命名的特典
+                    return done(unverified)
+                logger.info(f"{file_path.name} 名字里的特典词属于《{getattr(mi, 'title', '')}》的片名,按正片处理")
+                return None
+            if loose is None:
+                loose = labels
+        if elsewhere:
+            return done(unverified)
+        if folder_miss or loose is None:
+            # 批次目录名是另一部作品(特典词不属于它的片名),或特典词不属于任何识别出的作品的片名:特典
+            return done(extra)
+        # 特典词属于文件名自己识别出的作品的片名,但没有旁证:批次目录名带特典标签时是特典,否则本轮不整理
+        return done(extra if loose else unverified)
+
+    def __folder_work(self, batch_name: str, file_year=None):
+        """批次目录名识别出的作品(目录名套上指定 id 的识别词时按 id 查);认不出时 None"""
+        bclean = self.__clean_name(batch_name) or batch_name
+        try:
+            dident = self.__word_identity(MetaInfo(title=bclean))
+        except Exception:
+            dident = {"source": None}
+        if dident.get("source"):
+            if dident.get("tmdbid") and dident.get("type"):
+                return self.__recognize_id(dident["tmdbid"], dident["type"])
+            return None
+        dtitle = re.sub(r"\s{2,}", " ", ID_TAG_RE.sub(" ", bclean)).strip()
+        return self.__recognize_dir_title(dtitle, file_year)[0] if dtitle else None
+
+    def __recognize_dir_title(self, dtitle: str, file_year=None, mtype: Optional[MediaType] = None):
+        """
+        按目录名识别。目录名不带年份而本批文件带年份(非剧集批次)时先按"目录名 年份"识别:裸标题(The Interview、
+        Halloween)会落到最新的同名作品上;不带年份识别出的作品与文件年份相差超过 1 年时不作依据。
+        返回 (作品, 年份不符的同名作品)
+        """
+        bare = False
+        if file_year and mtype != MediaType.TV:
+            try:
+                bare = not MetaInfo(title=dtitle).year
+            except Exception:
+                bare = False
+        if bare:
+            mi = self.__recognize_title(f"{dtitle} {file_year}", mtype)
+            if mi and getattr(mi, "tmdb_id", None) and self.__year_close(getattr(mi, "year", None), file_year):
+                return mi, None
+        mi = self.__recognize_title(dtitle, mtype)
+        if bare and mi and getattr(mi, "tmdb_id", None) and not self.__year_close(getattr(mi, "year", None), file_year):
+            return None, mi
+        return mi, None
+
+    @staticmethod
+    def __year_close(a, b, tol: int = 1) -> bool:
+        """两个年份相差不超过 tol 年;任一方缺失或不是数字时不算不符"""
+        try:
+            return abs(int(str(a)[:4]) - int(str(b)[:4])) <= tol
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def __marker_info(cleaned: str) -> Tuple[Optional[str], Optional[dict]]:
+        """
+        文件名特典标记(只看文件名本身,不依赖解析器取的名字,也不受识别词影响):返回 (类别, 软标记信息)。
+        类别 None=无标记(或带显式 SxxExx);"soft"=命中的全是 SOFT_MARKER_WORDS,这些词和其余特典标签(EXTRA_LABEL_RE)
+        都在片名区里(开头发布标签之后、第一个年份/季集号/集数/技术信息之前;中文名.年份.英文名 的英文名也算)、
+        不是整个括号里只有它([Menu]、(Trailer)),片名区也不只剩特典词本身(或带年份):可能是片名的一部分,
+        要按作品标题核对;其余为 "hard"。软标记信息 {"norm": 归一化文件名, "hits": [(起, 止, 词)] 含全部特典标签,
+        "year": 文件名里的年份}
+        """
+        norm = unicodedata.normalize("NFKC", cleaned or "")
+        if re.search(r"S\d{1,2}E\d{1,3}", norm, re.IGNORECASE):
+            return None, None
+
+        def spans(regex):
+            # 去掉命中尾部的空白(Preview (1989) 的命中只是 Preview)
+            return [(m.start(), m.start() + len(m.group(0).rstrip()), m.group(0).strip())
+                    for m in regex.finditer(norm) if m.group(0).strip()]
+
+        hits = spans(SP_FILE_RE)
+        if not hits:
+            return None, None
+        if any(re.sub(r"\s+", " ", h[2]).lower() not in SOFT_MARKER_WORDS for h in hits):
+            return "hard", None
+        labels = hits + spans(EXTRA_LABEL_RE)
+        lead, zone_end, _, tokens = _name_zone(norm)
+        year = next((int(t[0]) for t in tokens if YEAR_TOKEN_RE.fullmatch(t[0])), None)
+        for start, end, _ in labels:
+            if end > zone_end:
+                # 特典词/标签在年份、季集号或技术信息之后(The.Menu.2022.Trailer、Movie (2022)-deleted):是标签
+                return "hard", None
+            before, after = norm[:start].rstrip(), norm[end:].lstrip()
+            if before[-1:] in ("[", "(", "（", "【") and after[:1] in ("]", ")", "）", "】") \
+                    and not re.match(r"[\])）】]\s*[\[(（【]?\s*(?:19|20)\d{2}(?!\d)", after):
+                # 整个括号里只有它([Menu]、(Trailer)、【Preview】):是标签
+                return "hard", None
+        zone_words = [t[0] for t in tokens if t[1] >= lead and t[2] <= zone_end] \
+            or [t[0] for t in tokens if t[2] <= zone_end]
+        if year is None and all(w in SOFT_MARKER_WORDS for w in zone_words):
+            # 片名区只剩特典词本身(Trailer.mkv、Sample.mkv、[Grp] Menu、[4K] Trailer):特典;
+            # 带年份的(Interview.2007)仍可能是片名
+            return "hard", None
+        return "soft", {"norm": norm, "hits": labels, "year": year}
+
+    @staticmethod
+    def __dir_marker(part: str) -> Tuple[Optional[str], Optional[dict]]:
+        """
+        子目录名的特典标记:(None/"hard"/"soft", 软标记信息)。"soft":命中的全是 SOFT_DIR_WORDS、都在目录名的片名区里,
+        且片名区里还有光盘/容器/连接词/编号以外的词(Trailer Park Boys、Night Gallery、音乐之声)或片名区后接年份/季集号
+        (Extras.S01、The Others (2001)):可能是作品名的一部分,要按作品标题核对;整个目录名就是附加目录名(Featurettes、
+        Extras、特辑+花絮)、裸标签目录(Bonus Disc、Sample、Extras Vol 1)与其余命中一律 "hard"
+        """
+        raw = str(part).strip()
+        if SP_DIR_NAME_RE.fullmatch(raw):
+            return "hard", None
+        norm = unicodedata.normalize("NFKC", raw)
+        hits = [(m.start(), m.end(), m.group(0)) for m in SP_DIR_RE.finditer(norm) if m.group(0)]
+        if not hits:
+            return None, None
+        if any(h[2].lower() not in SOFT_DIR_WORDS for h in hits):
+            return "hard", None
+        # 其余特典标签(Trailer.Park.Boys.S01.Featurettes、Extras.S01.Deleted.Scenes)同样要在片名区里、被作品标题解释
+        hits += [(m.start(), m.start() + len(m.group(0).rstrip()), m.group(0).strip())
+                 for m in EXTRA_LABEL_RE.finditer(norm) if m.group(0).strip()]
+        lead, zone_end, ended, tokens = _name_zone(norm)
+        if any(h[1] > zone_end for h in hits):
+            return "hard", None
+        # 片名区里除特典词外只剩光盘/容器/连接词/编号(Bonus Disc、Extras Vol 1、Extras and Trailers、Trailers):特典目录;
+        # 片名区后接年份/季集号的(Extras.S01、The Others (2001))与带别的词的(Trailer Park Boys、Night Gallery)按作品标题核对
+        rest = [t[0] for t in tokens if t[1] >= lead and t[2] <= zone_end
+                and not any(h[0] <= t[1] and t[2] <= h[1] for h in hits)]
+        stop = next((t[0] for t in tokens if t[1] == zone_end), "") if ended else ""
+        if not (YEAR_TOKEN_RE.fullmatch(stop) or re.fullmatch(r"s\d{1,2}(?:e\d{1,4})?|e\d{1,4}|ep\d{1,4}", stop)) \
+                and all(w in DIR_VOCAB or w.isdigit() for w in rest):
+            return "hard", None
+        year = next((int(t[0]) for t in tokens if YEAR_TOKEN_RE.fullmatch(t[0])), None)
+        return "soft", {"norm": norm, "hits": hits, "year": year, "dir": raw}
+
+    @staticmethod
+    def __title_variants(names: list) -> set:
+        """标题的词元序列;带副标题的另收冒号/破折号前的主标题"""
+        variants = set()
+        for name in names or []:
+            if not name or not isinstance(name, str):
+                continue
+            name = unicodedata.normalize("NFKC", name)
+            for part in (name, re.split(r"\s*[:：]\s*|\s+[-–—]\s+", name, 1)[0]):
+                tokens = tuple(t[0] for t in _title_tokens(part))
+                if tokens:
+                    variants.add(tokens)
+        return variants
+
+    def __title_sets(self, mi, title: Optional[str] = None) -> Tuple[set, set]:
+        """
+        作品全部标题(中文名/原名/英文名/别名/译名)的词元序列,以及可以单独成立的单个词标题:拉丁单词只认正式名
+        (中文名/原名/英文名),别名/译名里的单个英文词(The Interview 的别名 Interview)不算;整段中日韩文字的标题都算
+        """
+        mains = [title, getattr(mi, "title", None), getattr(mi, "original_title", None), getattr(mi, "en_title", None)]
+        variants = self.__title_variants(mains + list(getattr(mi, "names", None) or []))
+        singles = {v for v in self.__title_variants(mains) if len(v) == 1}
+        # 别名本身就是特典词的(The Interview 的别名「采访」)不能当片名,否则会吞掉目录名里的特典标签
+        singles |= {v for v in variants if len(v) == 1 and not re.match(r"[0-9a-z]", v[0])
+                    and not EXTRA_LABEL_RE.fullmatch(v[0]) and not SP_FILE_RE.fullmatch(v[0])}
+        return variants, singles
+
+    @staticmethod
+    def __title_region(norm: str, variants: set, singles: set) -> Optional[List[Tuple[int, int]]]:
+        """
+        名字开头的片名区:从开头(或开头的发布标签之后)起,由作品标题(完整词元序列;单个词只认正式名)、跟在标题后的年份、
+        以及两段标题之间的发布标签(字幕/音轨/季集数/版本/技术信息,菜单[简繁英字幕].The.Menu)连成;返回其中每段标题在名字里的
+        位置 [(起, 止)](特典词必须落在某段标题里,落在标签里的不算);开头不是作品标题时 None
+        """
+        tokens = _title_tokens(norm)
+        words = [t[0] for t in tokens]
+        n = len(words)
+
+        def title_at(i: int) -> int:
+            return max((len(v) for v in variants
+                        if tuple(words[i:i + len(v)]) == v and (len(v) > 1 or v in singles)), default=0)
+
+        starts = {0}
+        first = LEAD_GROUP_RE.match(norm)
+        for cut in {0, (first.end() if first else 0), _lead_end(norm)}:
+            idx = next((i for i, t in enumerate(tokens) if t[1] >= cut), None)
+            if idx:
+                starts.add(idx)
+            # 标题前只隔着发布标签([1080P][中英字幕]The.Menu、[4K][国语中字]菜单.The.Menu)时从标题起算
+            j = next((i for i, t in enumerate(tokens) if t[1] >= cut and title_at(i)), None)
+            if j is not None and TITLE_GAP_RE.fullmatch(norm[cut:tokens[j][1]]):
+                starts.add(j)
+        best = None
+        for start in sorted(starts):
+            i, spans, end = start, [], 0
+            while i < n:
+                k = title_at(i)
+                if k:
+                    spans.append((tokens[i][1], tokens[i + k - 1][2]))
+                    end = tokens[i + k - 1][2]
+                    i += k
+                    continue
+                if not spans:
+                    break
+                if YEAR_TOKEN_RE.fullmatch(words[i]):
+                    end = tokens[i][2]
+                    i += 1
+                    continue
+                # 两段标题之间的发布标签:下一段标题前只隔着字幕/音轨/季集数/版本/技术信息时接上
+                j = next((j for j in range(i + 1, min(n, i + 12)) if title_at(j)), None)
+                if j is None or not TITLE_GAP_RE.fullmatch(norm[end:tokens[j][1]]):
+                    break
+                i = j
+            if spans and (best is None or spans[-1][1] > best[-1][1]):
+                best = spans
+        return best
+
+    @staticmethod
+    def __hits_in_region(hits: list, spans: Optional[List[Tuple[int, int]]]) -> bool:
+        """每一处特典词/标签都落在片名区的某段标题里(逐处判断:Trailer.Park.Boys.The.Movie 片名区之外再出现的 Trailer 不算)"""
+        return bool(spans) and bool(hits) and all(any(s <= h[0] and h[1] <= e for s, e in spans) for h in hits)
+
+    @staticmethod
+    def __title_occurrences(norm: str, variants: set, singles: set) -> List[Tuple[int, int]]:
+        """名字里任意位置出现的作品标题 [(起, 止)](不要求在开头)"""
+        tokens = _title_tokens(norm)
+        words = [t[0] for t in tokens]
+        spans = []
+        for i in range(len(words)):
+            for v in variants:
+                if tuple(words[i:i + len(v)]) == v and (len(v) > 1 or v in singles):
+                    spans.append((tokens[i][1], tokens[i + len(v) - 1][2]))
+        return spans
+
+    @staticmethod
+    def __residue_ok(soft: dict, spans: Optional[List[Tuple[int, int]]]) -> bool:
+        """
+        电影文件名在开头片名(和紧跟的年份)之后、第一个技术信息之前只有发布用词(版本/剪辑/语言/规格;方括号里的标签、
+        末尾的 -发布组 不算)。The Interview (2014) - Line-O-Rama、The.Interview.2014.Seth.Rogen.and.James.Franco.1080p 不是
+        """
+        if not spans:
+            return False
+        norm = soft["norm"]
+        tokens = [t for t in _title_tokens(norm) if t[1] >= spans[-1][1]]
+        pos = spans[-1][1]
+        while tokens and YEAR_TOKEN_RE.fullmatch(tokens[0][0]):
+            pos = tokens[0][2]
+            tokens = tokens[1:]
+        stop = next((t[1] for t in tokens if ZONE_END_RE.fullmatch(t[0])), len(norm))
+        rest = re.sub(r"[\[【][^\]】]*[\]】]", " ", norm[pos:stop]).replace("'", "").replace(chr(0x2019), "")
+        if stop == len(norm):
+            rest = re.sub(r"-[0-9A-Za-z]+\s*$", "", rest)
+        return bool(RESIDUE_RE.fullmatch(rest))
+
+    @staticmethod
+    def __soft_corroborated(soft: dict, spans: Optional[List[Tuple[int, int]]], work_year,
+                            independent: bool = False, tv: bool = False, allow_self: bool = True) -> bool:
+        """
+        特典词属于片名之外的旁证,防止"Making Of.mkv / Director's Commentary 01.mkv 识别成片名就叫这个的作品、再拿它的标题
+        解释自己"的循环:作品来自本文件以外的证据(识别词/下载记录直通/批次目录名/其他正片文件);或(allow_self:单文件批次,
+        或批次目录名开头就是该作品的片名)名字里的年份与作品相差不超过 1 年,或剧集片名区里有特典词和虚词以外的词
+        (Trailer Park Boys 的 Park/Boys、中文片名)且紧跟集号/季号。名字自己的年份/集号是拿来识别它的依据,单独不能自证
+        """
+        if independent:
+            return True
+        if not allow_self:
+            return False
+        try:
+            if soft.get("year") and work_year and abs(int(soft["year"]) - int(str(work_year)[:4])) <= 1:
+                return True
+        except (TypeError, ValueError):
+            pass
+        if not tv or not spans or not EPISODE_AFTER_RE.match(soft["norm"][spans[-1][1]:]):
+            return False
+        for word, start, end in _title_tokens(soft["norm"]):
+            if not any(s <= start and end <= e for s, e in spans):
+                continue
+            if word in SOFT_MARKER_WORDS or word in TITLE_STOPWORDS or word.isdigit():
+                continue
+            if any(h[0] <= start and end <= h[1] for h in soft["hits"]):
+                continue
+            return True
+        return False
+
+    def __batch_name_labels(self, batch_name: str, variants: set, singles: set, movie: bool = False) -> List[str]:
+        """
+        批次目录名里作品标题解释不了、也不在"附带"语境(+ Extras、with Bonus、含花絮特辑、附赠花絮、
+        [Trailers & Extras Included])里的特典词/标签(Movie.2022.Trailer/、Movie.2022.EXTRAS/、Movie Special Features/、
+        电影的 Specials/):目录说明整批可能只是特典,其中特典词属于片名的文件分不清是正片还是特典。
+        带 SxxExx 的目录名不看(剧集的集标题可能正好是这些词)
+        """
+        bnorm = unicodedata.normalize("NFKC", self.__clean_name(batch_name) or batch_name or "")
+        if re.search(r"S\d{1,2}E\d{1,3}", bnorm, re.IGNORECASE):
+            return []
+        titled = self.__title_region(bnorm, variants, singles) or []
+        found = []
+        for regex in (SP_FILE_RE, EXTRA_LABEL_RE) + ((MOVIE_LABEL_RE,) if movie else ()):
+            for m in regex.finditer(bnorm):
+                text = m.group(0)
+                if not text.strip():
+                    continue
+                start = m.start() + len(text) - len(text.lstrip())
+                found.append([start, m.start() + len(text.rstrip())])
+        merged: List[List[int]] = []
+        for s, e in sorted(found):
+            if merged and s < merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        # 片名里的词(菜单[中文字幕].The.Menu 的 Menu)不是标签
+        labels = [(s, e) for s, e in merged if not any(a <= s and e <= b for a, b in titled)]
+        n = len(labels)
+        fwd, bwd = [False] * n, [False] * n
+        for i, (s, e) in enumerate(labels):
+            # 附带语境之后连着列出的标签(含花絮特辑、+ Extras (Trailers, Featurettes))
+            fwd[i] = bool(INCLUDED_BEFORE_RE.search(bnorm[:s])) or (
+                i > 0 and fwd[i - 1] and bool(LABEL_RUN_GAP_RE.fullmatch(bnorm[labels[i - 1][1]:s])))
+        for i in range(n - 1, -1, -1):
+            s, e = labels[i]
+            # "… Included" 前面连着列出的标签([Trailers & Extras Included]);普通连词(Trailers & Featurettes)不往前传
+            bwd[i] = bool(INCLUDED_AFTER_RE.match(bnorm[e:])) or (
+                i < n - 1 and bwd[i + 1] and bool(LABEL_RUN_GAP_RE.fullmatch(bnorm[e:labels[i + 1][0]])))
+        return sorted({bnorm[s:e] for i, (s, e) in enumerate(labels) if not fwd[i] and not bwd[i]})
+
+    def __work_titles(self, series: dict) -> Optional[Tuple[set, set]]:
+        """主候选作品在 TMDB 上的全部标题(按 id 与类型查,进程内缓存);取不到时 None"""
+        try:
+            mtype = MediaType(series.get("type"))
+        except ValueError:
+            return None
+        if mtype not in (MediaType.MOVIE, MediaType.TV) or not series.get("tmdbid"):
+            return None
+        mi = self.__recognize_id(series["tmdbid"], mtype)
+        if not mi or str(getattr(mi, "tmdb_id", "")) != str(series["tmdbid"]):
+            return None
+        return self.__title_sets(mi, series.get("title"))
+
+    def __title_elsewhere(self, items: list, variants: set, singles: set) -> bool:
+        """
+        开头片名区解释不了,但每处特典词/标签都落在名字里某段作品标题里,且那段标题前只有中日韩文字、括号标签和技术信息
+        (菜單.The.Menu.2022、拖车公园男孩.Trailer.Park.Boys.The.Movie.2006:片名前有认不出的译名)
+        """
+        for it in items:
+            occ = self.__title_occurrences(it["norm"], variants, singles)
+            if not self.__hits_in_region(it["hits"], occ):
+                return False
+            first = min(s for s, e in occ if any(s <= h[0] and h[1] <= e for h in it["hits"]))
+            head = re.sub(r"[\[【(（][^\]】)）]*[\]】)）]", " ", it["norm"][:first])
+            if any(re.match(r"[0-9a-z]", t[0]) and not ZONE_END_RE.fullmatch(t[0]) for t in _title_tokens(head)):
+                return False
+        return True
+
+    @staticmethod
+    def __word_spans(meta, norm: str) -> Optional[List[Tuple[int, int]]]:
+        """指定作品 id 的识别词在名字里匹配到的位置(用户声明这段就是片名);定位不到或词写不成正则时 None"""
+        spans = []
+        for w in getattr(meta, "apply_words", None) or []:
+            w = str(w)
+            if "=>" not in w or not WORD_ID_RE.search(w):
+                continue
+            left = w.split("=>")[0].strip()
+            if not left:
+                continue
+            try:
+                spans += [(m.start(), m.end()) for m in re.finditer(left, norm) if m.end() > m.start()]
+            except re.error:
+                return None
+        return spans or None
+
+    @staticmethod
+    def __id_hold(items: list, spans: list, id_spans: Optional[List[Tuple[int, int]]], explained_by) -> bool:
+        """
+        识别词指定了作品、该作品开头的片名却解释不了的特典词:落在识别词匹配的那段(用户声明它就是片名)里、
+        在子目录名里、或定位不到识别词时分不清(True);都在那段之外时是标签,按特典(False)
+        """
+        if id_spans is None:
+            return True
+        for it, sp in zip(items, spans):
+            for h in it["hits"]:
+                if explained_by([h], sp):
+                    continue
+                if it.get("dir") or any(s < h[1] and h[0] < e for s, e in id_spans):
+                    return True
+        return False
+
+    def __resolve_soft_markers(self, batch_root: Path, batch_name: str, parsed: Dict[str, dict],
+                               soft_rels: List[str], primary: dict, independent: bool) -> Optional[dict]:
+        """
+        作品已定:软标记文件(文件名或子目录名里的特典词可能是片名一部分)按其全部标题核对,结论:
+        True=正片候选(特典词都在名字开头片名区的标题里,且有旁证 __soft_corroborated;识别词指定了作品的文件要指定的
+        就是本批作品);False=特典(特典词不属于片名;或属于片名但没有旁证而批次目录名带特典标签、目录名又不是该作品);
+        "hold"=待人工,不整理也不当特典清走(识别词对不上、电影年份与作品不符、属于片名但没有任何旁证、批次目录名带特典标签
+        而文件名像正片、片名前有认不出的内容)。
+        返回 {"state": {文件: 结论}, "notes": {文件: 待人工原因}, "conflict": [批次目录名里的特典标签],
+        "loose": [属于片名但没有旁证的文件], "folder_titled": 批次目录名开头就是该作品的片名,
+        "residue": [片名后跟着发布用词以外内容的电影文件]};取不到作品标题时 None
+        """
+        titles = self.__work_titles(primary)
+        if titles is None:
+            return None
+        variants, singles = titles
+        tv = primary.get("type") == MediaType.TV.value
+        work_year = primary.get("year")
+        is_dir = not batch_root.is_file()
+        conflict = self.__batch_name_labels(batch_name, variants, singles, movie=not tv) if is_dir else []
+        bnorm = unicodedata.normalize("NFKC", self.__clean_name(batch_name) or batch_name or "")
+        folder_titled = bool(is_dir and self.__title_region(bnorm, variants, singles))
+        # 名字自己的年份只在单文件批次或批次目录名就是该作品片名时算旁证,剧集"片名后接集号"只在目录名就是该作品片名时算:
+        # 目录批次里的通用名特典(Special Interview 01、Trailer (2014))识别成同名作品后会拿自己的集号/年份循环自证
+        allow_self = not is_dir or folder_titled
+        tv_rule = tv and folder_titled
+        remedy = "(改好目录名/文件名或识别词后,新文件出现或清单过期时会重新核对)"
+        both = f"批次目录名带特典标签 {'/'.join(conflict)},名字里的特典词又属于片名,分不清是正片还是特典,待人工{remedy}"
+        state: Dict[str, Any] = {}
+        notes: Dict[str, str] = {}
+        loose: List[str] = []
+        residue: List[str] = []
+        for rel in soft_rels:
+            v = parsed[rel]
+            items = v["soft"]
+            spans = [self.__title_region(it["norm"], variants, singles) for it in items]
+            explained = all(self.__hits_in_region(it["hits"], sp) for it, sp in zip(items, spans))
+            corroborated = independent or v.get("sxe") or any(
+                self.__soft_corroborated(it, sp, work_year, False, tv_rule, allow_self) for it, sp in zip(items, spans))
+            ok: Any = False
+            if v.get("id_source"):
+                if v.get("asserted_tmdb") != primary["tmdbid"]:
+                    ok, notes[rel] = "hold", f"识别词指定的不是本批作品,待人工{remedy}"
+                elif explained:
+                    ok = True
+                elif self.__id_hold(items, spans, v.get("id_spans"), self.__hits_in_region):
+                    ok, notes[rel] = "hold", f"识别词指定的作品与名字里的特典词对不上,待人工{remedy}"
+            elif not explained:
+                if not conflict and corroborated and self.__title_elsewhere(items, variants, singles):
+                    # 特典词都落在名字里某段作品标题里,只是片名前有认不出的内容:不当特典清走
+                    ok, notes[rel] = "hold", f"名字里的特典词属于片名,但片名前有认不出的内容,待人工{remedy}"
+            else:
+                off = next((it["year"] for it in items
+                            if not tv and it.get("year") and not self.__year_close(it["year"], work_year)), None)
+                if off:
+                    ok, notes[rel] = "hold", f"名字里的年份 {off} 与作品年份 {work_year} 不符(可能是同名作品),待人工{remedy}"
+                elif corroborated:
+                    ok = True
+                elif not conflict:
+                    ok, notes[rel] = "hold", f"名字里的特典词属于片名,但没有年份等旁证,分不清是正片还是特典,待人工{remedy}"
+                    loose.append(rel)
+                elif folder_titled:
+                    # 目录名开头就是该作品的片名(目录名识别瞬断时本该是旁证):不能因此当特典清走
+                    ok, notes[rel] = "hold", both
+            if ok is True and conflict:
+                ok, notes[rel] = "hold", both
+            if ok is True and not tv and any(not it.get("dir") and not self.__residue_ok(it, sp)
+                                             for it, sp in zip(items, spans)):
+                residue.append(rel)
+            v["marker"] = None if ok is True else v.get("soft_note") or "文件名标记"
+            state[rel] = ok
+        kept = [Path(r).name for r, ok in state.items() if ok is True]
+        if kept:
+            logger.info(f"批次 {batch_name}:{len(kept)} 个名字里的特典词属于《{primary['title']}》({primary['year']})"
+                        f"的片名,按正片候选处理:" + "; ".join(kept[:10]) + (" ..." if len(kept) > 10 else ""))
+        held = [f"{Path(r).name}({notes.get(r)})" for r, ok in state.items() if ok == "hold"]
+        if held:
+            logger.info(f"批次 {batch_name}:{len(held)} 个带特典词的文件分不清是正片还是特典:" + "; ".join(held[:10]))
+        rest = sum(1 for ok in state.values() if ok is False)
+        if rest:
+            logger.info(f"批次 {batch_name}:{rest} 个带特典词的文件仍按特典(特典词不属于《{primary['title']}》"
+                        f"开头的片名" + (f",且批次目录名带特典标签 {'/'.join(conflict)}" if conflict else "") + ")")
+        return {"state": state, "notes": notes, "conflict": conflict, "loose": loose, "folder_titled": folder_titled,
+                "residue": residue}
 
     def __batch_root(self, file_path: Path, mon_path: str) -> Optional[Path]:
         """文件所属批次根目录(监控目录下的一级子目录);直接位于监控目录的单文件无批次"""
@@ -1055,8 +1779,13 @@ class CloudLinkMonitor(_PluginBase):
                 kept = self.__batch_rels(batch_root, rels)
                 old_files = old.get("files") or {}
                 # 只要本批会被整理的文件都在清单里(没有新文件)就沿用:不看原始 digest,
-                # 否则过滤词放开后,建清单时被过滤掉的文件会没有条目而落到逐文件识别
-                if old.get("status") == "ok" and set(kept) <= set(old_files.keys()):
+                # 否则过滤词放开后,建清单时被过滤掉的文件会没有条目而落到逐文件识别。
+                # 旧版的全标记清单(没识别作品就整批按文件名特典词跳过,The Menu 这类电影会被当特典)按新规则重建
+                stale_marker = self.__stale_marker_manifest(old)
+                if stale_marker:
+                    logger.info(f"批次 {batch_root.stem if batch_root.is_file() else batch_root.name} 的清单按旧版"
+                                f"文件名特典词规则建立,按新规则重建")
+                if old.get("status") == "ok" and set(kept) <= set(old_files.keys()) and not stale_marker:
                     if old.get("digest") != digest and kept and all(
                             (old_files.get(r) or {}).get("c") in ("extra", "other")
                             or (old_files.get(r) or {}).get("llm_c") for r in kept):
@@ -1162,6 +1891,18 @@ class CloudLinkMonitor(_PluginBase):
                 self._manifests[key] = mf
                 self.__save_manifests()
             return mf if mf.get("status") == "ok" else None
+
+    @staticmethod
+    def __stale_marker_manifest(mf: Optional[dict]) -> bool:
+        """
+        按旧版特典判定规则建立、整批没有正片的清单:没识别作品就整批按文件名特典词/特典目录跳过(The Menu 这类电影、
+        Trailer.Park.Boys.S01/ 这类分季目录会被当特典)。取清单时按新规则重建;残留清理不能信它
+        (重建前同一轮对账里就会把目录当残留隔离)。已有正片的清单不重建(正片搬走后只剩特典,重建会把残留当正片)
+        """
+        return bool(mf) and mf.get("status") == "ok" and not mf.get("media") \
+            and mf.get("marker_rev") != MARKER_REV \
+            and any(str((e or {}).get("note") or "").startswith(("文件名标记", "目录 "))
+                    for e in (mf.get("files") or {}).values())
 
     def __release_retry_batches(self):
         """手动全量运行:挂起中的批次不等退避到期,下一次取清单时立即重算"""
@@ -1496,16 +2237,9 @@ class CloudLinkMonitor(_PluginBase):
         rels = [m[0] for m in media]
         dropped = len(listing["media"]) - len(media)
         mf = {"digest": digest, "time": time.time(), "status": "failed", "files": {}, "media": None,
-              "how": "", "unknown": []}
+              "how": "", "unknown": [], "marker_rev": MARKER_REV}
         # 自定义识别词变了:按标题缓存的识别结果作废(否则改了词后还拿旧结果)
-        try:
-            words_sig = hashlib.md5(json.dumps(self.systemconfig.get(SystemConfigKey.CustomIdentifiers) or [],
-                                               ensure_ascii=False).encode("utf-8")).hexdigest()
-        except Exception:
-            words_sig = None
-        if words_sig != self._words_sig:
-            self._recog_cache = {}
-            self._words_sig = words_sig
+        self.__sync_words_sig()
         try:
             parsed: Dict[str, dict] = {}
             for rel, size, _ in media:
@@ -1515,21 +2249,33 @@ class CloudLinkMonitor(_PluginBase):
                 # 自定义识别词直接指定了作品 id(「错误剧名 => {[tmdbid=…;type=tv]}」):剩下的"剧名"只是替换后的残渣
                 # (如只剩年份 2012),不能拿去识别;改按 id 计票。清洗后的名字套不上词时,再用原始文件名试一次(MP 自己
                 # 逐文件识别用的是原始文件名,按原文写的词也要认)
-                ident = self.__word_identity(meta)
+                ident, id_meta = self.__word_identity(meta), meta
                 if not ident["source"] and p.stem != cleaned:
-                    raw = self.__word_identity(MetaInfo(title=p.stem))
+                    raw_meta = MetaInfo(title=p.stem)
+                    raw = self.__word_identity(raw_meta)
                     if raw["source"] or (raw["season"] and not ident["season"]):
-                        ident = raw
+                        ident, id_meta = raw, raw_meta
                 asserted_id = ident["tmdbid"]
                 asserted_season = ident["season"]
                 marker = None
+                soft: List[dict] = []
                 for part in p.parts[:-1]:
-                    if _extra_dir(part):
-                        marker = f"目录 {part}"
+                    dkind, dsoft = self.__dir_marker(part)
+                    if dkind == "hard":
+                        marker, soft = f"目录 {part}", []
                         break
-                if not marker and not re.search(r"S\d{1,2}E\d{1,3}", cleaned, re.IGNORECASE) \
-                        and SP_FILE_RE.search(cleaned):
-                    marker = "文件名标记"
+                    if dkind == "soft":
+                        soft.append(dsoft)
+                if not marker:
+                    kind, fsoft = self.__marker_info(cleaned)
+                    if kind == "hard":
+                        marker, soft = "文件名标记", []
+                    elif kind == "soft":
+                        soft.append(fsoft)
+                    if soft:
+                        # 软标记(文件名/子目录名里的特典词可能是片名的一部分:The Menu、Trailer.Park.Boys.S01/)
+                        # 定下作品后按其标题核对(__resolve_soft_markers);核对不过时仍按这个标记记为特典
+                        marker = "文件名标记" if kind == "soft" else f"目录 {soft[0]['dir']}"
                 season = meta.begin_season
                 if season is not None and not EXPLICIT_SEASON_RE.search(cleaned) and not asserted_season:
                     # 解析器凭空给出的季号(如 "[4th - 08]" -> S01E08)不可信,按未知处理,交给下载记录/目录名/LLM;
@@ -1542,8 +2288,33 @@ class CloudLinkMonitor(_PluginBase):
                                "mt": ident["type"].value if ident["type"] else None,
                                "tmdbid": asserted_id, "id_source": ident["source"],
                                "season_declared": bool(asserted_season and ident.get("season_value") is not None),
-                               "marker": marker, "size": size, "pattern": re.sub(r"\d+", "#", cleaned.lower())}
+                               "marker": marker, "soft": soft or None, "soft_note": marker if soft else None,
+                               "id_spans": self.__word_spans(id_meta, unicodedata.normalize("NFKC", cleaned))
+                               if ident["source"] and soft else None,
+                               "sxe": bool(re.search(r"S\d{1,2}E\d{1,3}", cleaned, re.IGNORECASE)), "size": size,
+                               "pattern": re.sub(r"\d+", "#", cleaned.lower())}
             batch_name = batch_root.stem if batch_root.is_file() else batch_root.name
+
+            def all_extra(why: str = "") -> dict:
+                # 全是特典/附加(NCOP/PV/CM、扫图/特典目录等)或会被过滤的文件:规则映射对它们一律跳过
+                mf["files"] = {rel: {"c": "extra", "how": "rule", "note": v["marker"]} for rel, v in parsed.items()}
+                mf["how"] = "规则"
+                mf["status"] = "ok"
+                logger.info(f"批次清单[规则] {batch_name}:没有可整理的正片({why}{len(parsed)} 个特典/附加"
+                            + (f",{dropped} 个会被过滤" if dropped else "") + "),跳过")
+                return mf
+
+            soft_rels = [rel for rel, v in parsed.items() if v.get("soft")]
+            # trial:全都带标记,但有的特典词可能是片名的一部分(The.Menu.2022、Interview.with.the.Vampire.1994):
+            # 这些文件先照常参与作品识别投票,定下作品后再按其标题核对(认不出作品同样挂起,不猜)
+            trial = False
+            if all(v["marker"] for v in parsed.values()):
+                if not soft_rels:
+                    # 与属于哪部作品无关,不必识别作品(认不出也不该挂起、通知)
+                    return all_extra()
+                for rel in soft_rels:
+                    parsed[rel]["marker"] = None
+                trial = True
 
             plain = [v for v in parsed.values() if not v["marker"]]
             batch_tv = bool(plain) and 2 * sum(1 for v in plain if v.get("tv")) > len(plain)
@@ -1552,31 +2323,35 @@ class CloudLinkMonitor(_PluginBase):
                 # 日志、退避与通知由 __get_manifest 按实际复查间隔统一处理;tv 用于通知里给出 type=tv/movie 的写法
                 return {"pending": True, "retry_in": retry_in, "reason": reason, "kind": kind, "tv": batch_tv}
 
-            if all(v["marker"] for v in parsed.values()):
-                # 全是特典/附加(NCOP/PV/CM、扫图/特典目录等)或会被过滤的文件:规则映射对它们一律跳过,
-                # 与属于哪部作品无关,不必识别作品(认不出也不该挂起、通知)
-                mf["files"] = {rel: {"c": "extra", "how": "rule", "note": v["marker"]} for rel, v in parsed.items()}
-                mf["how"] = "规则"
-                mf["status"] = "ok"
-                logger.info(f"批次清单[规则] {batch_name}:没有可整理的正片"
-                            f"({len(parsed)} 个特典/附加" + (f",{dropped} 个会被过滤" if dropped else "") + "),跳过")
-                return mf
+            def word_gate(items: List[dict]) -> Optional[dict]:
+                # 识别词问题:没写 type=(TMDB 电影和剧集的 id 各自编号,不能猜)、用了非 TMDB 的 id、或 id 查不到
+                untyped = sorted({v["tmdbid"] for v in items if v.get("tmdbid") and not v.get("mt")})
+                other_src = sorted({str(v.get("id_source")) for v in items
+                                    if v.get("id_source") and v.get("id_source") != MediaSource.TMDB.value})
+                unresolved = sorted({v["tmdbid"] for v in items
+                                     if v.get("tmdbid") and v.get("mt") and not v.get("asserted_tmdb")})
+                if untyped:
+                    return transient_retry(f"自定义识别词指定了 TMDB {untyped} 但没写 type=movie/tv"
+                                           f"(TMDB 电影与剧集的 id 各自编号,不能猜),请补上", 1800, kind="asserted_unresolved")
+                if other_src:
+                    return transient_retry(f"自定义识别词用的是 {'/'.join(other_src)} 的 id,批次清单只认 TMDB,请改用 tmdbid",
+                                           1800, kind="asserted_unresolved")
+                if unresolved:
+                    return transient_retry(f"自定义识别词指定的 TMDB {unresolved} 查询失败(id/type 可能写错,或 TMDB 暂时不可用)",
+                                           1800, kind="asserted_unresolved")
+                return None
+
+            def independent_of(series: dict) -> bool:
+                # 作品不只来自软标记文件自己的名字:识别词/直通记录、批次目录名(单文件批次的"目录名"就是它自己)、其他正片文件
+                srcs = set(series.get("src") or [])
+                return bool(series.get("direct") or series.get("asserted")
+                            or (not batch_root.is_file() and srcs & {"目录名", "目录名(去序号)"})
+                            or (not trial and srcs & {"文件名", "文件名(去序号)"}))
 
             candidates = self.__series_candidates(batch_name, parsed)
-            # 识别词问题:没写 type=(TMDB 电影和剧集的 id 各自编号,不能猜)、用了非 TMDB 的 id、或 id 查不到
-            untyped = sorted({v["tmdbid"] for v in plain if v.get("tmdbid") and not v.get("mt")})
-            other_src = sorted({str(v.get("id_source")) for v in plain
-                                if v.get("id_source") and v.get("id_source") != MediaSource.TMDB.value})
-            unresolved = sorted({v["tmdbid"] for v in plain if v.get("tmdbid") and v.get("mt") and not v.get("asserted_tmdb")})
-            if untyped:
-                return transient_retry(f"自定义识别词指定了 TMDB {untyped} 但没写 type=movie/tv"
-                                       f"(TMDB 电影与剧集的 id 各自编号,不能猜),请补上", 1800, kind="asserted_unresolved")
-            if other_src:
-                return transient_retry(f"自定义识别词用的是 {'/'.join(other_src)} 的 id,批次清单只认 TMDB,请改用 tmdbid",
-                                       1800, kind="asserted_unresolved")
-            if unresolved:
-                return transient_retry(f"自定义识别词指定的 TMDB {unresolved} 查询失败(id/type 可能写错,或 TMDB 暂时不可用)",
-                                       1800, kind="asserted_unresolved")
+            gate = word_gate(plain)
+            if gate:
+                return gate
             first_strong = next((c for c in candidates if set(c.get("src") or []) & STRONG_SRCS), None)
             if first_strong is None:
                 # 本批文件名/目录名/直通记录都认不出作品(剩下的只有零票旁听或近期下载/订阅的其他作品):
@@ -1598,8 +2373,84 @@ class CloudLinkMonitor(_PluginBase):
                     f"同名同年作品 TMDB {twin['tmdbid']}《{twin['title']}》({twin['year']}) 比 TMDB {primary['tmdbid']}"
                     f"《{primary['title']}》({primary['year']}) 更装得下本批集号(TMDB 集数未更新或另有同名作品),分不清,不猜",
                     1800, kind="ambiguous")
+            soft_state = None
+            soft_hold: List[str] = []
+            soft_notes: Dict[str, str] = {}
+
+            def report_unknown(files: Dict[str, dict], title: str):
+                # 待人工的文件(季集无法确定/分不清是正片还是特典):清单里记为 unknown,不整理、残留清理也不清走
+                unknown = [r for r, v in files.items() if v.get("c") == "unknown"]
+                mf["unknown"] = unknown
+                if not unknown:
+                    return
+                detail = "; ".join(f"{Path(r).name}({files[r].get('note') or '?'})" for r in unknown[:20])
+                logger.warn(f"批次 {batch_name} 有 {len(unknown)} 个文件无法确定,已跳过待人工处理:{detail}")
+                if self._notify and not self._order_override:
+                    self.post_message(mtype=NotificationType.Manual,
+                                      title=f"{title} 批次有 {len(unknown)} 个文件无法确定,已跳过待人工处理",
+                                      text="\n".join(f"{Path(r).name}({files[r].get('note') or '?'})"
+                                                     for r in unknown[:15]))
+
+            def resolve_soft(series: dict):
+                # 返回 (核对结果, 挂起结果);核对结果见 __resolve_soft_markers
+                resolved = self.__resolve_soft_markers(batch_root, batch_name, parsed, soft_rels, series,
+                                                       independent_of(series))
+                if resolved is None:
+                    return None, transient_retry(f"取不到 TMDB {series['tmdbid']}《{series['title']}》的标题,"
+                                                 f"无法核对名字里的特典词是否属于片名")
+                if resolved["loose"] and resolved["folder_titled"] \
+                        and not set(series.get("src") or []) & {"目录名", "目录名(去序号)"}:
+                    # 批次目录名开头就是该作品的片名,目录名识别却没有落到它(识别服务瞬断/目录名年份写错):
+                    # 文件名里的特典词只能靠目录名作旁证,暂缓复查,不当特典也不猜
+                    return None, transient_retry(
+                        f"批次目录名是《{series['title']}》的片名,但目录名没有识别出该作品,无法核对 "
+                        f"{'; '.join(Path(r).name for r in resolved['loose'][:3])} 是正片还是特典", 1800, kind="no_evidence")
+                return resolved, None
+
+            if soft_rels:
+                # 作品已定:软标记文件按其全部标题核对,特典词都在开头片名区里且有旁证的才按正片候选,
+                # 其余是特典或待人工(__resolve_soft_markers)
+                resolved, held = resolve_soft(primary)
+                if held:
+                    return held
+                soft_state = resolved["state"]
+                soft_notes = resolved["notes"]
+                sole = [rel for rel, v in parsed.items() if not v["marker"]]
+                if primary["type"] == MediaType.MOVIE.value and len(sole) == 1 and sole[0] in resolved["residue"]:
+                    # 电影批次唯一的正片候选是片名后跟着发布用词以外内容的软标记文件(The Interview (2014) - Line-O-Rama,
+                    # 纯特典盘):可能是以片名开头命名的特典,不当正片整理,也不当特典清走
+                    parsed[sole[0]]["marker"] = parsed[sole[0]].get("soft_note") or "文件名标记"
+                    soft_state[sole[0]] = "hold"
+                    soft_notes[sole[0]] = ("片名后面跟着发布用词以外的内容,本批又只有这一个正片候选,"
+                                           "可能是以片名开头命名的特典,待人工")
+                    logger.info(f"批次 {batch_name}:{Path(sole[0]).name} {soft_notes[sole[0]]}")
+                soft_hold = [rel for rel, ok in soft_state.items() if ok == "hold"]
+                plain = [v for v in parsed.values() if not v["marker"]]
+                batch_tv = bool(plain) and 2 * sum(1 for v in plain if v.get("tv")) > len(plain)
+                # 刚成为正片候选(或识别词待人工)的文件也要过识别词检查(漏写 type=/非 TMDB id/id 查不到)
+                gate = word_gate(plain + [parsed[rel] for rel in soft_hold])
+                if gate:
+                    return gate
+                if not plain:
+                    all_extra(f"特典词不属于《{primary['title']}》({primary['year']})的片名或待人工,")
+                    for rel in soft_hold:
+                        mf["files"][rel] = {"c": "unknown", "how": "rule", "note": soft_notes.get(rel)}
+                    report_unknown(mf["files"], primary["title"])
+                    return mf
             year_counts = Counter(v.get("year") for v in plain if v.get("year"))
             file_year = year_counts.most_common(1)[0][0] if year_counts else None
+            if primary["type"] == MediaType.MOVIE.value and file_year and not primary.get("direct") \
+                    and not primary.get("asserted") and not self.__year_close(primary.get("year"), file_year) \
+                    and not set(primary.get("src") or []) & (STRONG_SRCS - {"目录名", "目录名(去序号)"}):
+                # 电影只凭目录名定下(目录名票数盖过了文件名),年份却与文件对不上,文件名又认出了年份相符的作品:
+                # 多半是同名不同年的作品(Halloween (2018)/Halloween.1978…),分不清,不猜
+                alt = next((c for c in candidates if c is not primary and self.__year_close(c.get("year"), file_year)
+                            and set(c.get("src") or []) & {"文件名", "文件名(去序号)"}), None)
+                if alt:
+                    return transient_retry(
+                        f"目录名识别为《{primary['title']}》({primary['year']}),文件名年份却是 {file_year},"
+                        f"文件名识别为《{alt['title']}》({alt['year']}) TMDB {alt['tmdbid']},分不清,不猜",
+                        1800, kind="ambiguous")
             # 本批自带年份且与主候选一致:零票旁听作品不能推翻(LLM 换选同样适用)
             year_locked = bool(file_year) and str(primary.get("year")) == str(file_year)
             if primary.get("asserted") and plain:
@@ -1686,6 +2537,15 @@ class CloudLinkMonitor(_PluginBase):
                     else:
                         logger.info(f"批次 {batch_name}:LLM 判定属于备选作品 {alt['title']} ({alt['year']}) TMDB {alt_id}")
                         primary = alt
+                        if soft_state is not None:
+                            # 软标记是按原作品的标题核对的:换了作品要按新作品的标题重核,结论变了就不猜
+                            again, held = resolve_soft(primary)
+                            if held:
+                                return held
+                            if again["state"] != soft_state:
+                                return transient_retry(
+                                    f"LLM 判定属于 TMDB {alt_id}《{alt['title']}》({alt['year']}),但按它的标题核对文件名里的"
+                                    f"特典词与原作品结论不同(哪些是正片会变),不猜", 1800, kind="ambiguous")
                         attach_binding(primary)
                         order, structure = build_structure(primary)
                         if primary["type"] == MediaType.TV.value and not structure.get("seasons"):
@@ -1708,6 +2568,10 @@ class CloudLinkMonitor(_PluginBase):
                 if _v.get("asserted_tmdb") and _v["asserted_tmdb"] != primary["tmdbid"] and not _v["marker"]:
                     files[_rel] = {"c": "unknown", "how": "rule",
                                    "note": f"识别词指定 TMDB {_v['asserted_tmdb']},与本批作品 TMDB {primary['tmdbid']} 不符"}
+            for _rel in soft_hold:
+                # 分不清是正片还是特典的软标记文件(识别词对不上/年份不符/没有旁证/批次目录名带特典标签):不整理,
+                # 也不当特典清走,待人工
+                files[_rel] = {"c": "unknown", "how": "rule", "note": soft_notes.get(_rel) or "待人工"}
             mf["files"] = files
             mf["media"] = {k: primary.get(k) for k in ("tmdbid", "title", "year", "type")}
             mf["media"]["episode_group"] = order.get("group_id")
@@ -1728,15 +2592,7 @@ class CloudLinkMonitor(_PluginBase):
                        if v.get("c") in ("extra", "other")]
             if skipped:
                 logger.info("跳过(特典/附加/杂项):" + "; ".join(skipped[:40]) + (" ..." if len(skipped) > 40 else ""))
-            unknown = [r for r, v in files.items() if v.get("c") == "unknown"]
-            mf["unknown"] = unknown
-            if unknown:
-                detail = "; ".join(f"{Path(r).name}({files[r].get('note') or '?'})" for r in unknown[:20])
-                logger.warn(f"批次 {batch_name} 有 {len(unknown)} 个文件无法确定季集,已跳过待人工处理:{detail}")
-                if self._notify and not self._order_override:
-                    self.post_message(mtype=NotificationType.Manual,
-                                      title=f"{primary['title']} 批次有 {len(unknown)} 个文件无法确定季集,已跳过",
-                                      text="\n".join(Path(r).name for r in unknown[:15]))
+            report_unknown(files, primary["title"])
             return mf
         except Exception as e:
             logger.error(f"建立批次清单失败 {batch_root}:{str(e)} - {traceback.format_exc()}")
@@ -2042,13 +2898,19 @@ class CloudLinkMonitor(_PluginBase):
         # 每个文件记下它被指定的作品(asserted_tmdb),映射后不属于本批作品的文件一律不整理
         id_votes = Counter((v["tmdbid"], v["mt"]) for v in parsed.values()
                            if v.get("tmdbid") and v.get("mt") and not v["marker"])
-        for (tid, mt), cnt in id_votes.most_common():
+        # 还带着软标记的文件(不投票)的识别词也要解析:之后按正片候选时,指定的必须是本批作品
+        soft_pairs = sorted({(v["tmdbid"], v["mt"]) for v in parsed.values()
+                             if v.get("tmdbid") and v.get("mt") and v.get("soft")} - set(id_votes))
+        for tid, mt in [p for p, _ in id_votes.most_common()] + soft_pairs:
             imi = self.__recognize_id(tid, MediaType(mt))
             if not imi or not getattr(imi, "tmdb_id", None):
                 continue
             for v in parsed.values():
                 if v.get("tmdbid") == tid and v.get("mt") == mt:
                     v["asserted_tmdb"] = imi.tmdb_id
+            cnt = id_votes.get((tid, mt), 0)
+            if not cnt:
+                continue
             add(imi.tmdb_id, imi.title, imi.year, imi.type.value, cnt, "识别词", groups=mi_groups(imi))
             if votes.get(str(imi.tmdb_id)):
                 votes[str(imi.tmdb_id)]["asserted"] = True
@@ -2098,9 +2960,15 @@ class CloudLinkMonitor(_PluginBase):
             if dident.get("tmdbid") and dident.get("type"):
                 mi = self.__recognize_id(dident["tmdbid"], dident["type"])
         else:
-            # 目录名自带的 id 标签不是用户声明(也没有类型):剥掉后按标题识别,不让本批文件猜的类型决定去哪个库查 id
+            # 目录名自带的 id 标签不是用户声明(也没有类型):剥掉后按标题识别,不让本批文件猜的类型决定去哪个库查 id。
+            # 不带年份的目录名(The Interview/)按本批文件的年份识别:裸标题会落到最新的同名作品上,
+            # 年份对不上的同名作品只零票旁听(不能靠目录名的 3 票盖过文件名)
             dtitle = re.sub(r"\s{2,}", " ", ID_TAG_RE.sub(" ", batch_clean)).strip()
-            mi = self.__recognize_title(dtitle, batch_type) if dtitle else None
+            if dtitle:
+                mi, off_year = self.__recognize_dir_title(dtitle, file_year, batch_type)
+                if off_year:
+                    add(off_year.tmdb_id, off_year.title, off_year.year, off_year.type.value, 0, "目录名(年份不符)",
+                        groups=mi_groups(off_year))
         if mi and getattr(mi, "tmdb_id", None):
             add(mi.tmdb_id, mi.title, mi.year, mi.type.value, 3, "目录名", groups=mi_groups(mi))
         elif dtitle:
@@ -3126,6 +3994,10 @@ class CloudLinkMonitor(_PluginBase):
                     newest = max(f.stat().st_mtime for f in files)
                     if time.time() - newest < 1800:
                         continue
+                    if ((self._manifests or {}).get(str(child)) or {}).get("status") == "retry" \
+                            or str(child) in (self._recheck_pending or ()):
+                        # 挂起中的批次还在等作品判定(认不出/分不清/TMDB 故障),或清单还没定(稳定窗口内、排着复查):不是残留
+                        continue
                     pending, failed = [], []
                     for f in files:
                         suffix = f.suffix.lower()
@@ -3143,13 +4015,17 @@ class CloudLinkMonitor(_PluginBase):
                         if self.__match_any(keywords, str(f)):
                             continue
                         mf = (self._manifests or {}).get(str(child))
-                        entry = self.__manifest_entry(mf, child, f) if mf and mf.get("status") == "ok" else None
+                        # 旧版规则建立的全标记清单不可信(可能把 The Menu 这类电影当特典),按文件名判定
+                        entry = self.__manifest_entry(mf, child, f) \
+                            if mf and mf.get("status") == "ok" and not self.__stale_marker_manifest(mf) else None
                         if entry:
                             if entry.get("c") in ("extra", "other"):
                                 continue
                             pending.append(f)
                             continue
-                        if self.__extra_verdict(f, mon_path):
+                        # 没有当前清单(建立失败/旧版清单):只有确定是特典的(特典目录、文件名硬标记)才算残留;
+                        # 特典词可能是片名的(软标记)宁可留着,不把电影当残留清走
+                        if self.__lexical_extra(f, mon_path):
                             continue
                         pending.append(f)
                     if failed:
