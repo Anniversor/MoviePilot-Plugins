@@ -59,7 +59,7 @@ class CloudStrmCompanion(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -111,6 +111,9 @@ class CloudStrmCompanion(_PluginBase):
     _emby_paths = {}
     _path_replacements = {}  # 新增：路径替换规则属性
     _cloud_files_json = "cloud_files.json"
+    # 删除 strm 时一并删除的同名附属文件
+    _companion_exts = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub", ".sup", ".vtt",
+                       ".idx", ".smi"}
     _headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_2_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.192 Safari/537.36",
         "Cookie": "",
@@ -320,8 +323,53 @@ class CloudStrmCompanion(_PluginBase):
                 logger.error(f"未找到文件 {file_path} 对应的监控目录")
                 return
 
-            # 处理单文件
-            self.__handle_file(event_path=file_path, mon_path=mon_path)
+            # 处理单文件(cover:调用方要求覆盖已有 strm,如洗版换版后同名 strm 要改指向新文件)
+            self.__handle_file(event_path=file_path, mon_path=mon_path, cover=bool(event_data.get("cover")))
+
+    @eventmanager.register(EventType.PluginAction)
+    def strm_delete(self, event: Event = None):
+        """
+        云端媒体文件已删除(如洗版换版删掉了旧版本)时,删除它的 strm 及同名附属文件(nfo/缩略图/字幕),
+        并通知 Emby 移除条目。只删内容确实指向该文件的 strm。
+        """
+        if not event:
+            return
+        event_data = event.event_data
+        if not event_data or event_data.get("action") != "cloudstrm_delete":
+            return
+        file_path = event_data.get("file_path")
+        if not file_path:
+            logger.error(f"缺少参数：{event_data}")
+            return
+        mon_path = next((mon for mon in self._strm_dir_conf.keys() if str(file_path).startswith(mon)), None)
+        if not mon_path:
+            logger.error(f"未找到文件 {file_path} 对应的监控目录")
+            return
+        try:
+            with lock:
+                target = Path(str(file_path).replace(mon_path, self._strm_dir_conf.get(mon_path)))
+                stem = target.stem
+                strm_file = target.parent / f"{stem}.strm"
+                if not strm_file.exists():
+                    logger.info(f"{strm_file} 不存在，无需删除")
+                    return
+                content = strm_file.read_text(encoding="utf-8").strip()
+                if Path(urllib.parse.unquote(content)).name != Path(file_path).name:
+                    logger.warn(f"{strm_file} 指向 {content}，不是已删除的 {Path(file_path).name}，保留")
+                    return
+                removed = [strm_file]
+                for file in target.parent.iterdir():
+                    if file.is_file() and file != strm_file \
+                            and file.suffix.lower() in self._companion_exts \
+                            and (file.name.startswith(stem + ".") or file.name == f"{stem}-thumb.jpg"):
+                        removed.append(file)
+                for file in removed:
+                    file.unlink()
+                logger.info(f"已删除 strm 及附属文件：{', '.join(file.name for file in removed)}")
+            if self._refresh_emby and self._mediaservers:
+                self.__refresh_emby_file(str(strm_file), update_type="Deleted")
+        except Exception as e:
+            logger.error(f"删除 strm 失败：{file_path} - {str(e)} - {traceback.format_exc()}")
 
     def event_handler(self, event, mon_path: str, text: str, event_path: str):
         """
@@ -339,11 +387,12 @@ class CloudStrmCompanion(_PluginBase):
             logger.debug("监控到文件%s：%s" % (text, event_path))
             self.__handle_file(event_path=event_path, mon_path=mon_path)
 
-    def __handle_file(self, event_path: str, mon_path: str):
+    def __handle_file(self, event_path: str, mon_path: str, cover: bool = False):
         """
         同步一个文件
         :param event_path: 事件文件路径
         :param mon_path: 监控目录
+        :param cover: 已有 strm 时也覆盖(不受全局覆盖开关限制)
         """
         try:
             if not Path(event_path).exists():
@@ -372,7 +421,8 @@ class CloudStrmCompanion(_PluginBase):
                     # 生成strm文件
                     self.__create_strm_file(strm_file=target_file,
                                             strm_content=strm_content,
-                                            source_file=event_path)
+                                            source_file=event_path,
+                                            cover=cover)
 
                     # nfo、jpg等同名文件
                     pattern = Path(event_path).stem.replace('[', '?').replace(']', '?')
@@ -478,13 +528,14 @@ class CloudStrmCompanion(_PluginBase):
         else:
             return None
 
-    def __create_strm_file(self, strm_file: str, strm_content: str, source_file: str = None):
+    def __create_strm_file(self, strm_file: str, strm_content: str, source_file: str = None, cover: bool = False):
 
         """
         生成strm文件
         :param strm_file: strm文件路径
         :param strm_content: strm文件内容
         :param source_file: 云盘挂载源文件路径（通知Emby前校验可见性）
+        :param cover: 已有 strm 时也覆盖
         """
         try:
             # 文件
@@ -496,7 +547,7 @@ class CloudStrmCompanion(_PluginBase):
             strm_file = os.path.join(Path(strm_file).parent, f"{os.path.splitext(Path(strm_file).name)[0]}.strm")
 
             # 媒体文件
-            if Path(strm_file).exists() and not self._cover:
+            if Path(strm_file).exists() and not (self._cover or cover):
                 logger.debug(f"目标文件 {strm_file} 已存在")
                 return
             # 新增：应用自定义路径替换规则
@@ -769,9 +820,9 @@ class CloudStrmCompanion(_PluginBase):
             return False
         return self.__rc_call("vfs/refresh", {"fs": self._rc_fs, "dir": rel})
 
-    def __refresh_emby_file(self, strm_file: str):
+    def __refresh_emby_file(self, strm_file: str, update_type: str = "Created"):
         """
-        通知emby刷新文件
+        通知emby刷新文件(update_type:Created 新增/Deleted 删除)
         """
         emby_servers = self.mediaserver_helper.get_services(name_filters=self._mediaservers, type_filter="emby")
         if not emby_servers:
@@ -785,7 +836,7 @@ class CloudStrmCompanion(_PluginBase):
             self._EMBY_APIKEY = emby_server.config.config.get("apikey")
             self._EMBY_HOST = emby_server.config.config.get("host")
 
-            logger.info(f"开始通知媒体服务器 {emby_name} 刷新增量文件 {strm_file}")
+            logger.info(f"开始通知媒体服务器 {emby_name} {'移除' if update_type == 'Deleted' else '刷新增量'}文件 {strm_file}")
             try:
                 res = emby.post_data(
                     url=f'[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
@@ -793,7 +844,7 @@ class CloudStrmCompanion(_PluginBase):
                         "Updates": [
                             {
                                 "Path": strm_file,
-                                "UpdateType": "Created",
+                                "UpdateType": update_type,
                             }
                         ]
                     }),

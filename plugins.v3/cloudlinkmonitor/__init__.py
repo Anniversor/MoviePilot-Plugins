@@ -306,7 +306,7 @@ class CloudLinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.6.2"
+    plugin_version = "3.7.0"
     # 插件作者
     plugin_author = "thsrite,Anniversor"
     # 作者主页
@@ -364,6 +364,8 @@ class CloudLinkMonitor(_PluginBase):
     _batch_settle = 120
     _emby_reprobe = True
     _emby_sync_group = True
+    # 洗版订阅的新版本入库后删除同集旧版本
+    _best_version_replace = True
     _group_map = ""
     _batch_list_cache = None
     # 作品编号体系(剧集组)持久化映射与进程内状态
@@ -475,6 +477,7 @@ class CloudLinkMonitor(_PluginBase):
                 self._batch_settle = 120
             self._emby_reprobe = config.get("emby_reprobe", True)
             self._emby_sync_group = config.get("emby_sync_group", True)
+            self._best_version_replace = config.get("best_version_replace", True)
             try:
                 self._notify_probe_interval = int(config.get("notify_probe_interval") or 180)
             except (TypeError, ValueError):
@@ -658,6 +661,7 @@ class CloudLinkMonitor(_PluginBase):
             "batch_settle": self._batch_settle,
             "emby_reprobe": self._emby_reprobe,
             "emby_sync_group": self._emby_sync_group,
+            "best_version_replace": self._best_version_replace,
             "notify_probe_interval": self._notify_probe_interval,
             "group_map": self._group_map,
         })
@@ -4681,7 +4685,15 @@ class CloudLinkMonitor(_PluginBase):
                 'action': 'cloudstrm_file'
             })
 
-        if pre_item:
+        # 洗版换版:洗版订阅下的新版本入库后,删掉同集的旧版本(文件名不同,size 覆盖管不到)
+        replaced = {}
+        if self._best_version_replace and not is_subtitle and mediainfo.type == MediaType.TV:
+            try:
+                replaced = self.__replace_old_versions(mediainfo, file_meta, transferinfo)
+            except Exception as e:
+                logger.error(f"洗版换版出错:{str(e)} - {traceback.format_exc()}")
+        # 只换掉了不同名的旧版本时,Emby 已有条目就是被删的旧版本,新版本是新条目,不用重探
+        if pre_item and not (replaced.get("other") and not replaced.get("same")):
             self.__emby_reprobe_later(pre_item, file_path.name)
         if entry and manifest.get("sync_emby") and not is_subtitle:
             media = manifest.get("media") or {}
@@ -4700,6 +4712,218 @@ class CloudLinkMonitor(_PluginBase):
                 if not files:
                     logger.warn(f"移动模式，删除空目录：{file_dir}")
                     shutil.rmtree(file_dir, ignore_errors=True)
+
+    @staticmethod
+    def __subscribe_of(his) -> Optional[dict]:
+        """下载记录的出处是订阅时,返回记录里的订阅快照 {"id","name",...};否则 None"""
+        note = getattr(his, "note", None)
+        if isinstance(note, str):
+            try:
+                note = json.loads(note)
+            except Exception:
+                return None
+        source = str((note or {}).get("source") or "") if isinstance(note, dict) else ""
+        if not source.startswith("Subscribe|"):
+            return None
+        try:
+            sub = json.loads(source.split("|", 1)[1])
+        except Exception:
+            return None
+        return sub if isinstance(sub, dict) else None
+
+    @staticmethod
+    def __is_best_version_subscribe(sid, tmdbid: str, season: int) -> bool:
+        """订阅(进行中,或已洗完移入订阅历史)是否为洗版订阅"""
+        try:
+            from app.db.subscribe_oper import SubscribeOper
+            sub = SubscribeOper().get(int(sid)) if sid else None
+            if sub is not None and str(getattr(sub, "media_id", "") or "") == tmdbid:
+                return bool(getattr(sub, "best_version", False))
+        except Exception as e:
+            logger.debug(f"读取订阅 {sid} 失败:{str(e)}")
+        # 订阅洗完后会移入订阅历史:最后几集的新版本往往在订阅完成之后才整理到
+        try:
+            from sqlalchemy import select
+            from app.db.models.subscribehistory import SubscribeHistory
+            from app.db.oper.subscribehistory import SubscribeHistoryOper
+            rows = SubscribeHistoryOper()._execute_sync_query(
+                lambda session: session.execute(select(SubscribeHistory).where(
+                    SubscribeHistory.media_id == tmdbid, SubscribeHistory.season == season)).scalars().all())
+            return any(getattr(r, "best_version", False) for r in rows or [])
+        except Exception as e:
+            logger.debug(f"读取订阅历史失败:{str(e)}")
+        return False
+
+    def __best_version_source(self, tmdbid, season: int, episode: int) -> Optional[str]:
+        """这一集近 14 天内是否由洗版订阅下载过:是则返回出处描述,否则 None"""
+        tmdbid = str(tmdbid or "")
+        if not tmdbid or season is None or episode is None:
+            return None
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+        checked = {}
+        try:
+            records = self.downloadhis.list_by_page(1, 200) or []
+        except Exception as e:
+            logger.debug(f"读取下载记录失败:{str(e)}")
+            return None
+        for his in records:
+            if str(getattr(his, "media_source", "") or "") != "themoviedb" \
+                    or str(getattr(his, "media_id", "") or "") != tmdbid \
+                    or str(getattr(his, "date", "") or "") < cutoff:
+                continue
+            seasons = {int(s) for s in re.findall(r"S(\d{1,3})", str(his.seasons or ""), re.IGNORECASE)}
+            if int(season) not in seasons:
+                continue
+            eps = set()
+            for m in EP_RANGE_RE.finditer(str(his.episodes or "")):
+                a = int(m.group(1))
+                b = int(m.group(2)) if m.group(2) else a
+                eps.update(range(min(a, b), max(a, b) + 1))
+            # 无集号的是整季包,覆盖这一季所有集
+            if eps and int(episode) not in eps:
+                continue
+            sub = self.__subscribe_of(his)
+            if not sub:
+                continue
+            sid = sub.get("id")
+            if sid not in checked:
+                checked[sid] = self.__is_best_version_subscribe(sid, tmdbid, int(season))
+            if checked[sid]:
+                return f"洗版订阅 #{sid} {sub.get('name') or ''} 的下载 {his.torrent_name or ''}".strip()
+        return None
+
+    def __plan_version_replace(self, target: Path, tmdbid, season: int, episode: int, new_size: int) -> dict:
+        """
+        找出目标目录里与新版本同季集的旧版本视频,按能否替换分组(只读,不改任何文件)。
+        返回 {"source", "replace": [Path], "keep": [(Path, 原因)]};source 为空表示这一集不是洗版下载,什么都不动。
+        """
+        plan = {"source": None, "replace": [], "keep": []}
+        if season is None or episode is None or not new_size:
+            return plan
+        tmeta = MetaInfoPath(target)
+        if tmeta.begin_season != int(season) or tmeta.begin_episode != int(episode) \
+                or tmeta.end_episode not in (None, tmeta.begin_episode):
+            # 新文件名解析出的季集与入库季集不一致(命名模板不带季集/多集合并):无法安全比对同集版本
+            return plan
+        plan["source"] = self.__best_version_source(tmdbid, season, episode)
+        if not plan["source"] or not target.parent.is_dir():
+            return plan
+        media_exts = {str(e).lower() for e in settings.RMT_MEDIAEXT}
+        for f in sorted(target.parent.iterdir()):
+            if f.name == target.name or f.suffix.lower() not in media_exts or not f.is_file():
+                continue
+            fmeta = MetaInfoPath(f)
+            if fmeta.begin_season != tmeta.begin_season or fmeta.begin_episode != tmeta.begin_episode:
+                continue
+            if fmeta.end_episode not in (None, fmeta.begin_episode):
+                plan["keep"].append((f, "多集合并文件"))
+                continue
+            if tmeta.part and fmeta.part and tmeta.part != fmeta.part:
+                continue
+            try:
+                old_size = f.stat().st_size
+            except Exception:
+                plan["keep"].append((f, "读不到大小"))
+                continue
+            if old_size >= new_size:
+                # 拿不准时宁可留着两个版本,也不删掉可能更好的那个(如新版本先于先行版到达)
+                plan["keep"].append((f, f"不小于新版本({StringUtils.str_filesize(old_size)})"))
+                continue
+            plan["replace"].append(f)
+        return plan
+
+    def __replace_old_versions(self, mediainfo, file_meta, transferinfo) -> dict:
+        """
+        洗版换版:这一集近 14 天内由洗版订阅下载、新版本已入库时,删掉同目录同季集、比新版本小的旧版本
+        (如 1080p 先行版被 4K 换掉)。云端删除进 115 回收站;不同名的旧版本连同其同名字幕/nfo/缩略图一起删,
+        strm 交给 Strm 助手删除并通知 Emby;同名不同扩展名的旧版本(.mp4 -> .mkv)只删视频,
+        让 Strm 助手把 strm 改指向新文件。返回 {"same": [旧文件名], "other": [旧文件名]}。
+        """
+        result = {"same": [], "other": []}
+        target_item = transferinfo.target_item
+        if not target_item or not target_item.path:
+            return result
+        target = Path(target_item.path)
+        try:
+            new_size = int(getattr(target_item, "size", 0) or 0) or target.stat().st_size
+        except Exception:
+            new_size = 0
+        plan = self.__plan_version_replace(target, mediainfo.tmdb_id, file_meta.begin_season,
+                                           file_meta.begin_episode, new_size)
+        for f, why in plan["keep"]:
+            logger.info(f"洗版换版:{target.name} 的同集旧版本 {f.name} {why},保留")
+        if not plan["replace"]:
+            return result
+        logger.info(f"洗版换版:{target.name} 来自{plan['source']},"
+                    f"替换同集旧版本 {', '.join(f.name for f in plan['replace'])}")
+        media_exts = {str(e).lower() for e in settings.RMT_MEDIAEXT}
+        for old in plan["replace"]:
+            same_stem = old.stem == target.stem
+            sidecars = []
+            if not same_stem:
+                # 只认 "旧文件名." 开头的附属文件与 "旧文件名-thumb.jpg";同名不同扩展名时附属文件是新旧共用的,不动
+                sidecars = [p for p in target.parent.iterdir()
+                            if p.is_file() and p.suffix.lower() not in media_exts
+                            and (p.name.startswith(old.stem + ".") or p.name == f"{old.stem}-thumb.jpg")]
+            try:
+                old.unlink()
+            except Exception as e:
+                logger.error(f"洗版换版:删除旧版本 {old} 失败,保留:{str(e)}")
+                continue
+            for p in sidecars:
+                try:
+                    p.unlink()
+                    logger.info(f"洗版换版:已删除旧版本附属文件 {p.name}")
+                except Exception as e:
+                    logger.warn(f"洗版换版:删除附属文件 {p} 失败:{str(e)}")
+            logger.info(f"洗版换版:已删除旧版本 {old}(进 115 回收站)")
+            if same_stem:
+                result["same"].append(old.name)
+            else:
+                result["other"].append(old.name)
+                if self._strm:
+                    self.eventmanager.send_event(EventType.PluginAction, {
+                        'file_path': str(old),
+                        'action': 'cloudstrm_delete'
+                    })
+        if self._strm and result["same"]:
+            # strm 路径与旧版本相同,Strm 助手默认不覆盖已有 strm:要求它改指向新文件
+            self.eventmanager.send_event(EventType.PluginAction, {
+                'file_path': str(target),
+                'action': 'cloudstrm_file',
+                'cover': True
+            })
+        if result["same"] or result["other"]:
+            # 删除后刷新目标目录缓存,后续列举/对账看到的是删除后的真实状态
+            refreshed = getattr(self, "_target_refreshed", None)
+            if refreshed:
+                refreshed.pop(str(target.parent), None)
+            self.__refresh_target_dir(str(target.parent))
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.Organize,
+                    title=f"{mediainfo.title_year} {file_meta.season_episode} 洗版完成",
+                    text=f"新版本:{target.name}\n已替换:{', '.join(result['same'] + result['other'])}",
+                    image=mediainfo.get_message_image())
+        return result
+
+    def version_preview(self, path: str, tmdbid: str = "", season: Optional[int] = None,
+                        episode: Optional[int] = None) -> schemas.Response:
+        """
+        API:洗版换版预览(不删任何文件)。path 为媒体库里的新版本文件;tmdbid 必填,季集默认按文件名解析
+        """
+        target = Path(os.path.normpath(path))
+        if not target.is_file():
+            return schemas.Response(success=False, message=f"文件不存在:{path}")
+        meta = MetaInfoPath(target)
+        season = meta.begin_season if season is None else int(season)
+        episode = meta.begin_episode if episode is None else int(episode)
+        plan = self.__plan_version_replace(target, tmdbid, season, episode, target.stat().st_size)
+        return schemas.Response(success=True, data={
+            "season": season, "episode": episode, "source": plan["source"],
+            "replace": [f.name for f in plan["replace"]],
+            "keep": [{"name": f.name, "reason": why} for f, why in plan["keep"]],
+        })
 
     def send_msg(self):
         """
@@ -4797,6 +5021,12 @@ class CloudLinkMonitor(_PluginBase):
             "methods": ["GET"],
             "summary": "批次清单预览",
             "description": "对指定批次目录建立/查看批次清单(作品识别 + 季集映射),不整理文件;rebuild=true 强制重建",
+        }, {
+            "path": "/version_preview",
+            "endpoint": self.version_preview,
+            "methods": ["GET"],
+            "summary": "洗版换版预览",
+            "description": "对媒体库里的新版本文件预览会替换掉哪些同集旧版本,不删除任何文件",
         }]
 
     def batch_manifest(self, path: str, rebuild: bool = False, ignore_emby: bool = False,
@@ -5343,6 +5573,19 @@ class CloudLinkMonitor(_PluginBase):
                                 'props': {'cols': 12, 'md': 3},
                                 'content': [
                                     {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'best_version_replace',
+                                            'label': '洗版新版本入库后删除同集旧版本',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
                                         'component': 'VTextarea',
                                         'props': {
                                             'model': 'group_map',
@@ -5622,6 +5865,7 @@ class CloudLinkMonitor(_PluginBase):
             "batch_settle": 120,
             "emby_reprobe": True,
             "emby_sync_group": True,
+            "best_version_replace": True,
             "group_map": "",
             "notify_probe_interval": 180
         }
