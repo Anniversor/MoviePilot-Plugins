@@ -1,0 +1,5 @@
+# The repository-wide rules ignore every __init__.py.
+# Keep the actual MoviePilot plugin entrypoint in this new package.
+!__init__.py
+__pycache__/
+*.pyc
