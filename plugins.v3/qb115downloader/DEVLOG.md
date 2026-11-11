@@ -1,5 +1,48 @@
 # Qb115Downloader 开发/验收记录
 
+## 0.1.1：同根目录不同 hash 连续订阅（本地功能分支，未发布/未部署）
+
+仓库起点 `main@0e6e504`，开始时工作树干净；开发分支 `feat/qb115-isolated-batches`。此次只改源码、测试、文档与本地 market 版本，不提交种子、不访问生产账本/凭据、不修改运行容器、不重启、不上传真实 115。下方首版至第三轮的记录均是 0.1.0 的历史，不代表本次执行。
+
+### 严格测试先行：实际 RED → GREEN
+
+定向命令 `I = python3 -m unittest discover -s plugins.v3/qb115downloader/tests -p test_isolated_batches.py -v`。每次先改测试、执行并看见失败，再改生产逻辑：
+
+| 增量 | 实际 RED | 实际 GREEN |
+|---|---|---|
+| 同根名两个完整 hash，不同落地根、独立预留、重启恢复 | I：`Ran 1 test`，`FAILED (errors=1)`；第二次 admit 抛旧错误 `ValueError: batch name already reserved`，不是导入/夹具错误 | I：1 OK；全量 203 OK |
+| 适配器按 hash 选择本地根并双向映射，保留 legacy 路径 | I：2 tests，1 error；新 resolver API 尚缺失（`unexpected keyword argument 'task_root'`，API 级弱红） | I：2 OK；后续插件集成测试提供行为级红 |
+| 真实插件 + 真实适配器提交两份同根 partial torrent，重载后继续提交 | I：3 tests，1 failure；账本 root 仍是 local_root，缺完整 hash 子目录 | I：3 OK；全量 205 OK |
+| 占位不能因目录重名修复而失去路径冲突保护 | I：4 tests，3 subtest failures；嵌套本地目录、同物理 qB 路径别名/父子目录未拒绝 | I：4 OK |
+| hash 命名空间 symlink/非法 ledger root 不得到达 qB add | I：5 tests，1 failure；`native.calls` 已包含 add 请求（虽然后续 snapshot 拒绝） | I：5 OK；所有拒绝均在 add 前 |
+| 同一冻结绑定用于 start 与 unsuspend：root/save_path 不一致不得恢复 | I：7 tests，2 failures；两入口均错误返回 True | I：7 OK；全量 209 OK |
+| 同 hash 幂等返回也必须核对冻结物理实例 | I：7 tests，1 failure；另一实例含同 hash/path 时仍返回成功 hash | I：7 OK |
+| 插件、market、history、README 版本同步 | `python3 tests/test_qb115_market_contract.py`：1 failure，`'0.1.0' != '0.1.1'` | 1 OK |
+
+另外 3 个 `WorkflowNamespaceTests` 是既有安全门控在 legacy/new 混合路径下的刻画回归，首次运行即绿，没有为它们新增生产行为：两个源相对路径完全相同但内容不同，逐份真实 SHA1/loopback HTTP 上传；云端同名冲突不覆盖、CLM fixture 消费后跨重启复用暂存、成功非覆盖交接；新根 unsuspend 保持暂停；缺已选文件 metadata 无上传；untracked guard 找到新 hash 根并仅暂停/摘对应 hash 的全局标签。两个旧 FakeQb 只增加 `local_root(tid)` 与 `expected_save_path(tid=None)` 接口，旧断言未删减。
+
+### 实现与兼容边界
+
+- 生产适配器 resolver 固定到创建时 Engine，在账本锁下查任务 root。已知 hash 用冻结 root；只有未知 hash 取 `local_root/<完整 hash>`。重载会重建适配器，不迁移旧账本/root，不移动文件，不调用 qB 改保存位置接口。
+- Engine 按本地/同物理 qB 的内容路径保留占位，拒绝相等与父子重叠；同名但隔离根不同允许并行，空间预留与同 hash 幂等不放宽。
+- snapshot/expected_save_path/submit 统一按 hash 解析路径；root 纳入冻结绑定，start/retry 与重复提交也比对绑定。上传源码始终从该任务 root 开启，冻结 source/size/SHA1/signature 校验不变。guard 不改保护范围、批量查询或 source_present 的 root/name 规则。
+- 云端仍使用原名，暂存仍按完整 hash；后批遇到监控目录同名目标则失败退避，CLM 消费后重试。既有非覆盖交接、commit_intent 崩溃恢复、不删本地/云端源的安全边界均保留。不新增清理执行器；free 不等于免做种/H&R。
+- 升级是 legacy 兼容，不是降级兼容：0.1.0 无法恢复新增 hash 根任务，不能直接回滚旧代码后继续推进。NoSubfolder 的历史路径回填限制、native 补全局标签的竞态、最终入库证据链未实现等仍存在，未扩大承诺。
+
+### 本次实际验证（均从仓库根目录执行）
+
+- `python3 -m unittest discover -s plugins.v3/qb115downloader/tests -q`：`Ran 212 tests in 67.329s`、`OK`。输出两行 `event=guard_failed` 来自既有故障注入测试，不是真实服务告警。
+- `python3 tests/test_qb115_market_contract.py`：`Ran 1 test`、`OK`。
+- `PYTHONDONTWRITEBYTECODE=1 python3 plugins.v3/qb115downloader/tools/check_moviepilot_contract.py`：所有 live-source 契约 PASS；仅只读容器固定源码，宿主执行真实 AST，不调用真实 qB/115。
+- `python3 -m compileall -q plugins.v3/qb115downloader` 与 `git diff --check`：exit 0。
+- `python3 /home/anniversor/.hermes/profiles/nas/cache/scratch/verify_qb115_branch.py`：新增行密钥/注入/反序列化静态扫描无命中；生产 Python 的删除与改保存位置调用扫描无命中；从 `git show HEAD` 复制完整插件到 scratch 跑未改动基线，`Ran 202 tests in 63.970s`、`OK`、exit 0。首次基线脚本只复制 Python 导致缺 README 的夹具错误，补齐完整 HEAD 文件后重跑通过；没有为此修改生产代码或旧测试。
+- 仓库既有 `tests/test_moviepilot_v2_service_contract.py` 经 `runpy.run_path` 逐个执行 `test_*`：2 项 PASS。
+- 后续重复全量：`Ran 212 tests in 66.409s`、`OK`；market 1 OK。未运行/未安装额外 pytest、lint 包。
+- 当前保持未 commit/未 push 的功能分支工作树，留给父代理独立审查；没有独立审查通过声明。
+- 尚待父代理独立审查并重跑测试；实际 MP 安装/真实路径映射、qB 自动建立 hash 子目录、CLM 连续消费同名目录等端到端验证，本次没有执行。未经授权不得发布/部署。
+
+---
+
 范围：仅本地 `plugins.v3/qb115downloader/`。未部署、未重启、未 commit/push、未修改现有插件。开发时未读取用户私密 env 或服务配置/凭据；容器仅用于读取 `/app/app` 固定源码。网络上传全部在本机临时 HTTP server，内容为测试 fixture。
 
 ## 命令定义（工作目录均为仓库根目录）

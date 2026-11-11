@@ -1,6 +1,17 @@
 # qB → 115（MoviePilot V3）
 
-类名 `Qb115Downloader`，版本 `0.1.0`，**默认禁用**。这是独立的虚拟下载器，不是 115 离线下载器，也不替换普通 qB。
+类名 `Qb115Downloader`，版本 `0.1.1`，**默认禁用**。这是独立的虚拟下载器，不是 115 离线下载器，也不替换普通 qB。本次仅在功能分支完成实现和测试，尚未发布或部署。
+
+## 同根目录不同种子/集数：本地隔离与 legacy 兼容
+
+- 新任务实际落地在 `local_root/<完整 hash>/`，内容通常为 `local_root/<完整 hash>/<原种子根名>/...`。使用完整的 40 位小写 v1 infohash，不截短、不改种子名。同一个剧集包根名对应不同 hash 时，可以并行下载、跨重启继续提交；同 hash 仍幂等，不重复预留/添加。
+- **既有 `tasks_v1` 账本完全沿用每条任务已保存的 `root/save_path/layout/physical_downloader`**，包括 legacy `local_root/<原种子根名>` 的任务以及正在下载的任务。不批量迁移账本，不移动旧文件，不调用 qB 的移动/改保存位置接口；旧任务和新 hash 子目录任务可共存。
+- 适配器每次按 hash 查冻结的任务 root，再做 MP→qB→MP 路径双向验证。准入、提交、快照、重复提交、`start/retry`、上传前及交接前、`unsuspend` 使用同一绑定；guard 的停跟踪源存在检查仍用该任务的 `root/name`。本地根含 symlink/非目录、未知 hash 格式、空/非法账本 root 均拒绝；真实源读取继续使用 dirfd/O_NOFOLLOW。
+- 改为按**内容路径**保留占位（同时检查本地路径和同一物理 qB 的映射路径），相等/父子重叠均拒绝，即使旧任务处于 `waiting_library/untracked`。只允许路径确实独立的同名任务，不是直接取消安全占位。
+- **云端仍保持原名**：`staging_path/<完整 hash>/<原种子根名>` → `target_path/<原种子根名>`，不把 hash 加进云端成片名。若前一同名批次还在监控目录，后一批保持隔离暂存并失败退避；CLM 消费后再校验并重试非覆盖交接，不合并、不覆盖、不删除前一批。前一批未被消费时，不承诺两批能同时交接。
+- 选集仍依赖 qB 确认：priority=0 跳过，选中文件缺 size/priority/progress、未知扩展名、源缺失或冻结清单改变仍 fail closed。本插件只把 qB 返回的选中文件作为该 hash 的上传清单；partial torrent 不补全季度，未知/缺失集数不自动推断。
+- 这次没有新增清理执行器或自动删除。**免费种只代表下载计费优惠，不证明免做种/H&R/分享率义务**；本地源、qB 任务和云端文件均保留，清理仍需独立设计和授权。
+- 回滚提醒：0.1.0 的适配器只接受配置中的单一根目录，不能正确恢复新增的 hash 子目录任务。出现新格式任务后不要直接退回旧代码并继续运行；先停止插件推进并人工安排保留新版或逐任务核对，不靠清账本、搬文件绕过。
 
 ## 已实现的链路
 
@@ -24,7 +35,7 @@
 
 - **状态别名**：`TorrentStatus.DOWNLOADING.value` 是中文 `下载中`，`TRANSFER` 是 `可转移`。插件同时识别中英文（与 `_normalize_query_status` 的别名集合一致，工具会用 MP 真实方法逐个核验）。传了 `hashs` 时 `hashs` 优先于 `status`（与 native 一致）。
 - **状态映射**：只有 `waiting_library` 返回 `completed`；其余推进中状态（含上传、校验、交接、失败退避）返回 `downloading`，暂停/挂起/隔离失效返回 `paused`。推进中任务的进度封顶 99.9，不把 qB 100% 当“已完成”。
-- **路径回填**：`DownloaderTorrent` 填充 `save_path`、`content_path`、`path`（来自账本里的 MP 侧本地根目录和种子名）。MP 的 `_resolve_actual_download_dir` 据此写入下载历史，不会退回 MP 的 `download_dir`。`content_path` 按 `local_root/<种子名>` 计算；若 qB 内容布局为 `NoSubfolder` 的多文件种子，真实内容路径不同，这一点未实现、未验证。
+- **路径回填**：`DownloaderTorrent` 填充 `save_path`、`content_path`、`path`（来自账本里的 MP 侧本地根目录和种子名）。MP 的 `_resolve_actual_download_dir` 据此写入下载历史，不会退回 MP 的 `download_dir`。`content_path` 按账本 `root/<种子名>` 计算（新任务 root 为 `local_root/<完整 hash>`，legacy root 不变）；若 qB 内容布局为 `NoSubfolder` 的多文件种子，真实内容路径不同，这一点未实现、未验证。
 - **重复提交**：同 hash 已跟踪时返回 MP 的 `DOWNLOAD_TASK_ALREADY_EXISTS`（`下载任务已存在`），MP 据此不重复记下载历史；处于 `admitted/suspended/untracked/隔离失效` 的任务拒绝再次提交。
 - **`downloader=None` 的限制（设计如此）**：模块调度器对 `list_torrents` 做列表合并、对 `download/stop/start/remove` 取首个非空结果。插件对未指定/其他下载器名一律返回 `None`，因此“全部下载器”的全局列表、native 自动整理都**看不到**本插件任务。MP 下载管理页/`downloading(name)` 在传入精确名称 `qB → 115` 时会用 `status=TorrentStatus.DOWNLOADING` 调用本插件（核对了 `application/download/tasks.py`）；是否在前端页面选择该名称显示，需要安装后人工确认。
 
@@ -84,7 +95,7 @@
 - **人工步骤**：出现“隔离失效”后 ① 立即在 MP 暂停/关闭 native 整理的“移动”模式并检查整理队列；② 检查本地源文件是否仍在；③ 确认 qB 里该任务没有全局标签（插件已摘除则无需处理，失败则手工摘）；④ **确认任务仍带 `mp-qb115` 标签——如果丢了，必须先在 qB 手工补回 mp-qb115 标签**（插件不会自动补回；这是选定的方案：人工补回后再 release）；⑤ 再 `POST /control?action=release`：只有 qB 里找得到该 hash、带 `mp-qb115`、且无全局标签时才会通过，否则保持隔离；通过后任务仍然暂停，再 `action=start` 恢复。已被整理/移动的任务按 MP 整理历史人工处理。
 - **`TORRENT_TAG` 配置的后果**：全局 `TORRENT_TAG` 必须非空且不含 `mp-qb115`。如果被清空，或被改成包含 `mp-qb115`，适配器会对账本里**所有**未停跟踪任务报告 `tag_config_unusable`，guard 随即暂停并隔离**每一个任务（包括保种中的）**，即**暂停所有任务包括保种**（它们要靠 `release`+`start` 逐个恢复，且 `release` 要求配置先改回）；`_runtime` 同时拒绝一切新准入。改全局标签前先 abandon/暂停账本里的任务或接受这一后果。
 - **布局绑定用的是 qB 的全局偏好**：账本里的 `layout` 来自 `get_content_layout()`，即 qB 的全局“内容布局”偏好，不是每个种子自己的设置。**改动 qB 全局内容布局，下一次 tick/`unsuspend` 校验时会把所有活动任务判成布局不一致并挂起所有任务**（并请求暂停它们的 qB 任务）；改回原值后用 `unsuspend` 逐个核对恢复。
-- **已停跟踪（untracked）任务的轻量 guard**：guard 也会查询 untracked 任务，但**仅当**它仍带 `mp-qb115` 标签、源文件（`local_root/<种子名>`）仍在、且再次出现全局标签时，才暂停并只摘这个全局标签（不置隔离标记、状态仍是 untracked，错误文本写明）。如果你想让 MP 原生整理接手一个 abandon 过的任务，**先在 qB 里手工摘掉 `mp-qb115` 标签**（这时 guard 认为任务已被人接管，不再干预），再给它全局标签。
+- **已停跟踪（untracked）任务的轻量 guard**：guard 也会查询 untracked 任务，但**仅当**它仍带 `mp-qb115` 标签、源文件（账本 `root/<种子名>`，含 legacy 和新 hash 子目录）仍在、且再次出现全局标签时，才暂停并只摘这个全局标签（不置隔离标记、状态仍是 untracked，错误文本写明）。如果你想让 MP 原生整理接手一个 abandon 过的任务，**先在 qB 里手工摘掉 `mp-qb115` 标签**（这时 guard 认为任务已被人接管，不再干预），再给它全局标签。
 - 建议整理方式使用“复制/硬链接”而非“移动”，并避免其他下载器配置与物理 qB 同名重复提交同一资源。
 
 ## 禁用、配置无效、重载被阻塞时 guard 与 poll 的语义
@@ -125,7 +136,7 @@ MoviePilot 只给 `get_state()` 为真的插件注册 `get_service()` 的定时�
 
 不会复制凭据到本插件配置、持久化任务、日志、页面或 API。OpenList URL 只接受不含账号、密码、query 的 origin；不接受子路径反代。管理接口令牌需要存储列表读取、文件列表/读取、创建目录、上传、移动权限；没有这些权限就 fail closed。
 
-下载目录**始终使用插件独立 `local_root`**，不继承 MP 调用方普通目录或分类；实际路径由已配置物理 qB 的 `normalize_path / normalize_return_path` 双向核对。请在安装后的人工验证中确认 MP 和 qB 指向同一份本地文件，不能仅凭两个同名路径推断。
+新任务下载目录**始终使用插件独立 `local_root/<完整 hash>`**（legacy 任务沿用账本 root），不继承 MP 调用方普通目录或分类；实际路径由已配置物理 qB 的 `normalize_path / normalize_return_path` 双向核对。请在安装后的人工验证中确认 MP 和 qB 指向同一份本地文件，不能仅凭两个同名路径推断。
 
 ### OpenList v4.2.7 上传头
 
@@ -144,7 +155,7 @@ MoviePilot 只给 `get_state()` 为真的插件注册 `get_service()` 的定时�
 
 任务使用插件 `get_data/save_data` 的 `tasks_v1` 键；落在 **MP 数据库的 `plugindata` 表**，一行 `(plugin_id='Qb115Downloader'（类名）, key='tasks_v1', value=<JSON>)`（契约探针核对 `PluginData` 模型和 `save_data` 的默认 plugin_id）。备份/迁移就是备份这一行。账本字段（与实现一致）：
 
-- 身份/预留：`hash`、`name`（种子显示名）、`reserved`（全种子大小）、`root`（MP 侧本地根目录）、`selected_size`；
+- 身份/预留：`hash`、`name`（种子显示名）、`reserved`（全种子大小）、`root`（MP 侧该任务落地根目录：新任务为 `local_root/<完整 hash>`，legacy 保持原值）、`selected_size`；
 - 绑定：`physical_downloader`、`layout`、`save_path`——**`save_path` 是准入时由配置经 qB 路径映射推算出的“预期路径”（去掉结尾 `/`）**，每次快照都校验 qB 实际路径与它一致（两边都去掉结尾 `/` 后比较，qB 返回带斜杠不会误挂起），不是首次快照后回写的实际值；
 - 状态：`state`、`paused`、`quarantined`、`error`、`attempts`、`next_retry`（普通退避到期时间）、`quiet_until`（PUT 结果未知的静默到期时间，只由失败设置，`start/retry` 不清除）；
 - 上传：`manifest`（冻结的选中文件清单：source/remote/size/sha1/head/signature）、`stage`、`target`、`verified`（已完成远端校验的 remote 名，重试时若目录列表里大小一致就不再重新探测）、`commit_intent`；

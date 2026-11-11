@@ -1,4 +1,5 @@
 """Direct calls to the already-running physical QbittorrentModule, no dispatcher."""
+import re
 import time
 from pathlib import Path
 
@@ -31,12 +32,13 @@ class QbAdapter:
     retries = 5
     retry_interval = 0.4
 
-    def __init__(self, module, physical_name, local_root, global_tag):
+    def __init__(self, module, physical_name, local_root, global_tag, task_root=None):
         if not physical_name or physical_name == "qB → 115":
             raise ValueError("explicit physical qB required")
         self.module, self.name = module, physical_name
         self.root = str(local_root)
         self.global_tag = global_tag
+        self.task_root = task_root
 
     def _server(self):
         server = self.module.get_instance(self.name)
@@ -44,8 +46,28 @@ class QbAdapter:
             raise ValueError("physical qB unavailable")
         return server
 
-    def expected_save_path(self):
-        return str(self.module.normalize_path(Path(self.root), self.name))
+    def local_root(self, tid):
+        """Resolve a frozen ledger root; only unseen hashes get a new full-hash namespace.
+
+        Without a ledger resolver this adapter retains its explicit, single-root API.
+        Production always supplies the resolver, including after reload.
+        """
+        if not re.fullmatch(r"[a-f0-9]{40}", tid):
+            raise ValueError("invalid torrent hash")
+        bound = self.task_root(tid) if self.task_root is not None else self.root
+        root = str(Path(self.root) / tid) if bound is None else str(bound)
+        if not root.startswith("/") or any(part in {"", ".", ".."} for part in root[1:].split("/")):
+            raise ValueError("absolute safe local task root required")
+        current = Path("/")
+        for part in Path(root).parts[1:]:
+            current /= part
+            if current.is_symlink() or (current.exists() and not current.is_dir()):
+                raise ValueError("local task root must not traverse symlinks or files")
+        return root
+
+    def expected_save_path(self, tid=None):
+        root = self.root if tid is None else self.local_root(tid)
+        return str(self.module.normalize_path(Path(root), self.name))
 
     def guard(self):
         tags = _tags(self.global_tag())
@@ -155,8 +177,9 @@ class QbAdapter:
             raise IsolationLost("qB task isolation lost")
         raw = item.get("save_path") or ""
         local = self.module.normalize_return_path(Path(raw), self.name)
-        expected = self.module.normalize_path(Path(self.root), self.name)
-        if local != self.root or raw.rstrip("/") != str(expected).rstrip("/"):
+        root = self.local_root(tid)
+        expected = self.expected_save_path(tid)
+        if local != root or raw.rstrip("/") != str(expected).rstrip("/"):
             raise ValueError("qB actual path does not roundtrip to isolated local root")
         return dict(name=item.get("name"), root=local, save_path=raw, physical=self.name,
                     layout=server.get_content_layout(), files=server.get_files(tid),
@@ -186,7 +209,7 @@ class QbAdapter:
     def submit(self, content, tid, episodes=None, custom_words=None):
         server = self.guard()
         self.preflight(tid)
-        success, _ = server.add_torrent(content=content, download_dir=self.module.normalize_path(Path(self.root), self.name),
+        success, _ = server.add_torrent(content=content, download_dir=self.expected_save_path(tid),
                                          is_paused=True, tag=[TAG], cookie=None, category=None,
                                          ignore_category_check=False)
         if not success:

@@ -42,7 +42,10 @@ class Qb:
         self.report_error = None
         self.order = []
 
-    def expected_save_path(self):
+    def local_root(self, tid):
+        return self.root
+
+    def expected_save_path(self, tid=None):
         return self.root
 
     def snapshot(self, tid):
