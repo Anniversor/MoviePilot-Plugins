@@ -74,7 +74,10 @@ class FakeQb:
         self.paused = []
         self.started = []
 
-    def expected_save_path(self):
+    def local_root(self, tid):
+        return self.root
+
+    def expected_save_path(self, tid=None):
         return self.root
 
     def preflight(self, tid):

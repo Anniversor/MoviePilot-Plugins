@@ -41,7 +41,7 @@ class Qb115Downloader(_PluginBase):
     plugin_name = "qB → 115"
     plugin_desc = "本地 qB 下载保种，逐文件真实上传、校验后整批交接 CLM；删除/最终入库确认待人工。"
     plugin_icon = "115.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "Anniversor"
     author_url = "https://github.com/Anniversor"
     plugin_config_prefix = "qb115downloader_"
@@ -240,12 +240,13 @@ class Qb115Downloader(_PluginBase):
                     existing = engine.tasks[tid]
                     if existing["state"] in {"admitted", "suspended", "untracked"} or existing.get("quarantined"):
                         raise ValueError("submission incomplete; manual reconciliation required")
-                    qb.snapshot(tid)
+                    if engine._binding_error(existing, qb, qb.snapshot(tid)):
+                        raise ValueError("tracked hash binding changed; manual reconciliation required")
                     # MoviePilot's own contract for "same hash already tracked" (schemas/download.py)
                     return self.DOWNLOADER_NAME, tid, existing.get("layout"), DOWNLOAD_TASK_ALREADY_EXISTS
                 qb.preflight(tid)  # duplicate hash in the physical qB is refused BEFORE any ledger write
-                task = engine.admit(tid, name, size, self._config["local_root"], physical=qb.name,
-                                    save_path=qb.expected_save_path())
+                task = engine.admit(tid, name, size, qb.local_root(tid), physical=qb.name,
+                                    save_path=qb.expected_save_path(tid))
                 result = qb.submit(content, tid, episodes=episodes, custom_words=custom_words)
                 engine._set(task, state="downloading", layout=result[2])
             return self.DOWNLOADER_NAME, tid, result[2], "qB 已提交；云端上传/入库尚未完成"
@@ -269,7 +270,13 @@ class Qb115Downloader(_PluginBase):
         modules = [m for m in ModuleManager().get_running_modules("download") if isinstance(m, QbittorrentModule)]
         if len(modules) != 1:
             raise ValueError("exactly one already-running native QbittorrentModule required")
-        return QbAdapter(modules[0], physical, root, lambda: get_runtime_setting("TORRENT_TAG"))
+        engine = self._engine  # pin this adapter to its ledger, never a later plugin incarnation
+        def task_root(tid):
+            with engine.lock:
+                task = engine.tasks.get(tid)
+                return task["root"] if task is not None else None
+        return QbAdapter(modules[0], physical, root, lambda: get_runtime_setting("TORRENT_TAG"),
+                         task_root=task_root)
 
     def _runtime(self):
         if self._name_conflict:

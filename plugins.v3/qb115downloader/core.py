@@ -176,8 +176,18 @@ class Engine:
                 return self.tasks[tid]
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
                 raise ValueError("known positive torrent size required; magnets unsupported")
-            if any(t["name"] == name for t in self.tasks.values()):
-                raise ValueError("batch name already reserved")
+            def overlaps(left, right):
+                left, right = PurePosixPath(left), PurePosixPath(right)
+                return left == right or left in right.parents or right in left.parents
+            for existing in self.tasks.values():
+                # Include legacy/tombstoned content, not just a bare name. A legacy torrent could itself
+                # be named like a full hash, so nested new namespaces must also be refused.
+                if overlaps(PurePosixPath(root) / name, PurePosixPath(existing["root"]) / existing["name"]):
+                    raise ValueError("local batch path already reserved")
+                if (physical and physical == existing.get("physical_downloader") and save_path
+                        and existing.get("save_path") and overlaps(PurePosixPath(save_path) / name,
+                                                                   PurePosixPath(existing["save_path"]) / existing["name"])):
+                    raise ValueError("physical batch path already reserved")
             reserved = sum(self.outstanding(t) for t in self.tasks.values())
             if self.free() - self.low_water - reserved < size:
                 raise ValueError("insufficient unreserved local space")
@@ -280,6 +290,8 @@ class Engine:
         if getattr(qb, "name", None) != task["physical_downloader"]:
             return "当前配置的物理下载器与任务创建时不一致；拒绝用另一个实例接管同 hash，人工核对"
         if snapshot is not None:
+            if norm_path(snapshot.get("root")) != norm_path(task.get("root")):
+                return "qB 本地落地目录与账本批次不一致；挂起，人工核对"
             if norm_path(snapshot.get("save_path")) != norm_path(task["save_path"]):
                 return "qB 实际保存路径与任务创建时不一致；挂起，人工核对"
             if task.get("layout") and snapshot.get("layout") != task["layout"]:
@@ -393,6 +405,10 @@ class Engine:
                         action == "retry" and task.get("commit_intent")):
                     return False
                 try:
+                    mismatch = self._binding_error(task, qb, qb.snapshot(tid))
+                    if mismatch:
+                        self._suspend(task, mismatch, qb)
+                        return False
                     started = qb.start(tid)
                 except Exception as err:
                     if getattr(err, "isolation_lost", False):
