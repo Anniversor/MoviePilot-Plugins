@@ -542,12 +542,30 @@ class R7_GuardQuarantine(Workflow):
         self.assertTrue(self.engine.control(self.tid, "release", self.qb))
         self.assertFalse(self.task["quarantined"])
 
-    def test_plugin_has_no_deletion_code_path(self):
-        banned = ("unlink", "rmtree", "os.remove", "torrents_delete", "delete_torrents", "fs/remove", "fs/rename")
-        for name in ("core.py", "cloud.py", "adapter.py", "__init__.py"):
+    def test_plugin_has_only_controlled_cleanup_deletion_code_path(self):
+        # v0.2: keep the original no-uncontrolled-deletion intent, allow only the WAL cleanup seam.
+        import ast
+        allowed = {('core.py', '_unlink_source', 'os.unlink'),
+                   ('adapter.py', 'remove_only', 'self.guard().delete_torrents')}
+        found = set()
+        for name in ('core.py', 'cloud.py', 'adapter.py', '__init__.py', 'history.py'):
             source = (PLUGIN / name).read_text()
-            for word in banned:
-                self.assertNotIn(word, source, "%s must not contain %s" % (name, word))
+            for word in ('rmtree', 'os.remove', 'torrents_delete', 'fs/remove', 'fs/rename'):
+                self.assertNotIn(word, source)
+            tree = ast.parse(source)
+            for func in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+                for call in (n for n in ast.walk(func) if isinstance(n, ast.Call)):
+                    target = ast.unparse(call.func)
+                    if target.endswith(('.unlink', '.delete_torrents')):
+                        identity = (name, func.name, target)
+                        self.assertIn(identity, allowed)
+                        found.add(identity)
+                        if target.endswith('.delete_torrents'):
+                            self.assertTrue(any(k.arg == 'delete_file' and isinstance(k.value, ast.Constant)
+                                                and k.value.value is False for k in call.keywords))
+                        else:
+                            self.assertTrue(any(k.arg == 'dir_fd' for k in call.keywords))
+        self.assertEqual(found, allowed)
 
 
 # ---------------------------------------------------------------- 8: config validation / origin / raw host

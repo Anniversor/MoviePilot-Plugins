@@ -1,6 +1,19 @@
 # qB → 115（MoviePilot V3）
 
-类名 `Qb115Downloader`，版本 `0.1.1`，**默认禁用**。这是独立的虚拟下载器，不是 115 离线下载器，也不替换普通 qB。本次仅在功能分支完成实现和测试，尚未发布或部署。
+类名 `Qb115Downloader`，版本 `0.2.0`，**默认禁用**。这是独立的虚拟下载器，不是 115 离线下载器，也不替换普通 qB。本次仅在功能分支完成实现和测试，尚未发布或部署。
+
+## 0.2.0：提交计费、严格免费清理与缺失对账
+
+- `auto_cleanup_free=False` 是新默认值，且只接受 JSON 布尔值。开启后仅明确选择本下载器、**提交时** `downloadvolumefactor=0` 的新任务可自动清理；1、0.5 等非0保种，None/字符串/布尔/NaN/缺失账本均 unknown 保留。后来促销变化不能覆盖原提交事实。不引入站规、H&R、分享率或做种时长条件。
+- 真实 `ResourceDownload` 为同步链式事件，但发生在获取种子、校验与可取消步骤之前；不能把 worker 的 threadlocal 候选交给“下一次下载”。现在无候选缓存，直接在当前 `app.chain.download.submission._submit_prepared_download` 栈帧读取 context，并比对 prepared.torrent_content 与本次内容完全一致。提交冻结 site、资源地址 SHA256（不保存 passkey）、计费值；异步 `DownloadAdded` 的 hash/site/resource 精确匹配后才 accepted。直接调用、跨线程/上游边界变化无证据时保持 unknown，探针会报告契约变化。
+- 新任务提交后冻结 qB `added_on` 与全文件 name/size/priority（包括未选文件）；旧账本不追认免费/不补造 generation。清理前核对实例、hash、root/save_path/layout、标签隔离、完整文件绑定、已选清单、inode/size/mtime + 全本地SHA1，以及全部qB任务和全部legacy账本的实际内容命名空间重叠。legacy共享根不代表拥有整个根；真实相等/父子内容路径仍阻断。
+- 删除门控额外要求 **fresh verify 返回完整 SHA1 与冻结清单相等**；上传兼容的“大小+文件头、无SHA1”绝不能用于删除。监控路径仍在时直接核验；只有明确 CloudMissing 才按 CLM `rc_mount_prefix`/`openlist_base` 映射精确 src，调用只读 `TransferHistoryOper.get_by_src(src, "local")`，要求成功、src/dest存储和源/目标size一致，再核验最终115文件完整SHA1。不按标题匹配，不依赖经常为空的 download_hash/downloader，不读挂载文件或递归扫云盘。历史缺失、大小不符、最终路径不在同一115映射或SHA1不可得都保留。
+- 清理只调用一次精确hash的 `delete_torrents(ids=hash, delete_file=False)` 并回读确认不存在；先持久化 remove_intent，不确定时不重发。随后仅对manifest文件：WAL → 同父0700私有slot → dirfd原子rename → 再核对inode与SHA1 → unlink_intent → 单文件dirfd unlink。替换对象只隔离保留、不删；不删除目录、非manifest/priority0文件、共享根、115成片或strm。空slot故意保留。重启可恢复qB移除后、rename后和unlink意图后的阶段；mkdir落盘前后等身份不明窗口保持失败待人工，不能猜测归属。
+- 安全审查修复：本地/云端长IO结束后、写 `remove_intent` 之前重新核对冻结的实例/hash/name/root/save_path/layout/added_on、完整文件名/大小/priority、已选完成清单和标签；`remove_only` 接收显式冻结 expected task，RPC内部再做同一检查，不再只比 generation。长IO后的qB移除前、每个文件原子隔离前及最终unlink前重查全量账本+全量qB内容独占；网络失败或新增重叠均保留并记原因。rename后才发现重叠时，已验证文件留在私有slot，不强移回覆盖其他写入者的新文件。
+- **清理的并发边界**：qB API没有服务端CAS/跨查询与删除的事务；上述逐边界重核不能消除最后一次查询与RPC/rename/unlink之间的所有外部竞态。启用免费清理时，**不可同时通过qB界面、其他客户端或其他插件手工重绑hash/路径、修改选集/标签，或让其他任务接管同一来源**；先关闭清理并等待当前worker结束，再进行人工修改。不能将这些本地测试称为对独立外部API的原子保证。
+- 启用状态的poll自动对账→推进上传→严格免费清理。只在同一物理qB成功查询不存在、`root/name`整棵来源确切不存在时写 `external_missing` 终态，释放未完成reservation，不重下，也**不计为插件清理成功**。目录仍在（即使空目录）、部分源、symlink/权限/网络查询失败都不当作完全缺失，提供明确原因。已交接的missing任务仍可通过精确src+云SHA1核验，`library_confirmed`为本次云端完整性核验结果（监控或最终路径），不是Emby播放验证。
+- 只读 `GET /api/v1/plugin/Qb115Downloader/cleanup_preview?hash=<完整hash>` 返回eligible、原因、准确绝对本地文件路径与大小；会做本地SHA1和远端只读核验，不写账本、不触发清理。`/tasks` 显示billing、cleanup/cleanup_reason、reconcile_reason、library_confirmed和verified_cloud_paths，done/external_missing不再伪装继续保种。done、清理中和external_missing禁止start/retry/再次提交；保留墓碑跨重启幂等。
+- 本次只有本地代码/测试/commit；没有push、安装、部署、生产写或真实删除。既往E199/E194和生产旧hash的外部删除不是本版清理验收，真实隔离BT小样本由父代理独立完成。
 
 ## 同根目录不同种子/集数：本地隔离与 legacy 兼容
 
@@ -10,7 +23,7 @@
 - 改为按**内容路径**保留占位（同时检查本地路径和同一物理 qB 的映射路径），相等/父子重叠均拒绝，即使旧任务处于 `waiting_library/untracked`。只允许路径确实独立的同名任务，不是直接取消安全占位。
 - **云端仍保持原名**：`staging_path/<完整 hash>/<原种子根名>` → `target_path/<原种子根名>`，不把 hash 加进云端成片名。若前一同名批次还在监控目录，后一批保持隔离暂存并失败退避；CLM 消费后再校验并重试非覆盖交接，不合并、不覆盖、不删除前一批。前一批未被消费时，不承诺两批能同时交接。
 - 选集仍依赖 qB 确认：priority=0 跳过，选中文件缺 size/priority/progress、未知扩展名、源缺失或冻结清单改变仍 fail closed。本插件只把 qB 返回的选中文件作为该 hash 的上传清单；partial torrent 不补全季度，未知/缺失集数不自动推断。
-- 这次没有新增清理执行器或自动删除。**免费种只代表下载计费优惠，不证明免做种/H&R/分享率义务**；本地源、qB 任务和云端文件均保留，清理仍需独立设计和授权。
+- 非0/unknown继续保种；仅0.2.0的显式免费开关可以在上述严格门控后清理。
 - 回滚提醒：0.1.0 的适配器只接受配置中的单一根目录，不能正确恢复新增的 hash 子目录任务。出现新格式任务后不要直接退回旧代码并继续运行；先停止插件推进并人工安排保留新版或逐任务核对，不靠清账本、搬文件绕过。
 
 ## 已实现的链路
@@ -24,7 +37,7 @@
   → OpenList 隔离目录逐文件流式 PUT
   → 大小、可用 SHA1、文件头可读性、整批文件清单验证
   → 单个完整目录 move 到 /115/媒体库监控目录/<原种子名>
-  → CLM / CSC / Emby 后续处理；本地原文件继续保种
+  → CLM / CSC / Emby 后续处理；云端完整SHA1核验后，仅明确free按开关清理，否则保种
 ```
 
 状态包含 `downloading / uploading / verifying / commit_pending / handed_off / waiting_library / failed / suspended / untracked`。页面同时显示真实 qB 进度、qB 状态和云端阶段。**qB 下载 100% 不等于上传完成，更不等于已经入库。**
@@ -68,7 +81,7 @@
   - 两者都不在 → 挂起（可能被 CLM 搬走，也可能丢失），等人工按 SHA1/整理历史核对；两者都在 → 挂起；
   - 核对本身遇到 OpenList 超时/5xx/传输错误（`transient`）时只退避重试，不挂起、不动作。
   move 成功后若目标已被 CLM 取走（目录或部分文件消失），进入“等待入库”而不是失败；只有“存在但内容不符”才挂起。
-- **没有任何本地/115 文件删除实现**。下载器删除入口 `delete_file=True`（包括省略参数）拒绝；明确 `False` 仅暂停 qB 并停止跟踪，保留源文件、云端文件、任务墓碑和空间预留。**墓碑（`untracked`）和 `suspended` 是粘性状态**：在途 tick（`_process`/退避/交接收尾都在账本锁外运行）写入的状态迁移**不会被在途**的 worker 覆盖回 `uploading/verifying/failed`，被拒绝的迁移连同其 `error` 文本一起丢弃；只有显式的 remove/abandon（→ untracked）、挂起（→ suspended，且不会把 untracked 变回 suspended）和 `unsuspend` 能跨越。上传/哈希中途出现墓碑或挂起，worker 在下一个读块/下一个文件前退出（已发出的那一个 PUT 仍会结束）。
+- **不提供通用或云端删除入口；仅上述受控免费清理可删本地manifest**。下载器删除入口 `delete_file=True`（包括省略参数）拒绝；明确 `False` 仅暂停 qB 并停止跟踪，保留源文件、云端文件、任务墓碑和空间预留。**墓碑（`untracked`）和 `suspended` 是粘性状态**：在途 tick（`_process`/退避/交接收尾都在账本锁外运行）写入的状态迁移**不会被在途**的 worker 覆盖回 `uploading/verifying/failed`，被拒绝的迁移连同其 `error` 文本一起丢弃；只有显式的 remove/abandon（→ untracked）、挂起（→ suspended，且不会把 untracked 变回 suspended）和 `unsuspend` 能跨越。上传/哈希中途出现墓碑或挂起，worker 在下一个读块/下一个文件前退出（已发出的那一个 PUT 仍会结束）。
 
 ### native 自动整理隔离的验证与条件
 
@@ -119,6 +132,7 @@ MoviePilot 只给 `get_state()` 为真的插件注册 `get_service()` 的定时�
 | 字段 | 说明 / 默认 |
 |---|---|
 | `enabled` | `False` |
+| `auto_cleanup_free` | `False`；仅JSON布尔；0计费+accepted+云完整SHA1+严格归属通过才删本地manifest和qB条目 |
 | `physical_downloader` | 已启用物理 qB 的精确配置名称；无默认回退 |
 | `local_root` | MP 内可读的独立本地目录；必须已存在、绝对路径、各级均非 symlink |
 | `staging_path` | `/115/.qb115-staging`，不得被任何 CLM/其他程序监控 |
@@ -162,7 +176,7 @@ MoviePilot 只给 `get_state()` 为真的插件注册 `get_service()` 的定时�
 - 不保存 torrent 内容、cookie、tracker、raw URL 或云端 token。
 
 - 磁力、v2/未知大小种子拒绝；v1 `bytes` 或本地 `Path` 可接收。以**全种子大小**预留空间（即使只选几集也保守预留）。
-- 空闲空间必须覆盖低水位 + 现有全部预留 + 新任务。已经上传/继续保种/停止跟踪的预留都不自动释放，因此可能明显过度保守，不会只靠当前 free 无限接单。
+- 空闲空间必须覆盖低水位+未冻结清单且未确认external_missing的全种子预留+新任务；冻结清单后不双算已占用磁盘。
 - 网络失败退避 `60s → 120s → ... → 最多 3600s`；完成文件逐个重新验证后复用。**不支持远端分片断点续传**；中断文件需整文件重传，已有冲突/半成品不会被自动覆盖或删除。
 - 上传清单冻结。选集、源文件或文件签名变化会挂起；不偷偷替换清单。**文件签名只含 inode/大小/mtime_ns**（不含 `st_dev`、`st_ctime_ns`）：新增硬链接、chmod 或 btrfs 子卷设备号变化不会再让已上传任务误挂起。取舍：保持 inode、大小和 mtime 不变的原地改写无法通过元数据发现（逐文件 SHA1 仍在上传前计算，已上传文件的云端 SHA1/大小/文件头在交接前校验）。旧版 5 字段签名在加载时自动迁移。
 - **任务与物理 qB 绑定**：账本为每个任务持久化 `physical_downloader`、qB 实际 `save_path`、`layout`，每次 tick/控制前比对；改配置/换物理下载器/保存路径或布局变化 → 任务挂起，且不对另一个实例执行 pause/start。账本缺少这些字段同样挂起。重载插件会丢弃旧的 qB 适配器。
@@ -181,6 +195,7 @@ MoviePilot 只给 `get_state()` 为真的插件注册 `get_service()` 的定时�
 API 使用 MP 的 `apikey` 认证（不要把令牌放在 URL）：
 
 - `GET /api/v1/plugin/Qb115Downloader/tasks`
+- `GET /api/v1/plugin/Qb115Downloader/cleanup_preview?hash=<完整hash>`（只读）
 - `POST /api/v1/plugin/Qb115Downloader/control?hash=<原始hash>&action=pause`
 - `action=start` / `action=retry` / `action=release`（解除隔离标记，仅限实时检查通过）同上。非法动作/删除拒绝。
 - `action=abandon`：**人工、不含删除**的“放弃跟踪”，把任何未停跟踪的任务转成 `untracked`：保留本地文件、云端文件/暂存、qB 任务，**预留不释放**，不再上传/交接，不能再 start；对任务绑定的 qB 实例尽力暂停（实例不符则只写账本）。同样 `remove_torrents(delete_file=False)` 也只做这件事。
@@ -188,14 +203,14 @@ API 使用 MP 的 `apikey` 认证（不要把令牌放在 URL）：
 
 ## 明确未完成 / 必须人工的部分
 
-1. **最终入库/最终路径关联未自动实现。** OpenList 通用 `ObjResp` 不提供可稳定追踪搬移的 115 fileid；没有可靠的 cloud fileid → CLM → `transferhistory` 证据链，故 API 永远不报 `library_confirmed=True`。上传和云端登记只到“等待入库”，不是“已入库”。目标消失时不推断成功，交接不明时挂起，按 SHA1、原目标路径和整理历史人工核对。
-2. 源文件删除、云端删除、暂存残留删除、自动空间回收、预留释放 UI **都未实现**（`abandon` 只是不含删除的停跟踪，预留仍保留）。不要因为空间紧张就直接清账本重加，这会丢掉幂等保护。清理需另行设计和独立授权。
-3. PT 做种时间/分享率策略不由本插件管理；原 qB 持续保种。下载失败不自动回退 MP 订阅、不自动换资源搜索，避免误改现有订阅。
+1. 最终关联只支持本机CLM的local挂载前缀→同115 OpenList映射；只读精确src+size记录和最终SHA1均齐才确认。任一证据缺失时待核验，不按标题兜底；不声称Emby可播放。
+2. 云端删除、暂存/空slot目录回收仍未实现。`abandon`不含删除；external_missing必须双端缺失证据才释放预留。不能清账本重加绕过墓碑。
+3. 不按PT做种时间/分享率策略门控；非0/unknown保种，提交free按显式开关处理。下载失败不自动回退 MP 订阅、不自动换资源搜索，避免误改现有订阅。
 4. 常见 NFO/封面/未知扩展名若仍处于选中状态会阻塞整批。本版媒体/字幕白名单较保守；需用户在 qB 明确取消不需要的文件并在首次冻结清单前完成选择。
 5. raw URL 需要额外鉴权、重定向或 CDN 特殊规则时会拒绝校验而非带管理员 token 尝试；需要后续在授权测试环境验证兼容性。
 6. **仍未做/仍有的限制**：每个文件仍有一次 `fs/get` + 一次 raw 探测（没有也不能省，这是交接前的逐文件校验）；失败重试会重新对源文件做本地 SHA1（本地 IO，不触 115）；预留空间不自动释放（`untracked`、已提交未冻结清单的任务仍计入）；账本不自动清理已完成任务；同 hash 经 native `download()` 补全局标签的风险只能缩小窗口，见上文；`download()` 在持有 `engine.lock` 时做 qB 添加/选集确认（秒级，qB 异常慢时会短暂阻塞 pause/状态查询）。
 7. **未验证的契约**：全部是源码核对 + 本地 loopback/假 qB 测试。未验证：真实 115/OpenList 在客户端断开后的上传行为、`content_path` 在 `NoSubfolder` 布局下、MP 前端是否按下载器名展示本任务、`get_runtime_setting('TORRENT_TAG')` 在运行时被改动的时序、一次真实 MP 重复提交到同物理 qB 的竞态窗口大小。
-8. 尚未在真实下载任务、真实 115、已安装 MP 插件、CLM/CSC/Emby 上执行端到端实验；也未验证大文件上传耗时、115 限流、断电时底层数据库的持久化保证。不得将本地 HTTP 测试冒充生产验收。
+8. 本次0.2.0尚未在真实任务做端到端清理验收；历史旧版本上线实验不证明本次自动删除有效。115限流、实际断电持久性仍未验证，不得把本地HTTP/模拟qB测试冒充生产验收。
 
 ## 本地开发验证
 
