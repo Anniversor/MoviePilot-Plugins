@@ -21,7 +21,9 @@ PATHS = ["modules/qbittorrent/__init__.py", "modules/qbittorrent/qbittorrent.py"
          "runtime/extensions/module/contracts.py", "chain/download/submission.py",
          "chain/transfer/settlement.py", "modules/__init__.py",
          "db/oper/systemconfig.py", "db/oper/plugindata.py", "db/models/plugindata.py",
-         "runtime/extensions/plugin/projection.py", "db/base.py"]
+         "runtime/extensions/plugin/projection.py", "db/base.py", "runtime/events.py", "runtime/event/dispatch.py",
+         "chain/download/history.py", "db/oper/transferhistory.py", "db/models/transferhistory.py",
+         "plugins/cloudlinkmonitor/__init__.py"]
 code = "from pathlib import Path; import json; print(json.dumps({p:Path('/app/app/'+p).read_text() for p in " + repr(PATHS) + "}))"
 result = subprocess.run(["docker", "exec", "moviepilot-v3", "python3", "-c", code],
                         check=True, capture_output=True, text=True, timeout=30)
@@ -233,3 +235,67 @@ print("PASS live source: ledger = table plugindata, row (plugin_id='Qb115Downloa
 services = ast.get_source_segment(sources["runtime/extensions/plugin/projection.py"], find_func(tree("runtime/extensions/plugin/projection.py"), "services"))
 assert "if plugin.get_state():" in services and "plugin.get_service()" in services
 print("PASS live source: plugin services are registered only while get_state() is true (guard-only plugins must report True)")
+
+# v0.2: source-only billing/acceptance/history boundary checks. A changed boundary fails this probe;
+# at runtime absent stack evidence is billing_unknown, never a title-based fallback.
+submission = sources['chain/download/submission.py']
+assert submission.index('ChainEventType.ResourceDownload') < submission.index('class DownloadSubmissionOwner')
+section = submission[submission.index('    def _submit_prepared_download('):submission.index('    def _settle_accepted_download(')]
+assert 'context: Context' in section and 'prepared: _PreparedDownload' in section
+assert 'content=prepared.torrent_content' in section and 'downloader=downloader or prepared.site_downloader' in section
+assert 'downloadvolumefactor=' not in section
+hist = sources['chain/download/history.py']
+assert '"hash": download_hash, "context": context' in hist and '"downloader": downloader' in hist
+assert 'self.eventmanager.send_event(EventType.DownloadAdded, event_payload)' in hist
+assert 'self._settle_download_success(' in submission
+send = ast.get_source_segment(sources['runtime/events.py'], find_func(tree('runtime/events.py'), 'send_event'))
+assert 'self.__trigger_broadcast_event(event)' in send
+chain = find_func(tree('runtime/event/dispatch.py'), 'dispatch_chain')
+assert 'self.invoke_sync(handler, event)' in ast.get_source_segment(sources['runtime/event/dispatch.py'], chain)
+assert 'method(event)' in ast.get_source_segment(sources['runtime/event/dispatch.py'], find_func(tree('runtime/event/dispatch.py'), 'invoke_sync'))
+print('PASS live source: ResourceDownload is synchronous but pre-fetch/cancellable; billing uses active _submit_prepared_download context+exact bytes, no threadlocal carry-over')
+print('PASS live source: accepted download history publishes DownloadAdded {hash,context,downloader}; asynchronous broadcast is matched by persisted hash/site/resource')
+# Execute the REAL live submission method with the real local plugin against an isolated fake qB.
+# Only source is read from the container; this does not instantiate MP or call any production peer.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
+from test_plugin import load_plugin
+from test_core import bencode, FakeQb
+probe = load_plugin().Qb115Downloader()
+probe.init_plugin({})
+probe._enabled = True
+probe._engine.free = lambda: 10**12
+peer = FakeQb('/isolated-test', [])
+peer.submit = lambda content, tid, **kw: ('physical', tid, 'Original', 'ok')
+probe._runtime = lambda: (peer, None)
+namespace = dict(__name__='app.chain.download.submission', cast=lambda _type, value: value, Set=set,
+                 DOWNLOAD_TASK_ALREADY_EXISTS=live_exists,
+                 subscription_download_label=lambda value: '', logger=logger)
+exec('from __future__ import annotations\n' + textwrap.dedent(section), namespace)
+accepted = []
+owner = SimpleNamespace(_subscription_download_cancelled=lambda _: False, download=probe.download,
+                        _settle_accepted_download=lambda **kw: accepted.append(kw))
+context = SimpleNamespace(subscription_download=None,
+                          torrent_info=SimpleNamespace(site=3, enclosure='https://invalid.example/resource', page_url=None, site_cookie=None,
+                                                       downloadvolumefactor=0))
+content = bencode({b'info': {b'name': b'a.mkv', b'length': 4, b'pieces': b'x'*20, b'piece length': 16384}})
+prepared = SimpleNamespace(torrent_content=content, torrent=context.torrent_info, site_downloader=probe.DOWNLOADER_NAME,
+                           download_dir=Path('/unused'), media=SimpleNamespace(category='TV'))
+tid, _ = namespace['_submit_prepared_download'](owner, prepared=prepared, context=context, episodes=None,
+                         channel=None, source=None, downloader=probe.DOWNLOADER_NAME, userid=None,
+                         username=None, label=None, custom_words=None, governance=None)
+assert tid and accepted and probe._engine.tasks[tid]['billing']['downloadvolumefactor'] == 0
+probe.on_download_added(SimpleNamespace(event_data=dict(hash=tid, context=context, downloader=probe.DOWNLOADER_NAME)))
+assert probe._engine.tasks[tid]['billing']['accepted'] is True
+print('PASS executed REAL live _submit_prepared_download -> local plugin -> fake qB; billing accepted by exact DownloadAdded payload')
+
+get_src = find_func(tree('db/oper/transferhistory.py'), 'get_by_src')
+assert arg_names(get_src) == ['self', 'src', 'storage']
+model_src = ast.get_source_segment(sources['db/models/transferhistory.py'], find_func(tree('db/models/transferhistory.py'), 'get_by_src'))
+assert 'cls.src == src' in model_src and 'cls.src_storage == storage' in model_src
+for field in ('src_fileitem', 'dest_fileitem', 'src_storage', 'dest_storage'):
+    assert field in sources['db/models/transferhistory.py']
+for key in ('rc_mount_prefix', 'openlist_base'):
+    assert key in sources['plugins/cloudlinkmonitor/__init__.py']
+assert {'ids', 'delete_file'} <= set(arg_names(find_func(qb_cls, 'delete_torrents')))
+print('PASS live source: read-only get_by_src(src,storage), source/destination file sizes and CLM mount-prefix mapping exist; cleanup removal accepts exact ids/delete_file=False')

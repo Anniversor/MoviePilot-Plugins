@@ -181,9 +181,43 @@ class QbAdapter:
         expected = self.expected_save_path(tid)
         if local != root or raw.rstrip("/") != str(expected).rstrip("/"):
             raise ValueError("qB actual path does not roundtrip to isolated local root")
-        return dict(name=item.get("name"), root=local, save_path=raw, physical=self.name,
+        return dict(name=item.get("name"), hash=item.get("hash"), added_on=item.get("added_on"),
+                    root=local, save_path=raw, physical=self.name,
                     layout=server.get_content_layout(), files=server.get_files(tid),
                     tags=item.get("tags"), state=item.get("state"), progress=item.get("progress") or 0)
+
+    def cleanup_inventory(self):
+        """Unfiltered inventory, mapped back to MP paths. Query errors never mean an empty downloader."""
+        torrents, error = self._server().get_torrents()
+        if error:
+            raise ValueError("qB inventory unavailable")
+        result = []
+        for item in torrents:
+            path = item.get("save_path") or ""
+            content = item.get("content_path") or ""
+            if not path.startswith("/"):
+                raise ValueError("qB inventory path unknown")
+            result.append(dict(hash=item.get("hash"), added_on=item.get("added_on"),
+                               save_path=self.module.normalize_return_path(Path(path), self.name),
+                               content_path=self.module.normalize_return_path(Path(content), self.name) if content else ""))
+        return result
+
+    def is_absent(self, tid):
+        if not re.fullmatch(r"[a-f0-9]{40}", tid):
+            raise ValueError("invalid torrent hash")
+        torrents, error = self._server().get_torrents(ids=tid)
+        if error or any(t.get("hash") != tid for t in torrents):
+            raise ValueError("qB absence unconfirmed")
+        return not torrents
+
+    def remove_only(self, tid, identity):
+        """ONE exact hash; no file deletion. Fresh generation/isolation/path checks and mandatory readback."""
+        snapshot = self.snapshot(tid)
+        if not isinstance(identity, int) or isinstance(identity, bool) or identity <= 0 or snapshot.get("added_on") != identity:
+            return False
+        if not self.guard().delete_torrents(ids=tid, delete_file=False):
+            return False
+        return self.is_absent(tid)
 
     def pause(self, tid):
         """Direct pause, deliberately WITHOUT snapshot/guard: it has to work exactly when isolation is lost."""

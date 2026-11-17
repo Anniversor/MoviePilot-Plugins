@@ -33,9 +33,12 @@ def load_plugin():
     if not (PLUGIN / "__init__.py").exists():
         return None
     modules = {}
-    for name in ["app", "app.sdk", "app.sdk.plugin", "app.schemas", "app.schemas.transfer"]:
+    for name in ["app", "app.sdk", "app.sdk.plugin", "app.schemas", "app.schemas.transfer", "app.runtime", "app.runtime.events", "app.schemas.types"]:
         modules[name] = ModuleType(name)
     modules["app.sdk.plugin"]._PluginBase = Base
+    modules["app.runtime.events"].eventmanager = SimpleNamespace(register=lambda *a, **k: lambda f: f)
+    modules["app.schemas.types"].ChainEventType = SimpleNamespace(ResourceDownload='resource.download')
+    modules["app.schemas.types"].EventType = SimpleNamespace(DownloadAdded='download.added')
     modules["app.schemas.transfer"].DownloaderTorrent = lambda **kw: SimpleNamespace(**kw)
     spec = importlib.util.spec_from_file_location("qb115_test", PLUGIN / "__init__.py", submodule_search_locations=[str(PLUGIN)])
     module = importlib.util.module_from_spec(spec)
@@ -111,7 +114,9 @@ class PluginTests(unittest.TestCase):
         self.assertNotIn("openlist_token", defaults)
         self.assertIn("待人工", json.dumps(p.get_page(), ensure_ascii=False))
         apis = p.get_api()
-        self.assertEqual({a["path"] for a in apis}, {"/tasks", "/control"})
+        self.assertFalse(defaults["auto_cleanup_free"])
+        self.assertEqual({a["path"] for a in apis}, {"/tasks", "/control", "/cleanup_preview"})
+        self.assertEqual(next(a for a in apis if a["path"] == "/cleanup_preview")["methods"], ["GET"])
         self.assertTrue(all(a["auth"] == "apikey" for a in apis))
         self.assertEqual(next(a for a in apis if a["path"] == "/control")["methods"], ["POST"])
         self.assertEqual(p.get_service(), [])

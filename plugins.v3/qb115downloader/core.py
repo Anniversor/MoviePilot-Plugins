@@ -9,6 +9,7 @@ import re
 import stat
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -94,7 +95,7 @@ SUSPEND_NOTES = {"ok": "；已请求暂停 qB（最佳努力，请在 qB 核对�
 ABANDON_MESSAGE = ("已人工放弃跟踪（abandon）：保留本地文件、云端文件和 qB 任务，预留不释放，不再上传/交接；"
                    "qB 里是否仍在做种请自行处理")
 UNTRACKED_GUARD_MESSAGE = "已停跟踪任务被补上全局整理标签：已暂停"
-STICKY_STATES = {"untracked", "suspended"}  # only an explicit, named transition may leave or enter these
+STICKY_STATES = {"untracked", "suspended", "external_missing"}  # only an explicit, named transition may leave or enter these
 
 
 def norm_path(path):
@@ -141,6 +142,7 @@ class Engine:
                 current = task.get("state")
                 allowed = (_force == "untrack" or (_force == "suspend" and current != "untracked")
                            or (_force == "unsuspend" and current == "suspended")
+                           or (_force == "external_missing" and current != "untracked")
                            or current not in STICKY_STATES)
                 if not allowed:
                     fields.pop("state")
@@ -166,7 +168,7 @@ class Engine:
     def outstanding(task):
         """Space still to be consumed. Once the selected files are complete on disk (manifest frozen)
         free() already excludes them, so counting the reservation again would double-count forever."""
-        return 0 if task.get("manifest") else task["reserved"]
+        return 0 if task.get("manifest") or task.get("reservation_released") else task["reserved"]
 
     def admit(self, tid, name, size, root, physical="", save_path="", layout=""):
         with self.lock:
@@ -200,6 +202,413 @@ class Engine:
             self.flush()
             return task
 
+    def capture_billing(self, tid, site, factor, resource):
+        """Freeze pre-submission facts. Acceptance must independently bind the exact hash/resource/site."""
+        with self.lock:
+            task = self.tasks.get(tid)
+            if not task or task.get("billing") or not isinstance(site, int) or isinstance(site, bool) or site <= 0:
+                return False
+            if not isinstance(factor, (int, float)) or isinstance(factor, bool) or not 0 <= factor < float("inf"):
+                factor = None
+            self._set(task, billing=dict(site=site, downloadvolumefactor=factor, resource=resource,
+                                        accepted=False, source="submission"))
+            return True
+
+    def confirm_billing(self, tid, site, resource):
+        with self.lock:
+            task = self.tasks.get(tid)
+            billing = task.get("billing") if task else None
+            if not billing or billing["site"] != site or billing["resource"] != resource:
+                return False
+            billing = dict(billing, accepted=True)
+            self._set(task, billing=billing)
+            return True
+
+    @staticmethod
+    def cleanup_policy(task, enabled):
+        billing = task.get("billing") or {}
+        if not enabled:
+            return "disabled"
+        if not billing.get("accepted") or not billing.get("site"):
+            return "billing_unknown"
+        factor = billing.get("downloadvolumefactor")
+        if type(factor) not in {int, float} or not 0 <= factor < float("inf"):
+            return "billing_unknown"
+        if factor != 0:
+            return "keep_seeding"
+        if task.get("state") != "waiting_library" or not task.get("commit_intent"):
+            return "not_handed_off"
+        if task.get("paused") or task.get("quarantined"):
+            return "held"
+        return ""
+
+    @staticmethod
+    def _cleanup_failure(err):
+        # Whitelist only fixed internal messages. Never surface provider exception text/URLs.
+        reasons = {
+            "cleanup ledger directory overlap": "ledger_content_overlap",
+            "cleanup qB content overlap": "qb_content_overlap",
+            "cleanup hash readded": "qb_generation_changed",
+            "cleanup qB generation mismatch": "qb_generation_changed",
+            "cleanup qB identity/files/tags changed": "qb_files_or_isolation_changed",
+            "cleanup source manifest mismatch": "qb_selection_changed",
+            "cleanup local fingerprint mismatch": "local_fingerprint_changed",
+            "fresh full cloud sha1 required": "cloud_sha1_unavailable_or_mismatch",
+            "final cloud mapping unavailable": "final_mapping_missing",
+            "cleanup instance binding mismatch": "instance_binding_changed",
+        }
+        if getattr(err, "transient", False):
+            return "cloud_unavailable"
+        if getattr(err, "missing", False):
+            return "cloud_mapping_missing"
+        if isinstance(err, FileNotFoundError):
+            return "local_source_missing"
+        return reasons.get(str(err), "verification_failed")
+
+    def cleanup_preview(self, tid, qb, cloud, enabled=False, resolve_final=None):
+        """Read-only, including full local SHA1 and fresh cloud verify. No ledger or external writes."""
+        with self.lock:
+            task = copy.deepcopy(self.tasks.get(tid))
+        if not task:
+            return dict(hash=tid, eligible=False, reason="unknown_task", files=[])
+        try:
+            files = [dict(path=str(Path(task["root"]) / i["source"]), size=i["size"])
+                     for i in self._cleanup_manifest(task)]
+        except Exception:
+            return dict(hash=tid, eligible=False, reason="manifest_invalid_or_missing", files=[])
+        reason = ("already_cleaned" if task.get("cleanup_state") == "done" else
+                  "external_missing" if task["state"] == "external_missing" else self.cleanup_policy(task, enabled))
+        if not reason:
+            try:
+                self._cleanup_checks(task, qb, cloud, resolve_final)
+            except Exception as err:
+                reason = self._cleanup_failure(err)
+        return dict(hash=tid, eligible=not bool(reason), reason=reason or "verified_free", files=files)
+
+    @staticmethod
+    def _hash_source(task, item):
+        with open_source(task["root"], item["source"]) as stream:
+            before = os.fstat(stream.fileno())
+            digest = hashlib.sha1()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if (file_signature(before) != item["signature"] or file_signature(os.fstat(stream.fileno())) != item["signature"]
+                    or digest.hexdigest() != item["sha1"] or before.st_size != item["size"]):
+                raise ValueError("cleanup local fingerprint mismatch")
+
+    @staticmethod
+    def _paths_overlap(left, right):
+        left, right = PurePosixPath(left), PurePosixPath(right)
+        return left == right or left in right.parents or right in left.parents
+
+    @staticmethod
+    def _cleanup_manifest(task):
+        root = task.get("root") or ""
+        if (not root.startswith("/") or root == "/"
+                or any(root == p or root.startswith(p + "/") for p in ("/115", "/115_rclone", "/quark_rclone", "/vol02"))):
+            raise ValueError("cleanup invalid root")
+        relative_name(root[1:])
+        relative_name(task["target"][1:])
+        if not task["target"].startswith("/115/"):
+            raise ValueError("cleanup invalid target")
+        manifest = task.get("manifest") or []
+        sources, remotes = set(), set()
+        for item in manifest:
+            parts = relative_name(item["source"])
+            relative_name(item["remote"])
+            if parts[0] != task["name"] or item["source"] in sources or item["remote"] in remotes:
+                raise ValueError("cleanup invalid manifest")
+            if (not re.fullmatch(r"[a-f0-9]{40}", item["sha1"]) or len(item["signature"]) != 3
+                    or item["signature"][1] != item["size"] or item["size"] <= 0):
+                raise ValueError("cleanup invalid fingerprint")
+            sources.add(item["source"])
+            remotes.add(item["remote"])
+        if not manifest:
+            raise ValueError("cleanup empty manifest")
+        return manifest
+
+    @staticmethod
+    def qb_file_binding(snapshot):
+        return sorted([[f["name"], f["size"], f["priority"]] for f in snapshot["files"]])
+
+    def _cleanup_exclusive(self, task, qb):
+        with self.lock:
+            others = copy.deepcopy([t for h, t in self.tasks.items() if h != task["hash"]])
+        own = str(PurePosixPath(task["root"]) / task["name"])
+        for other in others:
+            if not str(other.get("root") or "").startswith("/") or len(relative_name(other.get("name"))) != 1:
+                raise ValueError("cleanup ledger directory overlap")
+            relative_name(other["root"][1:])
+            if (not other.get("root") or not other.get("name")
+                    or self._paths_overlap(str(PurePosixPath(task["root"]) / task["name"]),
+                                           str(PurePosixPath(other["root"]) / other["name"]))):
+                raise ValueError("cleanup ledger directory overlap")
+        for other in qb.cleanup_inventory():  # ALL qB tasks, never just our tag or hashes
+            if other.get("hash") == task["hash"]:
+                if other.get("added_on") != task.get("qb_identity"):
+                    raise ValueError("cleanup hash readded")
+                continue
+            path = other.get("save_path")
+            content = other.get("content_path") or path  # unknown content => conservatively own save_path
+            if path and content:
+                relative_name(path[1:])
+                relative_name(content[1:])
+            if (not path or not path.startswith("/") or not content.startswith("/")
+                    or PurePosixPath(path) == PurePosixPath(own) or PurePosixPath(own) in PurePosixPath(path).parents
+                    or self._paths_overlap(own, content)):
+                raise ValueError("cleanup qB content overlap")
+
+    @staticmethod
+    def _verify_cloud(task, item, cloud, resolve_final=None):
+        """Deletion requires a fresh complete SHA1, not merely OpenList's readability/head check."""
+        path = task["target"] + "/" + item["remote"]
+        try:
+            result = cloud.verify(path, item)
+        except Exception as err:
+            # Only a definitive missing object may use the exact source-history association.
+            if not getattr(err, "missing", False) or resolve_final is None:
+                raise
+            path = resolve_final(task, item)
+            if not isinstance(path, str) or not path.startswith("/115/"):
+                raise ValueError("final cloud mapping unavailable")
+            relative_name(path[1:])
+            result = cloud.verify(path, item)
+        if not isinstance(result, dict) or str(result.get("sha1") or "").lower() != item["sha1"]:
+            raise ValueError("fresh full cloud sha1 required")
+        return path
+
+    def _cleanup_checks(self, task, qb, cloud, resolve_final=None):
+        manifest = self._cleanup_manifest(task)
+        self._cleanup_exclusive(task, qb)
+        if self._binding_error(task, qb):
+            raise ValueError("cleanup missing manifest/binding")
+        snapshot = qb.snapshot(task["hash"])
+        if self._binding_error(task, qb, snapshot) or not task.get("qb_identity") or snapshot.get("added_on") != task["qb_identity"]:
+            raise ValueError("cleanup qB generation mismatch")
+        if (snapshot.get("hash") != task["hash"] or snapshot.get("name") != task["name"]
+                or self.qb_file_binding(snapshot) != task.get("qb_files")
+                or "mp-qb115" not in {t.strip() for t in str(snapshot.get("tags") or "").split(",")}
+                or qb.isolation_report([task["hash"]])):
+            raise ValueError("cleanup qB identity/files/tags changed")
+        selected = selected_files(snapshot["files"])
+        if selected is None or sorted((i["name"], i["size"]) for i in selected) != sorted((i["source"], i["size"]) for i in manifest):
+            raise ValueError("cleanup source manifest mismatch")
+        for item in manifest:
+            self._hash_source(task, item)
+            self._verify_cloud(task, item, cloud, resolve_final)
+
+    @classmethod
+    def _cleanup_local(cls, task, item):
+        entry = (task.get("cleanup_files") or {}).get(item["source"])
+        if not entry:
+            cls._hash_source(task, item)
+            return
+        if not re.fullmatch(r"\.qb115-cleanup-[a-f0-9]{32}", entry.get("slot", "")):
+            raise ValueError("invalid cleanup journal slot")
+        parts = relative_name(item["source"])
+        isolated = "/".join(parts[:-1] + [entry["slot"], parts[-1]])
+        if os.path.lexists(os.path.join(task["root"], isolated)):
+            cls._hash_source(task, dict(item, source=isolated))
+        elif os.path.lexists(os.path.join(task["root"], item["source"])):
+            cls._hash_source(task, item)
+        elif entry.get("phase") not in {"unlink_intent", "unlinked"}:
+            raise ValueError("cleanup file missing without unlink intent")
+
+    def cleanup_free(self, tid, qb, cloud, enabled=False, resolve_final=None):
+        if self.stopped.is_set() or not self.worker.acquire(blocking=False):
+            return False
+        try:
+            task = self.tasks.get(tid)
+            if not task or self.cleanup_policy(task, enabled):
+                return False
+            if task.get("cleanup_state") == "done":
+                return True
+            if self._binding_error(task, qb):
+                raise ValueError("cleanup instance binding mismatch")
+            recovering = task.get("cleanup_state") in {"remove_intent", "qb_absent"}
+            if recovering:
+                # Never reissue a delete RPC after a crash. Even a seemingly identical present hash is uncertain.
+                if not qb.is_absent(tid):
+                    self._set(task, cleanup_reason="remove_uncertain_or_readded")
+                    return False
+                self._cleanup_manifest(task)
+                self._cleanup_exclusive(task, qb)
+                for item in task["manifest"]:
+                    self._cleanup_local(task, item)
+                    self._verify_cloud(task, item, cloud, resolve_final)
+            else:
+                self._cleanup_checks(task, qb, cloud, resolve_final)
+                if self._held(task):
+                    return False
+                self._set(task, cleanup_state="remove_intent", cleanup_reason="verified_free")
+                if not qb.remove_only(tid, task["qb_identity"]) or not qb.is_absent(tid):
+                    self._set(task, cleanup_reason="remove_unconfirmed")
+                    return False
+            self._set(task, cleanup_state="qb_absent", library_confirmed=True, library_reason="sha1_verified")
+            for item in task["manifest"]:
+                # Only frozen selected manifest files; isolate atomically before verifying the inode again.
+                self._unlink_source(task, item, qb)
+            self._set(task, cleanup_state="done", cleanup_reason="verified_free")
+            return True
+        except Exception as err:
+            if self.tasks.get(tid):
+                if self.tasks[tid].get("cleanup_reason") != "isolated_file_changed":
+                    self._set(self.tasks[tid], cleanup_reason=self._cleanup_failure(err))
+            return False
+        finally:
+            self.worker.release()
+
+    @staticmethod
+    @contextmanager
+    def _source_parent(task, item):
+        parts = list(Path(task["root"]).parts[1:]) + relative_name(item["source"])
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                relative_name(part)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            yield fd, parts[-1]
+        finally:
+            os.close(fd)
+
+    def _unlink_source(self, task, item, qb):
+        """WAL -> private 0700 slot -> atomic rename -> rehash -> WAL -> single dirfd unlink.
+
+        An attacker can replace the public source name between our checks and rename. That object is moved,
+        NOT deleted: post-rename identity+SHA1 must match. Nothing ever recursively removes the private slot.
+        """
+        journal = copy.deepcopy(task.get("cleanup_files") or {})
+        entry = journal.get(item["source"])
+        with self._source_parent(task, item) as (parent, name):
+            if entry is None:
+                entry = dict(slot=".qb115-cleanup-" + uuid.uuid4().hex, phase="planned")
+                journal[item["source"]] = entry
+                self._set(task, cleanup_files=journal)
+                os.mkdir(entry["slot"], mode=0o700, dir_fd=parent)
+                os.fsync(parent)
+                s = os.stat(entry["slot"], dir_fd=parent, follow_symlinks=False)
+                entry["directory"] = [s.st_dev, s.st_ino]
+                self._set(task, cleanup_files=journal)
+            if not re.fullmatch(r"\.qb115-cleanup-[a-f0-9]{32}", entry["slot"]):
+                raise ValueError("invalid cleanup journal slot")
+            slot = os.open(entry["slot"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                s = os.fstat(slot)
+                if ([s.st_dev, s.st_ino] != entry.get("directory") or stat.S_IMODE(s.st_mode) != 0o700 or s.st_uid != os.getuid()):
+                    raise ValueError("cleanup isolation directory changed")
+                def exists(fd, part):
+                    try:
+                        os.stat(part, dir_fd=fd, follow_symlinks=False)
+                        return True
+                    except FileNotFoundError:
+                        return False
+                source_exists, isolated_exists = exists(parent, name), exists(slot, name)
+                if entry["phase"] == "unlinked":
+                    if source_exists or isolated_exists:
+                        raise ValueError("cleanup deleted source reappeared")
+                    return
+                if source_exists and isolated_exists:
+                    raise ValueError("cleanup source replaced after isolation")
+                if not source_exists and not isolated_exists:
+                    if entry["phase"] != "unlink_intent":
+                        raise ValueError("cleanup isolation outcome uncertain")
+                else:
+                    if self._held(task) or not qb.is_absent(task["hash"]):
+                        raise ValueError("cleanup held or hash readded")
+                    if source_exists:
+                        os.rename(name, name, src_dir_fd=parent, dst_dir_fd=slot)
+                        os.fsync(parent)
+                        os.fsync(slot)
+                    filefd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=slot)
+                    try:
+                        with os.fdopen(filefd, "rb") as stream:
+                            before = os.fstat(stream.fileno())
+                            digest = hashlib.sha1()
+                            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                            if (not stat.S_ISREG(before.st_mode) or file_signature(before) != item["signature"]
+                                    or file_signature(os.fstat(stream.fileno())) != item["signature"] or digest.hexdigest() != item["sha1"]):
+                                self._set(task, cleanup_reason="isolated_file_changed")
+                                raise ValueError("isolated file changed")
+                    except Exception:
+                        self._set(task, cleanup_reason="isolated_file_changed")
+                        raise
+                    entry["phase"] = "unlink_intent"
+                    self._set(task, cleanup_files=journal)
+                    if self._held(task) or not qb.is_absent(task["hash"]):
+                        raise ValueError("cleanup held or hash readded")
+                    os.unlink(name, dir_fd=slot)
+                    os.fsync(slot)
+                entry["phase"] = "unlinked"
+                self._set(task, cleanup_files=journal)
+            finally:
+                os.close(slot)
+
+    @staticmethod
+    def _source_absent(task):
+        root = task.get("root") or ""
+        if not root.startswith("/") or root == "/" or any(root == p or root.startswith(p + "/") for p in ("/115", "/115_rclone", "/quark_rclone", "/vol02")):
+            raise ValueError("unsafe local root")
+        relative_name(root[1:])
+        if len(relative_name(task["name"])) != 1:
+            raise ValueError("invalid content namespace")
+        try:
+            with Engine._source_parent(task, dict(source=task["name"])) as (parent, name):
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+                return False  # includes empty directories, symlinks, partial and unselected data
+        except FileNotFoundError:
+            return True
+
+    def reconcile(self, qb, cloud, resolve_final=None):
+        """Prove external absence; never count someone else's deletion as plugin cleanup success."""
+        if self.stopped.is_set() or not self.worker.acquire(blocking=False):
+            return
+        try:
+            with self.lock:
+                tasks = list(self.tasks.values())
+            for task in tasks:
+                if self.stopped.is_set():
+                    break
+                if task.get("cleanup_state") or task["state"] == "untracked":
+                    continue  # the cleanup WAL alone owns in-flight local deletion recovery
+                try:
+                    if self._binding_error(task, qb):
+                        raise ValueError("instance mismatch")
+                    absent = qb.is_absent(task["hash"])
+                except Exception:
+                    self._set(task, reconcile_reason="qb_query_failed")
+                    continue
+                if absent:
+                    try:
+                        missing = self._source_absent(task)
+                    except Exception:
+                        self._set(task, reconcile_reason="local_absence_unconfirmed")
+                        continue
+                    if missing:
+                        self._set(task, state="external_missing", reservation_released=True,
+                                  reconcile_reason="external_missing", _force="external_missing",
+                                  error="qB 与本地来源已被外部移除；非插件清理成功，不重下")
+                    else:
+                        self._set(task, reconcile_reason="qb_absent_source_present_or_partial")
+                else:
+                    self._set(task, reconcile_reason="qb_present")
+                if task.get("commit_intent") and task.get("manifest"):
+                    try:
+                        self._cleanup_manifest(task)
+                        paths = [self._verify_cloud(task, item, cloud, resolve_final) for item in task["manifest"]]
+                        self._set(task, library_confirmed=True, verified_cloud_paths=paths, library_reason="sha1_verified")
+                        if (task["state"] == "suspended" and task.get("recovery_waiting_cloud")
+                                and not task["paused"] and not task.get("quarantined") and not absent):
+                            self._cleanup_checks(task, qb, cloud, resolve_final)
+                            self._set(task, state="waiting_library", recovery_waiting_cloud=False,
+                                      error="交接恢复已按冻结本地/qB归属与云端SHA1核实；未重传", _force="unsuspend")
+                    except Exception:
+                        self._set(task, library_confirmed=False, library_reason="cloud_verification_pending")
+        finally:
+            self.worker.release()
+
     def rollback(self, tid):
         """Undo an admission whose qB add is confirmed to have NOT happened; nothing else is touched."""
         with self.lock:
@@ -217,6 +626,8 @@ class Engine:
             if tid not in self.tasks:
                 return False
             task = self.tasks[tid]
+            if task["state"] == "external_missing" or task.get("cleanup_state"):
+                return False
             self._set(task, paused=True, state="untracked", _force="untrack")
             return self._pause(qb, tid)
 
@@ -228,7 +639,7 @@ class Engine:
         the tombstone was written; False for an unknown or already untracked hash."""
         with self.lock:
             task = self.tasks.get(tid)
-            if not task or task["state"] == "untracked":
+            if not task or task["state"] in {"untracked", "external_missing"} or task.get("cleanup_state"):
                 return False
             self._set(task, paused=True, state="untracked", error=ABANDON_MESSAGE, _force="untrack")
         if getattr(qb, "name", None) == task.get("physical_downloader"):
@@ -377,7 +788,8 @@ class Engine:
     def control(self, tid, action, qb):
         with self.lock:
             task = self.tasks.get(tid)
-            if not task:
+            if (not task or task["state"] == "external_missing" or task.get("cleanup_state") == "done"
+                    or (task.get("cleanup_state") and action != "pause")):
                 return False
             mismatch = self._binding_error(task, qb)
             if mismatch:
@@ -437,7 +849,7 @@ class Engine:
                 if self.stopped.is_set():  # reload/disable: release the worker, never start another task
                     break
                 current = at()
-                if (task["paused"] or task.get("quarantined") or task["state"] in {"waiting_library", "suspended"}
+                if (task["paused"] or task.get("quarantined") or task["state"] in {"waiting_library", "suspended", "external_missing"}
                         or task["next_retry"] > current or task.get("quiet_until", 0) > current):
                     continue
                 if task["state"] == "admitted":
@@ -508,7 +920,8 @@ class Engine:
                 self._set(task, state="handed_off")
                 self._settle_after_move(task, cloud)
             else:
-                self._suspend(task, "已发起交接，暂存与目标都不存在（可能已被 CLM 搬走）；禁止重传与清理，等待人工按云端身份/整理历史核对", qb)
+                self._set(task, recovery_waiting_cloud=True)
+                self._suspend(task, "已发起交接，暂存与目标都不存在（可能已被 CLM 搬走）；禁止重传，等待精确src关联与完整SHA1核验", qb)
         except Exception as err:
             if getattr(err, "transient", False):
                 self._backoff(task, at(), message="交接状态核对暂时失败，稍后重试；未重传、未挂起")

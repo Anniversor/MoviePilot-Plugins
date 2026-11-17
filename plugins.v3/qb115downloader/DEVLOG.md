@@ -1,5 +1,43 @@
 # Qb115Downloader 开发/验收记录
 
+## 0.2.0：提交计费免费清理（本地功能分支，未push/未部署）
+
+承接 `feat/qb115-free-cleanup` 中断工作树，基线main `a61d7b1`/v0.1.1。继承的billing/WAL/adapter slice与11个cleanup tests并未声称由本轮重新RED。起始实跑223项，只有旧版“源码不得出现unlink”断言失败；改为AST精确允许 `_unlink_source` 的dirfd单文件unlink和 `remove_only` 的单hash `delete_file=False`，仍禁止任意递归/云端删除，其他旧安全测试保留。
+
+### 本轮实际纵向RED→GREEN
+
+- `test_submission_scope.py`：先复现ResourceDownload候选泄漏到直接调用（1 failure），移除threadlocal；仅从活跃MP提交栈读取context并核对本次torrent bytes，GREEN。随后增加提交后qB generation/all-file priority冻结断言（None != 123 RED），实现后GREEN。接受事件仍精确hash/site/resource，促销变化不覆盖。
+- `test_cleanup_evolution.py`：fresh verify无完整SHA1仍允许删除与CLM映射未接入，先5 failures；删除专用完整SHA1门控、仅CloudMissing可精确最终映射后GREEN。网络失败不能当不存在、不回退历史。
+- `test_final_history.py`：缺模块时先import error（仅API缺失弱RED，不宣称行为RED）；实现纯函数后1 GREEN，逐项证明精确src/storage/status/源目标size和同115映射，download_hash/downloader为空不影响；最终SHA1另由Engine强制。
+- 缺失对账3 errors（reconcile API缺失）→实现后GREEN：qB查询成功absent + 整个root/name确切absent才external_missing，未完成reservation释放，部分/空目录/symlink/权限错误与网络错误不猜缺失，不删除/不重下。missing且已交接任务仍可验证云端。
+- legacy共享root永久阻断新hash目录、网盘root缺少硬拒绝先2 failures；改为实际内容namespace并验证路径后GREEN，真正相等/父子冲突仍拒绝。畸形其他账本namespace和矛盾qB save/content路径再1 failure，验证补齐后GREEN。
+- `test_cleanup_plugin.py`：只读preview/API/默认开关未接，先2 errors；接入表单、严格bool校验、poll对账/清理、准确绝对路径大小与状态后3 GREEN。done/external_missing禁止控制和再次提交。
+- factor None/malformed的原因被错误写成keep_seeding、WAL恢复能误用另一物理实例先2 failures；修复后GREEN。preview缺少具体归属/云SHA1原因先1 failure，固定白名单原因码后GREEN，不输出原始异常。
+- commit恢复的“目标与暂存都已消失”会永久挂起，先1 failure；只有内部 `recovery_waiting_cloud` 标记且完整本地/qB归属+云SHA1再次核验通过，才命名解除这一恢复hold；其他suspended仍粘性。GREEN。
+- 另增加unlink之后崩溃重启与remove不确定/重加hash的刻画回归，初跑即GREEN，不为这些已有行为编造RED。
+- market版本期望改0.2.0后先1 failure（0.1.1 != 0.2.0）；同步plugin/package/history/README后GREEN。
+
+### 真实MP契约（容器仅只读源码）
+
+`runtime/event/dispatch.py` 证明ResourceDownload同步调用，但submission中它发生在获取种子前，不能安全使用“下一次下载”的threadlocal。`chain/download/history.py`真实payload为 `{hash, context, downloader, ...}`，经异步广播发布。新版工具核对这些源码，并**执行当前容器提取的真实 `_submit_prepared_download` 方法→本地真实插件→fake qB**，再以真实shape的DownloadAdded确认账本；非生产端到端。补夹具字段site_cookie/cast/Set/常量期间的NameError只属于探针fixture，不隐瞒或冒充生产通过。只读get_by_src与CLM前缀配置也逐条核对；没有导入运行中的MP实例、调用真实qB/115或写容器。
+
+### 最终本地验证
+
+- `python3 -m unittest discover -s plugins.v3/qb115downloader/tests -q`：**Ran 246 tests in 67.130s — OK**；两行guard_failed为既有故障注入日志。中间完整回归亦跑过241、244项，均OK；不是只跑新增测试。
+- `PYTHONDONTWRITEBYTECODE=1 python3 plugins.v3/qb115downloader/tools/check_moviepilot_contract.py`：全部PASS，含执行真实当前MP提交方法至本地插件的账本接受验证。
+- `python3 tests/test_qb115_market_contract.py`：1 OK；既有v2 service contracts经runpy执行2 PASS；compileall与git diff --cached --check均exit 0。
+- 新增行静态扫描无硬编码密钥、shell注入或pickle反序列化命中。exec只在test_submission_scope合成固定调用栈与只读契约工具执行受信的当前MP源码；生产插件没有新增动态执行。
+- 最后自查再RED→GREEN修复：同轮tick后立即cleanup成功必须发布library_confirmed（先None断言失败）；external_missing不能被abandon/remove改写（先True失败）；WAL清理中pause仍须写hold并阻止本地unlink（先paused=False失败）。终态与其他旧不变量保持。
+- 本地自查不冒充独立审查；父代理独立安全审查与生产隔离验收仍是发布门槛。只commit，不push/部署。
+
+### 边界与交接
+
+- 原上传的无SHA1兼容未改，**删除额外强制完整远端SHA1**。无证据legacy/直接调用继续unknown，不追认历史免费。
+- 仅本地manifest单文件删除；不删目录、115、strm或priority0/未知文件。0700空slot保留；mkdir身份未完成的崩溃窗口保持失败待人工，不猜归属。qB删除RPC不确定时永不重发，待核对而不是冒险重删。
+- 当前MP私有提交栈/CLM本机local挂载映射是兼容依赖；变更时unknown/核验失败保留。本次自动清理仍待父代理独立审查、复跑与隔离真实BT小样本验收；不是已生产验证。
+- 旧生产hash外部删除不能计作本插件cleanup_success，E199/E194旧任务不能用作此次删除或保种验收。未改E200HDR订阅、其他业务配置、cron或生产数据。
+
+
 ## 0.1.1：同根目录不同 hash 连续订阅（本地功能分支，未发布/未部署）
 
 仓库起点 `main@0e6e504`，开始时工作树干净；开发分支 `feat/qb115-isolated-batches`。此次只改源码、测试、文档与本地 market 版本，不提交种子、不访问生产账本/凭据、不修改运行容器、不重启、不上传真实 115。下方首版至第三轮的记录均是 0.1.0 的历史，不代表本次执行。

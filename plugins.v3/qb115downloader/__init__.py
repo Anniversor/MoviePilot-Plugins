@@ -16,10 +16,16 @@ from pathlib import Path
 import re
 import shutil
 import time
+import hashlib
+import json
+import inspect
+from app.runtime.events import eventmanager
+from app.schemas.types import ChainEventType, EventType
 
 from .core import ConfigError, Engine, torrent_metadata, relative_name
 from .adapter import QbAdapter
 from .cloud import OpenList
+from .history import resolve_history
 
 
 class _AtomicEntries:
@@ -39,9 +45,9 @@ class _AtomicEntries:
 
 class Qb115Downloader(_PluginBase):
     plugin_name = "qB → 115"
-    plugin_desc = "本地 qB 下载保种，逐文件真实上传、校验后整批交接 CLM；删除/最终入库确认待人工。"
+    plugin_desc = "qB 下载后真实上传115并校验交接；提交时完全免费可自动清理，非0/unknown保种。"
     plugin_icon = "115.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.2.0"
     plugin_author = "Anniversor"
     author_url = "https://github.com/Anniversor"
     plugin_config_prefix = "qb115downloader_"
@@ -66,6 +72,54 @@ class Qb115Downloader(_PluginBase):
         self._brief_cache = {}
         self._brief_at = 0.0
 
+    @staticmethod
+    def _field(value, key, default=None):
+        return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+
+    @classmethod
+    def _resource_facts(cls, context):
+        torrent = cls._field(context, "torrent_info")
+        site = cls._field(torrent, "site")
+        enclosure, page = cls._field(torrent, "enclosure"), cls._field(torrent, "page_url")
+        if not isinstance(site, int) or isinstance(site, bool) or site <= 0 or not (enclosure or page):
+            return None
+        # Exact resource addresses are hashed, never stored/logged with passkeys. No title/name matching.
+        resource = hashlib.sha256(json.dumps([site, enclosure, page], ensure_ascii=False).encode()).hexdigest()
+        return dict(site=site, factor=cls._field(torrent, "downloadvolumefactor"), resource=resource)
+
+    def _submission_facts(self, content):
+        """Read the active MP submission boundary, never cache a pre-fetch event on a reused worker.
+
+        ResourceDownload is synchronous but precedes fetch/validation/cancellation. It cannot safely bind
+        the next download() call. Missing/changed MP boundary => unknown billing, never infer from title.
+        Frame references are released immediately; no credentials or contexts persist here.
+        """
+        frame = inspect.currentframe()
+        try:
+            for _ in range(64):
+                frame = frame.f_back if frame else None
+                if frame is None:
+                    break
+                if (frame.f_globals.get("__name__") == "app.chain.download.submission"
+                        and frame.f_code.co_name == "_submit_prepared_download"):
+                    context = frame.f_locals.get("context")
+                    prepared = frame.f_locals.get("prepared")
+                    if self._field(prepared, "torrent_content") == content:
+                        return self._resource_facts(context)
+                    return None
+            return None
+        finally:
+            del frame
+
+    @eventmanager.register(EventType.DownloadAdded)
+    def on_download_added(self, event):
+        data = event.event_data
+        if self._field(data, "downloader") != self.DOWNLOADER_NAME or not self._engine:
+            return
+        facts = self._resource_facts(self._field(data, "context"))
+        if facts:
+            self._engine.confirm_billing(self._field(data, "hash"), facts["site"], facts["resource"])
+
     STORAGE_TTL = 600  # seconds; avoids refresh=True listings of /115 and the monitor dir on every poll
     BRIEF_TTL = 5.0  # seconds; MP page refreshes / list calls share one batched qB status query
     _HOST_PATTERN = re.compile(r"\.?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
@@ -74,6 +128,8 @@ class Qb115Downloader(_PluginBase):
     def _validate_config(cls, config):
         """-> (clean values, [reasons]). Invalid values refuse to enable; nothing is silently clamped."""
         errors, clean = [], {}
+        if type(config.get("auto_cleanup_free", False)) is not bool:
+            errors.append("auto_cleanup_free 必须是布尔值")
 
         def number(key, default, minimum, label):
             value = config.get(key)
@@ -221,6 +277,7 @@ class Qb115Downloader(_PluginBase):
                  category=None, label=None, downloader=None, custom_words=None, **kwargs):
         if not self._owns(downloader):
             return None
+        candidate = self._submission_facts(content)
         task = None
         tid = None
         qb = None
@@ -238,7 +295,8 @@ class Qb115Downloader(_PluginBase):
                     raise ValueError("plugin stopped/reloaded during preflight")
                 if tid in engine.tasks:
                     existing = engine.tasks[tid]
-                    if existing["state"] in {"admitted", "suspended", "untracked"} or existing.get("quarantined"):
+                    if (existing["state"] in {"admitted", "suspended", "untracked", "external_missing"}
+                            or existing.get("quarantined") or existing.get("cleanup_state")):
                         raise ValueError("submission incomplete; manual reconciliation required")
                     if engine._binding_error(existing, qb, qb.snapshot(tid)):
                         raise ValueError("tracked hash binding changed; manual reconciliation required")
@@ -247,8 +305,12 @@ class Qb115Downloader(_PluginBase):
                 qb.preflight(tid)  # duplicate hash in the physical qB is refused BEFORE any ledger write
                 task = engine.admit(tid, name, size, qb.local_root(tid), physical=qb.name,
                                     save_path=qb.expected_save_path(tid))
+                if candidate:
+                    engine.capture_billing(tid, **candidate)
                 result = qb.submit(content, tid, episodes=episodes, custom_words=custom_words)
-                engine._set(task, state="downloading", layout=result[2])
+                snapshot = qb.snapshot(tid)  # post-selection generation + ALL file priorities, immutable
+                engine._set(task, state="downloading", layout=result[2],
+                            qb_identity=snapshot.get("added_on"), qb_files=engine.qb_file_binding(snapshot))
             return self.DOWNLOADER_NAME, tid, result[2], "qB 已提交；云端上传/入库尚未完成"
         except Exception as err:
             if task is not None:
@@ -324,6 +386,24 @@ class Qb115Downloader(_PluginBase):
             self._storage_key, self._storage_checked_at = key, time.monotonic()
         return qb, cloud
 
+    def _resolve_final(self, task, item):
+        from app.db.oper.transferhistory import TransferHistoryOper
+        config = self.get_config(plugin_id="CloudLinkMonitor") or {}
+        return resolve_history(task, item, TransferHistoryOper().get_by_src,
+                               config.get("rc_mount_prefix") or "/115_rclone",
+                               config.get("openlist_base") or "/115")
+
+    def cleanup_preview(self, hash: str):
+        if not self._engine:
+            return dict(hash=hash, eligible=False, reason="unknown_task", files=[])
+        try:
+            qb, cloud = self._runtime()
+            return self._engine.cleanup_preview(hash, qb, cloud,
+                        enabled=self._enabled and self._config.get("auto_cleanup_free") is True,
+                        resolve_final=self._resolve_final)
+        except Exception:
+            return dict(hash=hash, eligible=False, reason="runtime_unavailable", files=[])
+
     def poll(self):
         if not self._enabled:
             return
@@ -332,8 +412,14 @@ class Qb115Downloader(_PluginBase):
             self._qb = qb
             self._blocked = ""
             self._engine.guard(qb)
+            self._engine.reconcile(qb, cloud, resolve_final=self._resolve_final)
             self._engine.tick(qb, cloud, self._config.get("staging_path", "/115/.qb115-staging"),
                               self._config.get("target_path", "/115/媒体库监控目录"))
+            with self._engine.lock:
+                hashes = list(self._engine.tasks)
+            for tid in hashes:
+                self._engine.cleanup_free(tid, qb, cloud,
+                    enabled=self._config.get("auto_cleanup_free") is True, resolve_final=self._resolve_final)
         except ConfigError as err:  # fixed, credential/URL-free messages
             self._blocked = "运行前检查失败：" + str(err)
         except Exception:
@@ -401,12 +487,18 @@ class Qb115Downloader(_PluginBase):
             info = brief.get(task["hash"])
             progress, qb_state = (info["progress"] * 100, info["state"]) if info else (None, "unknown")
             quarantined = bool(task.get("quarantined")) or bool(info and not info["isolated"])
+            if task.get("cleanup_state") in {"done", "qb_absent"} or task["state"] == "external_missing":
+                progress, qb_state = None, "absent"
             rows.append(dict(hash=task["hash"], name=task["name"], state=task["state"], paused=task["paused"],
                              quarantined=quarantined, root=task.get("root"), physical_downloader=task.get("physical_downloader"),
                              reserved=task["reserved"], selected_size=task.get("selected_size"),
                              qb_progress=progress, qb_state=qb_state, error=task["error"],
                              target=task.get("target"), next_retry=task["next_retry"],
-                             library_confirmed=False, cleanup="待人工（本版永不删除）"))
+                             library_confirmed=bool(task.get("library_confirmed")),
+                             billing=task.get("billing"), reconcile_reason=task.get("reconcile_reason"),
+                             library_reason=task.get("library_reason"), verified_cloud_paths=task.get("verified_cloud_paths", []),
+                             cleanup=task.get("cleanup_state") or self._engine.cleanup_policy(task, self._config.get("auto_cleanup_free") is True) or "pending",
+                             cleanup_reason=task.get("cleanup_reason")))
         return {"enabled": self._enabled, "blocked": note, "tasks": rows}
 
     # Aliases mirror modules/_base/downloader.py::_normalize_query_status; TorrentStatus values are Chinese.
@@ -444,7 +536,7 @@ class Qb115Downloader(_PluginBase):
         ids = {hashs} if isinstance(hashs, str) else set(hashs or [])
         result = []
         for task in self.tasks_status(hashs=ids or None)["tasks"]:
-            if task["state"] == "untracked":
+            if task["state"] in {"untracked", "external_missing"} or task["cleanup"] == "done":
                 continue
             state = self._mp_state(task)
             if not ids and query != "all" and state != query:  # explicit hashs win over status, as natively
@@ -502,12 +594,13 @@ class Qb115Downloader(_PluginBase):
                                  max_instances=1, coalesce=True, misfire_grace_time=60)), guard]
 
     def get_api(self):
-        return [dict(path="/tasks", endpoint=self.tasks_status, methods=["GET"], auth="apikey", summary="任务状态（不含凭据）"),
+        return [dict(path="/cleanup_preview", endpoint=self.cleanup_preview, methods=["GET"], auth="apikey", summary="只读清理核验：完整hash、本地绝对路径/大小、原因"),
+                dict(path="/tasks", endpoint=self.tasks_status, methods=["GET"], auth="apikey", summary="任务状态（不含凭据）"),
                 dict(path="/control", endpoint=self.api_control, methods=["POST"], auth="apikey", summary="pause/start/retry/release/abandon/unsuspend；不提供删除")]
 
     def api_control(self, hash: str, action: str, confirm: str = ""):
         if not self._enabled or action not in {"pause", "start", "retry", "release", "abandon", "unsuspend"}:
-            return {"success": False, "message": "仅支持启用状态下 pause/start/retry/release/abandon/unsuspend；清理待人工"}
+            return {"success": False, "message": "仅支持启用状态下 pause/start/retry/release/abandon/unsuspend；未知/异常保留待人工"}
         if action == "unsuspend" and confirm != hash:
             return {"success": False, "message": "unsuspend 需要显式 confirm=<完整 hash>；仅在人工核对 qB 任务/文件清单后使用"}
         try:
@@ -525,6 +618,7 @@ class Qb115Downloader(_PluginBase):
     def get_form(self):
         fields = [
             ("enabled", "启用插件（默认关闭）", "VSwitch"),
+            ("auto_cleanup_free", "仅提交时完全免费且已确认接受的任务：云端完整SHA1通过后自动清理qB与本地清单（默认关闭）", "VSwitch"),
             ("physical_downloader", "已配置物理 qB 下载器名称（不使用默认实例）", "VTextField"),
             ("local_root", "MP 可读的独立本地目录（按物理 qB 路径映射）", "VTextField"),
             ("staging_path", "OpenList 隔离暂存目录（必须预建，不受 CLM 监控）", "VTextField"),
@@ -538,25 +632,25 @@ class Qb115Downloader(_PluginBase):
         ]
         controls = [dict(component="VCol", props={"cols": 12}, content=[
             dict(component=component, props={"model": model, "label": label})]) for model, label, component in fields]
-        warning = "只处理明确选择 qB → 115 的任务，不改订阅/站点/默认下载器。真实上传后仍保种；最终入库确认、源文件/暂存清理待人工。本版永不删除。仅 v1 种子，磁力/未知大小拒绝。"
+        warning = "只处理明确选择 qB → 115 的任务。自动清理默认关闭：仅提交时完全免费且接受证据完整、云端完整SHA1及本地归属通过才删qB和本地清单；非0/unknown保种，异常待人工。不删115/strm/非清单文件。"
         return [dict(component="VAlert", props={"type": "warning", "variant": "tonal"}, text=warning),
                 dict(component="VForm", content=[dict(component="VRow", content=controls)])], dict(
-                    enabled=False, physical_downloader="", local_root="", staging_path="/115/.qb115-staging",
+                    enabled=False, auto_cleanup_free=False, physical_downloader="", local_root="", staging_path="/115/.qb115-staging",
                     target_path="/115/媒体库监控目录", credential_source="U115OfflineDownloader",
                     low_water_gib=10, poll_interval=30, put_timeout_seconds=0, raw_url_allowed_hosts="",
                     isolation_confirmed=False)
 
     def get_page(self):
         labels = dict(admitted="提交待确认", downloading="下载中", uploading="上传中", verifying="待校验",
-                      commit_pending="交接结果待确认", handed_off="已交接", waiting_library="等待入库（本地保种中）",
+                      commit_pending="交接结果待确认", handed_off="已交接", waiting_library="已交接（保种/清理见状态）", external_missing="外部已移除（非插件清理）",
                       suspended="挂起待人工", failed="失败/退避中", untracked="已停跟踪（保留文件）")
         status = self.tasks_status()
         rows = []
         for task in status["tasks"]:
             text = (f'{"🔴 隔离失效（已暂停并保持） | " if task["quarantined"] else ""}{task["name"]} | {task["hash"]} | {labels.get(task["state"], task["state"])}'
                     f' | qB {task["qb_progress"] if task["qb_progress"] is not None else "未知"}%'
-                    f' | {"已暂停" if task["paused"] else task["qb_state"]} | {task["error"]} | 清理待人工')
+                    f' | {"已暂停" if task["paused"] else task["qb_state"]} | {task["error"]} | 清理 {task["cleanup"]} {task["cleanup_reason"] or ""} | 云端核验 {task["library_confirmed"]}')
             rows.append(dict(component="div", props={"class": "pa-2 text-break"}, text=text))
         return [dict(component="VAlert", props={"type": "warning", "variant": "tonal"},
-                     text="真实 qB 进度不代表云端可整理。上传→校验→整批交接→等待入库；本地继续保种。最终路径/入库确认与清理待人工，永不自动删除。"),
+                     text="上传→校验→交接→云端SHA1核验；清理默认关闭。仅提交时0计费且归属完整可自动清理，非0/unknown保种；缺失与异常待人工。external_missing不是插件清理成功。"),
                 dict(component="div", text=status["blocked"]), *rows]
