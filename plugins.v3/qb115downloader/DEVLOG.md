@@ -1,5 +1,15 @@
 # Qb115Downloader 开发/验收记录
 
+## 0.2.0 安全审查修复：清理TOCTOU（仍未发布）
+
+- 基线 `feat/qb115-free-cleanup@d87f92b`；只修独立审查的两个P1：长IO期间新增重叠来源，以及qB完整文件/选集变化。审查复现脚本先实跑，两项均错误返回done、删除本地且发出 `delete_file=False` RPC；修复后重跑，两项均拒绝、source仍在、无删除RPC、未写remove_intent。
+- 纵向slice 1：9个边界回归先全部FAIL（原错误成功返回True），再于长IO后、每个rename前和最终unlink前复查全部ledger+qB实际内容独占，9 GREEN；全套255 OK。覆盖verify内新增ledger/qB共享、qB移除后rename前、rename后unlink前，以及同边界inventory查询失败。rename后保留已验证slot；public路径另有新文件时绝不覆盖还原；结构化reason区分ledger/qB重叠。
+- 纵向slice 2：8个选集/文件/标签/完成度回归先全部FAIL，再抽共享 `_cheap_qb_binding`，core在长IO后、remove WAL之前复查；adapter接收显式冻结expected task，在RPC内复查同一绑定+全文件priority+manifest完成清单。8 GREEN；全套263 OK。旧适配器精确hash、delete_file=False、readback、generation拒绝断言保留，仅更新expected签名。
+- 纵向slice 3：注入最终inventory网络调用期间新增ledger，先1 FAIL；将ledger快照移到该网络读取之后，避免用旧ledger副本作最终判断，随后GREEN。另5项刻画回归初跑即绿（不声称RED）：两项矩阵覆盖name/layout/physical/root/save_path/added_on/hash/网络在长IO与adapter snapshot处变化，三项覆盖本地hash长IO中的新ledger/qB共享及选集变化。
+- 最终完整suite：`python3 -m unittest discover -s plugins.v3/qb115downloader/tests -q` → **Ran 269 tests in 67.045s — OK**（原246保留，新增23）。两行guard_failed仍为既有故障注入。真实MP只读源码contract全部PASS，含执行当前真实 `_submit_prepared_download` 到本地插件+fake qB的接受验证；market contract 1 OK；`git diff --check`与新增行静态安全扫描无命中。
+- README明确：qB无服务端CAS，逐可观察边界重核不能原子阻止外部并发重绑；启用清理时不可同时手工重绑路径/hash、改选集/标签或让其他任务接管来源。没有新增功能/版本，不push、部署、读写生产账本或调用真实qB/115。
+- 本轮独立复审尝试受工具环境阻断：work_start在subagent上下文返回not_bot_chat；本地Claude只读审查CLI返回OAuth过期且刷新失败，未得到审查结论。上述测试和静态自查不冒充独立批准；仍需父代理独立复审后才能发布。
+
 ## 0.2.0：提交计费免费清理（本地功能分支，未push/未部署）
 
 承接 `feat/qb115-free-cleanup` 中断工作树，基线main `a61d7b1`/v0.1.1。继承的billing/WAL/adapter slice与11个cleanup tests并未声称由本轮重新RED。起始实跑223项，只有旧版“源码不得出现unlink”断言失败；改为AST精确允许 `_unlink_source` 的dirfd单文件unlink和 `remove_only` 的单hash `delete_file=False`，仍禁止任意递归/云端删除，其他旧安全测试保留。

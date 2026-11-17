@@ -81,8 +81,8 @@ class CleanupFixture(unittest.TestCase):
         self.qb.snapshot = lambda tid: dict(snapshot(tid), added_on=123, hash=tid)
         self.qb.cleanup_inventory = lambda: ([] if self.absent else [dict(hash=self.tid, save_path=str(self.root), content_path=str(self.root / 'seed.partial'), added_on=123)])
         self.qb.is_absent = lambda tid: self.absent
-        def remove(tid, identity):
-            self.removes.append((tid, identity))
+        def remove(tid, expected):
+            self.removes.append((tid, expected['qb_identity']))
             self.absent = True
             return True
         self.qb.remove_only = remove
@@ -196,11 +196,15 @@ class CleanupAdapterTests(unittest.TestCase):
         n.delete_torrents = delete
         a = adapter.QbAdapter(n, 'physical', '/mp/isolated', lambda: 'MOVIEPILOT')
         self.assertTrue(callable(getattr(a, 'remove_only', None)), 'safe qB removal adapter missing')
-        self.assertFalse(a.remove_only(tid, 124))
+        expected = dict(hash=tid, qb_identity=123, physical_downloader='physical', root='/mp/isolated',
+                        save_path='/qb/isolated', layout='Original', name='seed.partial',
+                        qb_files=[['seed.partial/a.mkv', 4, 1]],
+                        manifest=[dict(source='seed.partial/a.mkv', size=4)], cleanup_tags=['mp-qb115'])
+        self.assertFalse(a.remove_only(tid, dict(expected, qb_identity=124)))
         self.assertEqual(deletes, [])
         self.assertEqual(a.snapshot(tid)['added_on'], 123)
         self.assertEqual(a.cleanup_inventory()[0]['save_path'], '/mp/isolated')
-        self.assertTrue(a.remove_only(tid, 123))
+        self.assertTrue(a.remove_only(tid, expected))
         self.assertEqual(deletes, [dict(ids=tid, delete_file=False)])
         self.assertTrue(a.is_absent(tid))
         n.get_torrents = lambda **kw: ([], True)

@@ -3,6 +3,11 @@ import re
 import time
 from pathlib import Path
 
+if __package__:
+    from .core import Engine
+else:  # standalone stdlib contract tests
+    from core import Engine
+
 TAG = "mp-qb115"
 BATCH = 50  # hashes per qB query: guard/status must stay O(N/50) requests however long the ledger gets
 
@@ -210,10 +215,13 @@ class QbAdapter:
             raise ValueError("qB absence unconfirmed")
         return not torrents
 
-    def remove_only(self, tid, identity):
-        """ONE exact hash; no file deletion. Fresh generation/isolation/path checks and mandatory readback."""
-        snapshot = self.snapshot(tid)
-        if not isinstance(identity, int) or isinstance(identity, bool) or identity <= 0 or snapshot.get("added_on") != identity:
+    def remove_only(self, tid, expected):
+        """ONE exact hash; frozen binding/selection checked again at the RPC boundary; mandatory readback."""
+        if not isinstance(expected, dict) or expected.get("hash") != tid:
+            return False
+        try:
+            Engine._cheap_qb_binding(expected, self)
+        except ValueError:
             return False
         if not self.guard().delete_torrents(ids=tid, delete_file=False):
             return False

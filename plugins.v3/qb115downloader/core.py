@@ -332,6 +332,7 @@ class Engine:
         return sorted([[f["name"], f["size"], f["priority"]] for f in snapshot["files"]])
 
     def _cleanup_exclusive(self, task, qb):
+        inventory = qb.cleanup_inventory()  # finish network IO before taking the latest ledger copy
         with self.lock:
             others = copy.deepcopy([t for h, t in self.tasks.items() if h != task["hash"]])
         own = str(PurePosixPath(task["root"]) / task["name"])
@@ -343,7 +344,7 @@ class Engine:
                     or self._paths_overlap(str(PurePosixPath(task["root"]) / task["name"]),
                                            str(PurePosixPath(other["root"]) / other["name"]))):
                 raise ValueError("cleanup ledger directory overlap")
-        for other in qb.cleanup_inventory():  # ALL qB tasks, never just our tag or hashes
+        for other in inventory:  # ALL qB tasks, never just our tag or hashes
             if other.get("hash") == task["hash"]:
                 if other.get("added_on") != task.get("qb_identity"):
                     raise ValueError("cleanup hash readded")
@@ -377,25 +378,36 @@ class Engine:
             raise ValueError("fresh full cloud sha1 required")
         return path
 
-    def _cleanup_checks(self, task, qb, cloud, resolve_final=None):
-        manifest = self._cleanup_manifest(task)
-        self._cleanup_exclusive(task, qb)
-        if self._binding_error(task, qb):
+    @classmethod
+    def _cheap_qb_binding(cls, task, qb):
+        """Fresh destructive-operation gate; no local hashing or cloud IO. Also used inside the RPC adapter."""
+        if cls._binding_error(task, qb):
             raise ValueError("cleanup missing manifest/binding")
         snapshot = qb.snapshot(task["hash"])
-        if self._binding_error(task, qb, snapshot) or not task.get("qb_identity") or snapshot.get("added_on") != task["qb_identity"]:
+        identity = task.get("qb_identity")
+        if (cls._binding_error(task, qb, snapshot) or type(identity) is not int or identity <= 0
+                or snapshot.get("added_on") != identity):
             raise ValueError("cleanup qB generation mismatch")
+        tags = sorted({t.strip() for t in str(snapshot.get("tags") or "").split(",") if t.strip()})
         if (snapshot.get("hash") != task["hash"] or snapshot.get("name") != task["name"]
-                or self.qb_file_binding(snapshot) != task.get("qb_files")
-                or "mp-qb115" not in {t.strip() for t in str(snapshot.get("tags") or "").split(",")}
+                or snapshot.get("physical") != task["physical_downloader"]
+                or cls.qb_file_binding(snapshot) != task.get("qb_files")
+                or "mp-qb115" not in tags or ("cleanup_tags" in task and tags != task["cleanup_tags"])
                 or qb.isolation_report([task["hash"]])):
             raise ValueError("cleanup qB identity/files/tags changed")
         selected = selected_files(snapshot["files"])
-        if selected is None or sorted((i["name"], i["size"]) for i in selected) != sorted((i["source"], i["size"]) for i in manifest):
+        if selected is None or sorted((i["name"], i["size"]) for i in selected) != sorted((i["source"], i["size"]) for i in task["manifest"]):
             raise ValueError("cleanup source manifest mismatch")
+        return tags
+
+    def _cleanup_checks(self, task, qb, cloud, resolve_final=None):
+        manifest = self._cleanup_manifest(task)
+        self._cleanup_exclusive(task, qb)
+        tags = self._cheap_qb_binding(task, qb)
         for item in manifest:
             self._hash_source(task, item)
             self._verify_cloud(task, item, cloud, resolve_final)
+        return tags
 
     @classmethod
     def _cleanup_local(cls, task, item):
@@ -437,11 +449,14 @@ class Engine:
                     self._cleanup_local(task, item)
                     self._verify_cloud(task, item, cloud, resolve_final)
             else:
-                self._cleanup_checks(task, qb, cloud, resolve_final)
+                expected = copy.deepcopy(task)  # never let a late snapshot redefine what is safe to remove
+                expected["cleanup_tags"] = self._cleanup_checks(expected, qb, cloud, resolve_final)
+                self._cheap_qb_binding(expected, qb)
+                self._cleanup_exclusive(task, qb)  # local/cloud SHA1 may have taken hours
                 if self._held(task):
                     return False
                 self._set(task, cleanup_state="remove_intent", cleanup_reason="verified_free")
-                if not qb.remove_only(tid, task["qb_identity"]) or not qb.is_absent(tid):
+                if not qb.remove_only(tid, expected) or not qb.is_absent(tid):
                     self._set(task, cleanup_reason="remove_unconfirmed")
                     return False
             self._set(task, cleanup_state="qb_absent", library_confirmed=True, library_reason="sha1_verified")
@@ -517,6 +532,7 @@ class Engine:
                 else:
                     if self._held(task) or not qb.is_absent(task["hash"]):
                         raise ValueError("cleanup held or hash readded")
+                    self._cleanup_exclusive(task, qb)
                     if source_exists:
                         os.rename(name, name, src_dir_fd=parent, dst_dir_fd=slot)
                         os.fsync(parent)
@@ -539,6 +555,7 @@ class Engine:
                     self._set(task, cleanup_files=journal)
                     if self._held(task) or not qb.is_absent(task["hash"]):
                         raise ValueError("cleanup held or hash readded")
+                    self._cleanup_exclusive(task, qb)  # rehash and rename can expose a new owner
                     os.unlink(name, dir_fd=slot)
                     os.fsync(slot)
                 entry["phase"] = "unlinked"
