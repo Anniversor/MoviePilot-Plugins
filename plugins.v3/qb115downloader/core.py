@@ -533,8 +533,12 @@ class Engine:
                     if self._held(task) or not qb.is_absent(task["hash"]):
                         raise ValueError("cleanup held or hash readded")
                     self._cleanup_exclusive(task, qb)
+                    with self.lock:
+                        if self._held(task):
+                            raise ValueError("cleanup held or hash readded")
+                        if source_exists:
+                            os.rename(name, name, src_dir_fd=parent, dst_dir_fd=slot)
                     if source_exists:
-                        os.rename(name, name, src_dir_fd=parent, dst_dir_fd=slot)
                         os.fsync(parent)
                         os.fsync(slot)
                     filefd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=slot)
@@ -556,7 +560,10 @@ class Engine:
                     if self._held(task) or not qb.is_absent(task["hash"]):
                         raise ValueError("cleanup held or hash readded")
                     self._cleanup_exclusive(task, qb)  # rehash and rename can expose a new owner
-                    os.unlink(name, dir_fd=slot)
+                    with self.lock:  # a successful pause cannot race the local destructive syscall
+                        if self._held(task):
+                            raise ValueError("cleanup held or hash readded")
+                        os.unlink(name, dir_fd=slot)
                     os.fsync(slot)
                 entry["phase"] = "unlinked"
                 self._set(task, cleanup_files=journal)
