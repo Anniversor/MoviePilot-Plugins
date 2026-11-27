@@ -151,13 +151,14 @@
   },
   "SeedHubIndexer": {
     "name": "SeedHub索引",
-    "description": "将 SeedHub 接入内建搜索,公开磁力资源进入统一搜索结果,支持镜像域名自动切换。",
+    "description": "将 SeedHub 接入内建搜索，可选 FlareSolverr 回退，缓存已解析磁力。",
     "labels": "搜索,站点",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "https://sidhub.cc/favicon.ico",
     "author": "Anniversor",
     "level": 1,
     "history": {
+      "v1.3.0": "可选 FlareSolverr 搜索传输回退：直连被拦时使用，限制并发、新解析数和整体耗时，保留现有磁力缓存；启用时保持已配置域名和站点不变。",
       "v1.2.0": "适配 MoviePilot V3 插件资源源搜索(V3 每次搜索只调用一次插件且不传站点,旧版因此从未返回结果):按域名从索引池取回本站记录填充站点/下载器字段;遵循本次搜索的站点选择(订阅限定了站点、或系统搜索站点未勾选本站时不参与,V3 本身对插件资源源不做这层过滤),音乐搜索不参与;保留 V2 按站点调用",
       "v1.0.0": "首个版本:add_indexer 注册进搜索站点池 + search_torrents 插件模块;两级页面解析,magnet base64 解析并持久缓存;/worker-json-hosts/ 镜像域名每日巡检自动切换",
       "v1.0.1": "TorrentInfo 透传 site_downloader,支持站点级下载器定向路由(配合 115离线下载器)",

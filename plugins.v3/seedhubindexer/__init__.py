@@ -18,10 +18,15 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from contextvars import copy_context
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from urllib.parse import quote, urljoin, urlsplit
 
+import requests
 from apscheduler.triggers.cron import CronTrigger
+from requests.structures import CaseInsensitiveDict
+from urllib3.util import Timeout
 
 from app.core.config import settings
 from app.helper.sites import SitesHelper
@@ -37,6 +42,14 @@ except ImportError:
     from app.schemas import TorrentInfo
 
 
+_SOLVER_SLOTS = threading.BoundedSemaphore(2)
+_DISCOVERY_SLOTS = threading.BoundedSemaphore(2)
+_DISCOVERY_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="seedhub-discovery")
+_SOLVER_SEARCH_SECONDS = 44
+_SOLVER_DISCOVERY_SECONDS = 16
+_SOLVER_RESOLVE_LIMIT = 4
+
+
 class SeedHubIndexer(_PluginBase):
     # 插件名称
     plugin_name = "SeedHub索引"
@@ -45,7 +58,7 @@ class SeedHubIndexer(_PluginBase):
     # 插件图标
     plugin_icon = "https://sidhub.cc/favicon.ico"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "Anniversor"
     # 作者主页
@@ -80,6 +93,8 @@ class SeedHubIndexer(_PluginBase):
     _max_seeds = 20
     _resolve_budget = 30
     _timeout = 10
+    _flaresolverr_url = ""
+    _flaresolverr_timeout = 36
     _registered = False
 
     def __init__(self):
@@ -98,6 +113,13 @@ class SeedHubIndexer(_PluginBase):
             self._max_seeds = self.__to_int(config.get("max_seeds"), 20, 1, 100)
             self._resolve_budget = self.__to_int(config.get("resolve_budget"), 30, 1, 100)
             self._timeout = self.__to_int(config.get("timeout"), 10, 3, 60)
+        config = config or {}
+        solver_url = str(config.get("flaresolverr_url") or "").strip().rstrip("/")
+        valid_solver_url = self.__origin(solver_url) and not any(c in solver_url for c in "?#")
+        self._flaresolverr_url = solver_url if valid_solver_url else ""
+        if solver_url and not self._flaresolverr_url:
+            logger.warn("SeedHub FlareSolverr 地址无效，使用直连")
+        self._flaresolverr_timeout = self.__to_int(config.get("flaresolverr_timeout"), 36, 3, 60)
 
         # 磁力缓存(seed_id -> magnet,磁力不变可长期复用)
         self._magnet_cache = self.get_data("magnet_map") or {}
@@ -378,8 +400,11 @@ class SeedHubIndexer(_PluginBase):
             # 浏览模式(无关键词)不支持
             return []
         try:
+            deadline = time.monotonic() + _SOLVER_SEARCH_SECONDS if self._flaresolverr_url else None
             for kw in keywords[:2]:
-                results = self.__do_search(site, str(kw), mtype)
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                results = self.__do_search(site, str(kw), mtype, deadline)
                 if results:
                     return results
             return []
@@ -391,53 +416,184 @@ class SeedHubIndexer(_PluginBase):
 
     # region 站点抓取
 
-    def __request(self, url: str, retries: int = 1):
+    @staticmethod
+    def __origin(url: str):
+        try:
+            parts = urlsplit(url)
+            if parts.scheme in ("http", "https") and parts.hostname and parts.username is None:
+                port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+                return parts.scheme, parts.hostname, port
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return None
+
+    @staticmethod
+    def __challenge(response) -> bool:
+        headers = CaseInsensitiveDict(getattr(response, "headers", None) or {})
+        if response.status_code == 403 or headers.get("cf-mitigated", "").lower() == "challenge":
+            return True
+        # Normal pages can also embed Cloudflare's challenge-platform JS.
+        return bool(re.search(r'<title[^>]*>\s*Just a moment|<form\b[^>]*\bid\s*=\s*["\']challenge-form["\']',
+                              response.text[:32768], re.I))
+
+    def __request(self, url: str, retries: int = 1, deadline: Optional[float] = None):
         """
         瞬时失败(超时/连接异常/非200)自动重试:请求失败不等于站点无结果,
         中文关键词是 SeedHub 唯一有效索引,一次抖动不该让整轮搜索空手而归。
         """
-        from app.utils.http import RequestUtils
+        if self._flaresolverr_url:
+            expected = self.__origin(self._domain)
+            if not expected or self.__origin(url) != expected:
+                return None
         res = None
         for attempt in range(retries + 1):
-            res = RequestUtils(
-                ua=self.UA,
-                timeout=self._timeout,
-                referer=f"{self._domain}/",
-                proxies=settings.PROXY if self._proxy else None
-            ).get_res(url, allow_redirects=True)
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            try:
+                res, final_url = self.__direct_get(url, deadline)
+            except requests.RequestException:
+                res, final_url = None, url
+            if self._flaresolverr_url and res is not None and self.__challenge(res):
+                return self.__solve(final_url, deadline)
             if res is not None and res.status_code == 200:
                 return res
             if attempt < retries:
+                if deadline is not None and deadline - time.monotonic() <= 2:
+                    break
                 logger.warn(f"SeedHub 请求失败(第{attempt + 1}次),2秒后重试:{url}")
                 time.sleep(2)
         return res
 
-    def __do_search(self, site: dict, keyword: str, mtype: MediaType = None) -> List[TorrentInfo]:
+    def __direct_get(self, url: str, deadline: Optional[float]):
+        from app.utils.http import RequestUtils
+        solver = bool(self._flaresolverr_url)
+        expected = self.__origin(url)
+        for _ in range(4):
+            remaining = deadline - time.monotonic() if deadline is not None else self._timeout
+            if remaining <= 0:
+                break
+            res = RequestUtils(
+                ua=self.UA, timeout=min(self._timeout, remaining), referer=f"{self._domain}/",
+                proxies=settings.PROXY if self._proxy else None,
+            ).get_res(url, allow_redirects=not solver)
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if not solver or res is None or res.status_code not in (301, 302, 303, 307, 308):
+                return res, url
+            headers = CaseInsensitiveDict(getattr(res, "headers", None) or {})
+            if not headers.get("Location") or self.__challenge(res):
+                return res, url
+            try:
+                target = urljoin(url, headers["Location"])
+            except ValueError:
+                break
+            if self.__origin(target) != expected:
+                break
+            url = target
+        return None, url
+
+    def __solve(self, url: str, deadline: Optional[float]):
+        started = time.monotonic()
+        limit = self._flaresolverr_timeout + 2
+        deadline = min(deadline, started + limit) if deadline is not None else started + limit
+        if not _SOLVER_SLOTS.acquire(timeout=max(0, deadline - started)):
+            logger.warn("SeedHub FlareSolverr 并发队列超时")
+            return None
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                return None
+            timeout_ms = min(self._flaresolverr_timeout * 1000, int((remaining - 1) * 1000))
+            with requests.Session() as session:
+                session.trust_env = False
+                # HTTPAdapter accepts urllib3 Timeout; the requests stubs omit it.
+                transport_timeout = cast(Any, Timeout(total=remaining, connect=min(2, remaining)))
+                response = session.post(f"{self._flaresolverr_url}/v1", json={
+                    "cmd": "request.get", "url": url, "maxTimeout": max(1, timeout_ms),
+                }, timeout=transport_timeout, allow_redirects=False)
+                if response.status_code != 200:
+                    raise ValueError("unexpected solver HTTP status")
+                body = response.json()
+                solution = body.get("solution") if isinstance(body, dict) and body.get("status") == "ok" else None
+            if (not isinstance(solution, dict) or solution.get("status") != 200
+                    or not isinstance(solution.get("response"), str) or not solution["response"]
+                    or self.__origin(solution.get("url", "")) != self.__origin(url)):
+                raise ValueError("invalid solver result")
+            result = SimpleNamespace(status_code=200, text=solution["response"])
+            if self.__challenge(result):
+                raise ValueError("challenge response")
+        except (requests.RequestException, ValueError) as exc:
+            logger.warn(f"SeedHub FlareSolverr 请求失败 ({type(exc).__name__})")
+            return None
+        finally:
+            _SOLVER_SLOTS.release()
+        if time.monotonic() >= deadline:
+            return None
+        logger.info(f"SeedHub FlareSolverr {urlsplit(url).path.split('/')[1]} HTTP 200 "
+                    f"{time.monotonic() - started:.1f}s")
+        return result
+
+    def __discover(self, keyword: str, mtype: Optional[MediaType], deadline: Optional[float],
+                   publish: Callable[[List[dict]], None]) -> None:
         # 1. 搜索页:取作品条目
         search_url = f"{self._domain}/s/{quote(keyword, safe='')}/"
-        res = self.__request(search_url)
+        res = self.__request(search_url, deadline=deadline)
         if res is None or res.status_code != 200:
             logger.warn(f"SeedHub 搜索页请求失败:{search_url} "
                         f"status={res.status_code if res is not None else None}")
-            return []
+            return
         movies = self.__parse_search_page(res.text)
         if not movies:
             logger.info(f"SeedHub 搜索无结果:{keyword}")
-            return []
+            return
 
         # 2. 作品页:取磁力行
-        rows: List[dict] = []
         for mid, mtitle in movies[:self._max_movies]:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
-                rows.extend(self.__fetch_movie_rows(mid, mtitle, mtype))
+                publish(self.__fetch_movie_rows(mid, mtitle, mtype, deadline))
             except Exception as e:
                 logger.warn(f"SeedHub 作品页解析失败 movies/{mid}:{str(e)}")
+
+    def __do_search(self, site: dict, keyword: str, mtype: MediaType = None,
+                    deadline: Optional[float] = None) -> List[TorrentInfo]:
+        collected: List[dict] = []
+        if deadline is None:
+            self.__discover(keyword, mtype, None, collected.extend)
+            rows = collected
+        else:
+            if not _DISCOVERY_SLOTS.acquire(blocking=False):
+                logger.info("SeedHub 发现任务已满，跳过本轮")
+                return []
+            discovery_deadline = min(deadline, time.monotonic() + _SOLVER_DISCOVERY_SECONDS)
+            rows_lock = threading.Lock()
+
+            def publish(batch: List[dict]) -> None:
+                with rows_lock:
+                    if time.monotonic() < discovery_deadline:
+                        collected.extend(batch)
+
+            try:
+                future = _DISCOVERY_POOL.submit(copy_context().run, self.__discover,
+                                                keyword, mtype, discovery_deadline, publish)
+            except Exception:
+                _DISCOVERY_SLOTS.release()
+                raise
+            future.add_done_callback(lambda _: _DISCOVERY_SLOTS.release())
+            try:
+                future.result(timeout=max(0, discovery_deadline - time.monotonic()))
+            except TimeoutError:
+                future.cancel()
+                logger.info("SeedHub 搜索/详情发现达到时间上限，保留已有条目")
+            with rows_lock:
+                rows = list(collected)
 
         if not rows:
             return []
 
         # 3. 解析磁力(带持久缓存与单次预算)
-        resolved, cache_hits, fetched, skipped = self.__resolve_rows(rows)
+        resolved, cache_hits, fetched, skipped = self.__resolve_rows(rows, deadline)
 
         # 4. 构造 TorrentInfo(站点身份字段取自索引池合并后的 site 字典)
         torrents = []
@@ -491,12 +647,13 @@ class SeedHubIndexer(_PluginBase):
                     items.append((mid, ""))
         return items
 
-    def __fetch_movie_rows(self, mid: str, mtitle: str, mtype: MediaType = None) -> List[dict]:
+    def __fetch_movie_rows(self, mid: str, mtitle: str, mtype: MediaType = None,
+                           deadline: Optional[float] = None) -> List[dict]:
         """
         拉取作品页磁力列表,返回未解析磁力的行信息。
         """
         page_url = f"{self._domain}/movies/{mid}/"
-        res = self.__request(page_url)
+        res = self.__request(page_url, deadline=deadline)
         if res is None or res.status_code != 200:
             logger.warn(f"SeedHub 作品页请求失败:{page_url}")
             return []
@@ -556,7 +713,7 @@ class SeedHubIndexer(_PluginBase):
         except ValueError:
             return 0.0
 
-    def __resolve_rows(self, rows: List[dict]) -> Tuple[List[dict], int, int, int]:
+    def __resolve_rows(self, rows: List[dict], deadline: Optional[float] = None) -> Tuple[List[dict], int, int, int]:
         """
         为磁力行补齐 magnet:优先取持久缓存,未命中的按预算并发解析。
         返回 (成功行, 缓存命中数, 新解析数, 超预算跳过数)
@@ -564,39 +721,53 @@ class SeedHubIndexer(_PluginBase):
         resolved: List[dict] = []
         to_fetch: List[dict] = []
         cache_hits = 0
+        budget = min(self._resolve_budget, _SOLVER_RESOLVE_LIMIT) if self._flaresolverr_url else self._resolve_budget
         for row in rows:
             magnet = self._magnet_cache.get(row["seed_id"])
             if magnet:
                 row["magnet"] = magnet
                 resolved.append(row)
                 cache_hits += 1
-            elif len(to_fetch) < self._resolve_budget:
+            elif len(to_fetch) < budget:
                 to_fetch.append(row)
         skipped = len(rows) - cache_hits - len(to_fetch)
 
         fetched = 0
-        if to_fetch:
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {executor.submit(self.__resolve_magnet, r["seed_id"]): r
-                           for r in to_fetch}
-                for future in as_completed(futures):
+        new_magnets = {}
+        if to_fetch and (deadline is None or time.monotonic() < deadline):
+            executor = ThreadPoolExecutor(max_workers=2 if self._flaresolverr_url else 4)
+
+            def resolve(seed_id: str):
+                magnet = self.__resolve_magnet(seed_id, deadline)
+                return magnet, time.monotonic()
+
+            try:
+                futures = {executor.submit(resolve, row["seed_id"]): row for row in to_fetch}
+                wait = max(0, deadline - time.monotonic()) if deadline is not None else None
+                for future in as_completed(futures, timeout=wait):
                     row = futures[future]
                     try:
-                        magnet = future.result()
+                        magnet, completed_at = future.result()
                     except Exception as e:
                         logger.debug(f"SeedHub 磁力解析异常 seed_id={row['seed_id']}:{str(e)}")
-                        magnet = None
-                    if magnet:
+                        continue
+                    if magnet and (deadline is None or completed_at <= deadline):
                         row["magnet"] = magnet
                         resolved.append(row)
+                        new_magnets[row["seed_id"]] = magnet
                         fetched += 1
-            if fetched:
+            except TimeoutError:
+                logger.info("SeedHub 磁力解析达到搜索时间上限，返回已有结果")
+            finally:
+                executor.shutdown(wait=deadline is None, cancel_futures=True)
+            if new_magnets:
                 with self._cache_lock:
+                    self._magnet_cache.update(new_magnets)
                     self.save_data("magnet_map", self._magnet_cache)
         return resolved, cache_hits, fetched, skipped
 
-    def __resolve_magnet(self, seed_id: str) -> Optional[str]:
-        res = self.__request(f"{self._domain}/link_start/?seed_id={seed_id}")
+    def __resolve_magnet(self, seed_id: str, deadline: Optional[float] = None) -> Optional[str]:
+        res = self.__request(f"{self._domain}/link_start/?seed_id={seed_id}", deadline=deadline)
         if res is None or res.status_code != 200:
             return None
         m = re.search(r'const\s+data\s*=\s*"([A-Za-z0-9+/=]+)"', res.text)
@@ -608,8 +779,6 @@ class SeedHubIndexer(_PluginBase):
             return None
         if not magnet.startswith("magnet:"):
             return None
-        with self._cache_lock:
-            self._magnet_cache[seed_id] = magnet
         return magnet
 
     # endregion
@@ -624,6 +793,9 @@ class SeedHubIndexer(_PluginBase):
         if mirrors is not None:
             self.save_data("mirrors", mirrors)
             logger.info(f"SeedHub 域名巡检正常:{self._domain},镜像 {mirrors}")
+            return
+        if self._flaresolverr_url:
+            logger.warn("SeedHub 域名巡检失败，FlareSolverr 模式保留已配置域名和站点")
             return
         logger.warn(f"SeedHub 当前域名不可用:{self._domain},尝试切换镜像...")
         candidates = []
@@ -755,6 +927,29 @@ class SeedHubIndexer(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'flaresolverr_url', 'label': 'FlareSolverr 地址（留空关闭）',
+                                              'placeholder': 'http://127.0.0.1:8191'}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'flaresolverr_timeout', 'label': 'FlareSolverr 超时上限（秒）',
+                                              'placeholder': '36'}
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
                                 'props': {'cols': 12, 'md': 3},
                                 'content': [{
                                     'component': 'VTextField',
@@ -797,6 +992,8 @@ class SeedHubIndexer(_PluginBase):
             "max_seeds": 20,
             "resolve_budget": 30,
             "timeout": 10,
+            "flaresolverr_url": "",
+            "flaresolverr_timeout": 36,
         }
 
     def get_page(self) -> List[dict]:
