@@ -66,3 +66,10 @@ MoviePilot三方插件市场：https://github.com/thsrite/MoviePilot-Plugins/
 60. Emby剧集演员同步 v1.5 `同步剧演员信息到集演员信息。`
 61. 云盘Strm助手 v1.0.4 `实时监控、定时全量增量生成strm文件。`
 62. Strm重定向 v1.0 `重写Strm文件内容。`
+
+### SeedHub 索引（MoviePilot V3）
+
+- `flaresolverr_url` 默认留空（保持原直连）。如配置，只在 SeedHub 直连遇到 HTTP 403 或 Cloudflare 挑战页时调用 FlareSolverr；它不是 HTTP 代理，不填在 MP 的全局代理里。
+- 使用受信任的 FlareSolverr。MoviePilot 使用 host 网络时可配 `http://127.0.0.1:8191`，不要对公网暴露服务，也不要在 URL 中嵌入账号或其他凭据。
+- `flaresolverr_timeout` 单次上限默认 36 秒（3–60 秒）；实际请求受本轮剩余时间限制。启用时每轮抓取预算 44 秒，单关键词搜索和详情发现用其中最多 16 秒；同时最多两个 Solver 请求，每批新磁力解析不超过 `min(resolve_budget, 4)`。已有磁力缓存依然可用；请求超时或服务不可用可能只返回部分结果。
+- 启用 FlareSolverr 时，插件直连只跟随同源跳转，只向 FlareSolverr 提交已配置域名的 URL，并同源校验它返回的最终 URL。FlareSolverr 的浏览器仍可能请求重定向目标及跨域子资源；同源校验不等于出站网络隔离。启用期间巡检失败不会自动换镜像或站点。想恢复旧行为时清空 `flaresolverr_url`，无需重启，也不必清空磁力缓存。
